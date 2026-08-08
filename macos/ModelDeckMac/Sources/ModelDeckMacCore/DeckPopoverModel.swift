@@ -237,14 +237,35 @@ public struct DeckWindow: Equatable, Identifiable, Sendable {
         return min(max((100 - remaining) / 100, 0), 1)
     }
 
+    /// The one whole-percentage derivation used by both rendered text and
+    /// visibility decisions. Swift's default rule rounds an exact half away
+    /// from zero, so 4.5 becomes the displayed/filterable 5 percentage points.
+    public static func roundedRemainingPercentagePoints(_ remainingPercent: Double) -> Int {
+        Int(remainingPercent.rounded())
+    }
+
+    private var roundedRemainingPercentagePoints: Int? {
+        guard idleRollforward == nil, let remainingPercent else { return nil }
+        return Self.roundedRemainingPercentagePoints(remainingPercent)
+    }
+
+    /// The percentage value the deck actually renders. Keeping the rounded
+    /// number here — beside `remainingText` — gives visual filters the same
+    /// value a person reads (for example raw 4.6 renders and compares as 5).
+    /// Dollar-headlined spend and idle-rollforward windows render no percent,
+    /// so their displayed percentage is unknown.
+    public var displayedRemainingPercent: Double? {
+        guard spendText == nil, let points = roundedRemainingPercentagePoints else { return nil }
+        return Double(points)
+    }
+
     /// "72% left" — the locked number convention, both providers.
     /// Issue #175: nil once the window has provably closed since its
     /// observation — the stale % must not render as if current, and a
     /// derived % is NEVER fabricated (limits are per-account; our idleness
     /// signal is per-machine-profile).
     public var remainingText: String? {
-        guard idleRollforward == nil else { return nil }
-        return remainingPercent.map { "\(Int($0.rounded()))% left" }
+        roundedRemainingPercentagePoints.map { "\($0)% left" }
     }
 
     /// Issue #145 (generalizing #143/#144): what the row's reset slot
@@ -576,7 +597,18 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
         worstWindow?.resetsAt
     }
 
-    /// Lowest % left across windows — the "lowest remaining" sort key.
+    /// The percentage the collapsed deck card actually displays. This must
+    /// stay a projection of `worstWindow`: that binding already incorporates
+    /// the model-window/general-weekly preferences and the no-data fallback,
+    /// so presentation rules can never quietly judge a sibling window the
+    /// user cannot see (#317's shared-derivation discipline).
+    public var displayedRemainingPercent: Double? {
+        worstWindow?.displayedRemainingPercent
+    }
+
+    /// Lowest % left across windows — the "lowest remaining" sort key. It
+    /// keeps the binding window's raw precision so rows with the same rounded
+    /// headline still sort deterministically.
     public var lowestRemaining: Double? {
         worstWindow?.remainingPercent
     }
@@ -698,11 +730,44 @@ public struct DeckUsageChange: Equatable, Sendable {
         self.previousRemaining = previousRemaining
         self.currentRemaining = currentRemaining
     }
+
+    /// The raw value a card may seed its decorative headline roll with.
+    /// If old and new round to different displayed percentages, start at the
+    /// committed value: the filter has already judged that value, so showing
+    /// the stale integer even briefly would make the card contradict its own
+    /// visibility. Same-rounded raw drift may start at the prior value because
+    /// both endpoints render the identical integer.
+    public var headlineAnimationStartRemaining: Double {
+        let previousPoints = DeckWindow.roundedRemainingPercentagePoints(previousRemaining)
+        let currentPoints = DeckWindow.roundedRemainingPercentagePoints(currentRemaining)
+        return previousPoints == currentPoints ? previousRemaining : currentRemaining
+    }
+
+    /// Resolves the actual animated headline text against the window's live,
+    /// committed display value. Animation state is eligible only for the same
+    /// scope and only when it rounds to the committed percentage; otherwise
+    /// the live text wins. This is the final backstop against stale delayed
+    /// state, binding-window switches, and percentless/spend headlines.
+    public func headlineText(
+        animationRemaining: Double?,
+        displayedWindow: DeckWindow,
+        liveText: String
+    ) -> String {
+        guard let animationRemaining,
+              scope == displayedWindow.scope,
+              let committed = displayedWindow.displayedRemainingPercent
+        else { return liveText }
+        let animationPoints = DeckWindow.roundedRemainingPercentagePoints(animationRemaining)
+        guard Double(animationPoints) == committed else { return liveText }
+        return "\(animationPoints)% left"
+    }
 }
 
 /// Persists each account's displayed headline at every popover open and
 /// answers "what moved since I last looked" — the cards that changed glow
-/// briefly and roll their percent from the old value to the new one.
+/// briefly. The view may roll only display-equivalent raw endpoints; a new
+/// rounded integer starts at the committed value so the headline cannot
+/// contradict a visibility decision made from that same integer.
 /// App-local UserDefaults (the #73 pattern); one snapshot per open, so a
 /// mid-open refresh simply glows on the NEXT open. Whole-percent threshold:
 /// the headline renders integers, so sub-point drift that cannot change the
@@ -730,7 +795,8 @@ public final class DeckChangeTracker {
             guard let worst = row.worstWindow, let remaining = worst.remainingPercent else { continue }
             next[row.id] = Seen(scope: worst.scope, remaining: remaining)
             guard let prior = previous[row.id], prior.scope == worst.scope else { continue }
-            if Int(prior.remaining.rounded()) != Int(remaining.rounded()) {
+            if DeckWindow.roundedRemainingPercentagePoints(prior.remaining)
+                != DeckWindow.roundedRemainingPercentagePoints(remaining) {
                 changes[row.id] = DeckUsageChange(
                     scope: worst.scope,
                     previousRemaining: prior.remaining,
@@ -1713,7 +1779,7 @@ public final class DeckPopoverModel: ObservableObject {
         focusGeneralWeeklyHeadline.toggle()
     }
 
-    // MARK: Hide/Show Accounts (issue #319, generalizing #315/#317)
+    // MARK: Hide/Show Accounts (issues #319/#326, generalizing #315/#317)
 
     /// Issue #319 (Tim, 2026-08-08): the zero-weight filter grows into a
     /// general Hide/Show system — a master switch (DEFAULT ON) plus three
@@ -1734,23 +1800,43 @@ public final class DeckPopoverModel: ObservableObject {
     public enum DeckHideMode: String, CaseIterable, Sendable {
         /// Manual list: only rows the user right-clicked Hide on are hidden.
         case byAccount = "by-account"
-        /// Rows whose DISPLAYED window resets within N days stay visible;
-        /// the rest hide. Manual hides still apply on top (spec: the
-        /// right-click line stays enabled in this mode).
-        case byResets = "by-resets"
+        /// Rows whose DISPLAYED percentage is at least the chosen threshold
+        /// stay visible, OR (when enabled) rows renewing within the chosen
+        /// horizon stay visible. Manual overrides win in both directions.
+        ///
+        /// The raw value deliberately remains `by-resets`: that was the
+        /// persistence format shipped by #319. Renaming it would make an
+        /// upgrader's stored middle-radio selection fail decoding and fall
+        /// back to By account. Keeping it turns the old selection into By
+        /// remaining in place while the new settings take their defaults.
+        case byRemaining = "by-resets"
         /// Exactly the shipped #317 behavior: rows displaying ⑂ 0 hide.
         case byZeroWeightings = "by-zero-weightings"
 
         public var displayName: String {
             switch self {
             case .byAccount: return "By account"
-            case .byResets: return "By resets"
+            case .byRemaining: return "By remaining"
             case .byZeroWeightings: return "By zero weightings"
             }
         }
     }
 
-    /// Issue #319 (grilled design, Tim-confirmed): the By-resets horizon —
+    /// Issue #326: the fixed "Remaining at least" menu. Integer raw values
+    /// are the persisted percentage points and are intentionally stable.
+    public enum DeckRemainingThreshold: Int, CaseIterable, Sendable {
+        case one = 1
+        case five = 5
+        case ten = 10
+        case twentyFive = 25
+        case fifty = 50
+
+        public var displayName: String { "\(rawValue)%" }
+
+        public var percentage: Double { Double(rawValue) }
+    }
+
+    /// Issue #319/#326: the renewing-soon horizon retained from By resets —
     /// a fixed dropdown, not a free stepper. Rolling windows from NOW
     /// ("12 hours" = displayed reset lands within the next 12 hours).
     /// Raw values are the persistence format — never rename a case's raw
@@ -1759,7 +1845,10 @@ public final class DeckPopoverModel: ObservableObject {
     public enum DeckResetsHorizon: String, CaseIterable, Sendable {
         case twelveHours = "12h"
         case oneDay = "24h"
-        case twoDays = "2d"
+        // Issue #324: the label became "48 hours"; the raw value stays "2d"
+        // (its persistence format since #320), so a stored "2 days" pick
+        // decodes to this same case — same interval, new name.
+        case fortyEightHours = "2d"
         case threeDays = "3d"
         case fourDays = "4d"
         case fiveDays = "5d"
@@ -1771,7 +1860,7 @@ public final class DeckPopoverModel: ObservableObject {
             switch self {
             case .twelveHours: return 12 * 3_600
             case .oneDay: return 86_400
-            case .twoDays: return 2 * 86_400
+            case .fortyEightHours: return 2 * 86_400
             case .threeDays: return 3 * 86_400
             case .fourDays: return 4 * 86_400
             case .fiveDays: return 5 * 86_400
@@ -1784,7 +1873,7 @@ public final class DeckPopoverModel: ObservableObject {
             switch self {
             case .twelveHours: return "12 hours"
             case .oneDay: return "24 hours"
-            case .twoDays: return "2 days"
+            case .fortyEightHours: return "48 hours"
             case .threeDays: return "3 days"
             case .fourDays: return "4 days"
             case .fiveDays: return "5 days"
@@ -1801,7 +1890,7 @@ public final class DeckPopoverModel: ObservableObject {
         static func fromLegacyDays(_ days: Int) -> DeckResetsHorizon {
             switch min(7, max(1, days)) {
             case 1: return .oneDay
-            case 2: return .twoDays
+            case 2: return .fortyEightHours
             case 3: return .threeDays
             case 4: return .fourDays
             case 5: return .fiveDays
@@ -1814,9 +1903,9 @@ public final class DeckPopoverModel: ObservableObject {
     /// A row's manual override — ONE shared list with two effects (the
     /// "manual wins both ways" decision): `.hidden` hides the account even
     /// when the mode's automatic rule would show it; `.shown` pins it
-    /// visible even when the rule would hide it (By resets: an account
-    /// resetting outside the window). Absent means the automatic rule
-    /// decides. Ignored entirely in By zero weightings.
+    /// visible even when the rule would hide it (By remaining: an account
+    /// below the threshold and outside the renewal window). Absent means
+    /// the automatic rule decides. Ignored entirely in By zero weightings.
     public enum ManualVisibility: Sendable, Equatable {
         case hidden
         case shown
@@ -1826,12 +1915,17 @@ public final class DeckPopoverModel: ObservableObject {
     static let hideShowModeDefaultsKey = "modeldeck.popover.hideShow.mode"
     static let hideShowResetsDaysDefaultsKey = "modeldeck.popover.hideShow.resetsDays"
     static let hideShowResetsHorizonDefaultsKey = "modeldeck.popover.hideShow.resetsHorizon"
+    static let hideShowRemainingThresholdDefaultsKey =
+        "modeldeck.popover.hideShow.remainingThreshold"
+    static let hideShowRenewingSoonEnabledDefaultsKey =
+        "modeldeck.popover.hideShow.renewingSoonEnabled"
     static let hideShowManualHiddenDefaultsKey = "modeldeck.popover.hideShow.manualHidden"
     static let hideShowManualShownDefaultsKey = "modeldeck.popover.hideShow.manualShown"
 
     /// The master switch — Settings section and footer eye are TWO surfaces
     /// over this ONE flag. OFF shows every account while keeping the mode,
-    /// days, and manual list intact for when it comes back on.
+    /// threshold, renewal settings, and manual list intact for when it
+    /// comes back on.
     @Published public var hideShowEnabled: Bool {
         didSet { defaults.set(hideShowEnabled, forKey: Self.hideShowEnabledDefaultsKey) }
     }
@@ -1842,7 +1936,26 @@ public final class DeckPopoverModel: ObservableObject {
         didSet { defaults.set(hideMode.rawValue, forKey: Self.hideShowModeDefaultsKey) }
     }
 
-    /// The By-resets horizon (dropdown selection). Default 24 hours.
+    /// The By-remaining percentage threshold. Default 5%; comparison is
+    /// inclusive, so a displayed 5.0% passes the 5% choice.
+    @Published public var hideRemainingThreshold: DeckRemainingThreshold {
+        didSet {
+            defaults.set(
+                hideRemainingThreshold.rawValue,
+                forKey: Self.hideShowRemainingThresholdDefaultsKey)
+        }
+    }
+
+    /// Whether By remaining's renewing-soon OR leg is enabled. Default ON.
+    @Published public var hideRenewingSoonEnabled: Bool {
+        didSet {
+            defaults.set(
+                hideRenewingSoonEnabled,
+                forKey: Self.hideShowRenewingSoonEnabledDefaultsKey)
+        }
+    }
+
+    /// The renewing-soon horizon (dropdown selection). Default 24 hours.
     @Published public var hideResetsHorizon: DeckResetsHorizon {
         didSet {
             defaults.set(hideResetsHorizon.rawValue, forKey: Self.hideShowResetsHorizonDefaultsKey)
@@ -1890,15 +2003,15 @@ public final class DeckPopoverModel: ObservableObject {
 
     /// The context-menu Hide/Show line's action. Hide always sets
     /// `.hidden`. Show is mode-shaped (Tim's ruling: "Pin only in By
-    /// resets"):
-    /// - By resets: Show creates a `.shown` PIN — the row stays visible
-    ///   even when it resets outside the window.
+    /// remaining"):
+    /// - By remaining: Show creates a `.shown` PIN — the row stays visible
+    ///   even when it fails both automatic visibility legs.
     /// - By account: Show returns the row to NEUTRAL — it leaves the
     ///   hidden set AND sheds any `.shown` pin, which is the user-visible
-    ///   escape hatch for a stale pin picked up in By resets.
+    ///   escape hatch for a stale pin picked up in By remaining.
     public func toggleManualVisibility(_ row: DeckAccountRow, now: Date = Date()) {
         if hiddenUnderCurrentMode(row, now: now) {
-            setManualVisibility(hideMode == .byResets ? .shown : nil, for: row.id)
+            setManualVisibility(hideMode == .byRemaining ? .shown : nil, for: row.id)
         } else {
             setManualVisibility(.hidden, for: row.id)
         }
@@ -1935,34 +2048,68 @@ public final class DeckPopoverModel: ObservableObject {
         defaults.set(shown.sorted(), forKey: Self.hideShowManualShownDefaultsKey)
     }
 
-    /// The footer eye's action: flip the master switch. Mode, days, and the
-    /// manual list all survive an off/on round trip.
+    /// The footer eye's action: flip the master switch. Mode, threshold,
+    /// renewal settings, and the manual list all survive an off/on round trip.
     public func toggleHideShowSystem() {
         hideShowEnabled.toggle()
     }
 
-    /// Issue #319: the deck row context menu's Hide/Show line is enabled in
-    /// By-account and By-resets modes and DISABLED (visible, grayed) in
-    /// By-zero-weightings — that mode's hiding is automatic, and a manual
-    /// line there would suggest an override that doesn't exist. Keyed on
-    /// the MODE, not the master switch: with the switch off, toggling
-    /// membership while everything is visible is exactly how a stranded
+    /// Issue #319/#326: the deck row context menu's Hide/Show line is
+    /// enabled in By-account and By-remaining modes and DISABLED (visible,
+    /// grayed) in By-zero-weightings — that mode's hiding is automatic,
+    /// and a manual line there would suggest an override that doesn't
+    /// exist. Keyed on the MODE, not the master switch: with the switch
+    /// off, toggling membership while everything is visible is how a stranded
     /// manual hide gets undone.
     public var contextMenuHideShowEnabled: Bool {
         hideMode != .byZeroWeightings
     }
 
-    /// Issue #319 "By resets": whether this row's DISPLAYED (binding)
-    /// window resets within the rolling horizon from NOW — the same reset
-    /// timestamp the collapsed card shows (#43: visible behavior keys on
+    /// Issue #326 Settings copy. Kept beside the persisted selections so
+    /// the sentence and the controls cannot drift apart. The ON/default
+    /// wording is verbatim from the confirmed grilling record.
+    public var byRemainingCaption: String {
+        let threshold = hideRemainingThreshold.displayName
+        guard hideRenewingSoonEnabled else {
+            return "Accounts with \(threshold) or more remaining stay visible. "
+                + "Right-click overrides win both ways."
+        }
+        return "Accounts with \(threshold) or more remaining stay visible — plus any renewing "
+            + "within \(hideResetsHorizon.displayName). Right-click overrides win both ways."
+    }
+
+    /// Whether this row's DISPLAYED (binding) window resets in the inclusive
+    /// future window `[now, now + horizon]` — the same reset timestamp the
+    /// collapsed card shows (#43: visible behavior keys on
     /// visible text, never a number the user can't see). A row with no
-    /// displayed reset at all stays visible: the filter can't judge it,
-    /// and no view preference may hide the only data a card has.
+    /// displayed reset fails this leg. That absence is not itself a hiding
+    /// rule: the displayed-percentage leg still decides, and an unknown
+    /// displayed percentage keeps the entire row visible. A reset exactly at
+    /// `now` counts because it is resetting this instant; any expired reset,
+    /// however recent, fails the leg.
     nonisolated public static func renewsWithinResetHorizon(
         _ row: DeckAccountRow, horizon: DeckResetsHorizon, now: Date
     ) -> Bool {
-        guard let reset = row.displayedReset else { return true }
-        return reset.timeIntervalSince(now) <= horizon.interval
+        guard let reset = row.displayedReset else { return false }
+        return reset >= now && reset.timeIntervalSince(now) <= horizon.interval
+    }
+
+    /// Issue #326: the automatic By-remaining OR-combo. The percentage is
+    /// read from the row's own displayed binding (`displayedRemainingPercent`)
+    /// and compared inclusively. Unknown displayed usage stays visible; the
+    /// filter never guesses that missing usage is low. A missing reset only
+    /// makes the optional renewing-soon leg false.
+    nonisolated public static func isVisibleByRemainingFilter(
+        _ row: DeckAccountRow,
+        threshold: DeckRemainingThreshold,
+        renewingSoonEnabled: Bool,
+        horizon: DeckResetsHorizon,
+        now: Date
+    ) -> Bool {
+        guard let remaining = row.displayedRemainingPercent else { return true }
+        if remaining >= threshold.percentage { return true }
+        return renewingSoonEnabled
+            && renewsWithinResetHorizon(row, horizon: horizon, now: now)
     }
 
     /// Issue #315, repredicated by #317: which rows the filter hides —
@@ -1990,10 +2137,10 @@ public final class DeckPopoverModel: ObservableObject {
     /// master switch aside (the context menu needs the mode's verdict even
     /// while the eye has everything visible):
     /// - By account: exactly the manual hides.
-    /// - By resets: manual wins both ways — an explicit `.hidden` hides an
-    ///   account even inside the window, an explicit `.shown` pins it
-    ///   visible even outside; only override-free rows fall to the
-    ///   automatic horizon rule.
+    /// - By remaining: manual wins both ways — an explicit `.hidden` hides
+    ///   an account even when either automatic leg passes, an explicit
+    ///   `.shown` pins it visible even when both fail; only override-free
+    ///   rows fall to the threshold/renewing-soon OR rule.
     /// - By zero weightings: exactly `isHiddenByZeroWeightFilter` (#317's
     ///   predicate, not a fork); manual overrides are ignored, matching
     ///   the disabled context-menu line.
@@ -2001,13 +2148,17 @@ public final class DeckPopoverModel: ObservableObject {
         switch hideMode {
         case .byAccount:
             return manuallyHiddenAccountIDs.contains(row.id)
-        case .byResets:
+        case .byRemaining:
             switch manualVisibility(for: row.id) {
             case .hidden: return true
             case .shown: return false
             case nil:
-                return !Self.renewsWithinResetHorizon(
-                    row, horizon: hideResetsHorizon, now: now)
+                return !Self.isVisibleByRemainingFilter(
+                    row,
+                    threshold: hideRemainingThreshold,
+                    renewingSoonEnabled: hideRenewingSoonEnabled,
+                    horizon: hideResetsHorizon,
+                    now: now)
             }
         case .byZeroWeightings:
             return Self.isHiddenByZeroWeightFilter(row)
@@ -2060,8 +2211,8 @@ public final class DeckPopoverModel: ObservableObject {
         switch mode {
         case .byAccount:
             return "Right-click any account to hide it."
-        case .byResets:
-            return "All accounts renew within your window — tighten it in Settings."
+        case .byRemaining:
+            return "Every account has enough remaining or renews within your window."
         case .byZeroWeightings:
             return "No accounts are at zero weight right now."
         }
@@ -2206,11 +2357,11 @@ public final class DeckPopoverModel: ObservableObject {
         )
     }
 
-    /// Tim directive 2026-08-02: on each popover open, the cards whose
-    /// headline moved since the PREVIOUS open glow briefly and roll their
-    /// percent old → new — "what changed since I last looked" at a glance.
-    /// Captured once per open (`captureUsageChanges`); purely decorative
-    /// state, so it never syncs anywhere.
+    /// Tim directive 2026-08-02: on each popover open, cards whose headline
+    /// moved since the PREVIOUS open glow briefly — "what changed since I
+    /// last looked" at a glance. Number animation is permitted only when its
+    /// rounded text already equals the committed headline. Captured once per
+    /// open (`captureUsageChanges`); purely decorative state, never synced.
     @Published public private(set) var usageChangesByAccount: [String: DeckUsageChange] = [:]
     /// Bumped by every capture. Cards animate at most once per generation —
     /// a plain one-shot flag broke because MenuBarExtra window content can
@@ -2308,6 +2459,18 @@ public final class DeckPopoverModel: ObservableObject {
             ?? (defaults.bool(forKey: Self.hideZeroWeightDefaultsKey)
                 ? .byZeroWeightings
                 : .byAccount)
+        // Issue #326: absent (including an upgrade from the old By-resets
+        // mode) reads 5%. Unknown/hand-edited values also fall back safely.
+        self.hideRemainingThreshold = DeckRemainingThreshold(rawValue: defaults.integer(
+            forKey: Self.hideShowRemainingThresholdDefaultsKey
+        )) ?? .five
+        // The renewing-soon OR leg is ON for both fresh installs and old
+        // By-resets selections. An explicit stored false remains false.
+        self.hideRenewingSoonEnabled = defaults.object(
+            forKey: Self.hideShowRenewingSoonEnabledDefaultsKey
+        ) == nil
+            ? true
+            : defaults.bool(forKey: Self.hideShowRenewingSoonEnabledDefaultsKey)
         // Absent key reads 24 hours (the grilled-design default). A stored
         // day count from the short-lived stepper migrates to its matching
         // dropdown case (1 day → 24 hours; out-of-range clamps first); an

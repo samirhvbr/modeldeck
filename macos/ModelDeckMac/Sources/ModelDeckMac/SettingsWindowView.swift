@@ -1352,9 +1352,8 @@ struct GeneralSettingsPane: View {
             // so this state-honest line keeps only what that caption
             // doesn't say.
             return "Nothing hides until you hide an account."
-        case .byResets:
-            return "Accounts renewing within the next \(deckModel.hideResetsHorizon.displayName.lowercased()) stay visible; the rest hide. "
-                + "Right-click overrides win both ways: Hide always hides, Show keeps an account visible."
+        case .byRemaining:
+            return deckModel.byRemainingCaption
         case .byZeroWeightings:
             return "Accounts whose row shows routing weight 0 hide automatically. The right-click Hide line is off in this mode."
         }
@@ -1470,16 +1469,16 @@ struct GeneralSettingsPane: View {
                 Toggle("Hide accounts from the deck", isOn: $deckModel.hideShowEnabled)
                     .help("The master switch for hiding — the deck footer's eye toggles the same thing. Display only: hidden accounts still count for routing, health, and the menu bar.")
                 Picker("Mode", selection: $deckModel.hideMode) {
-                    Text("By account").tag(DeckPopoverModel.DeckHideMode.byAccount)
-                    Text("By resets").tag(DeckPopoverModel.DeckHideMode.byResets)
-                    Text("By zero weightings").tag(DeckPopoverModel.DeckHideMode.byZeroWeightings)
+                    ForEach(DeckPopoverModel.DeckHideMode.allCases, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
                 }
                 .pickerStyle(.radioGroup)
                 .disabled(!deckModel.hideShowEnabled)
                 // Issue #321 decision 4 (Settings parity): a static caption
                 // for the By-account gesture, copy verbatim per the grilling
                 // record. Rendered exactly while the right-click Hide line
-                // is enabled (By account and By resets) — the SAME
+                // is enabled (By account and By remaining) — the SAME
                 // `contextMenuHideShowEnabled` condition the deck's context
                 // menu keys on, referenced not duplicated. In By zero
                 // weightings the gesture is off, and an instruction sitting
@@ -1491,15 +1490,40 @@ struct GeneralSettingsPane: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                if deckModel.hideMode == .byResets {
-                    // Grilled design (Tim-confirmed): a fixed dropdown of
-                    // rolling windows from now, not a free stepper.
-                    Picker("Renewing within", selection: $deckModel.hideResetsHorizon) {
-                        ForEach(DeckPopoverModel.DeckResetsHorizon.allCases, id: \.self) { horizon in
-                            Text(horizon.displayName).tag(horizon)
+                if deckModel.hideMode == .byRemaining {
+                    Picker("Remaining at least", selection: $deckModel.hideRemainingThreshold) {
+                        ForEach(
+                            DeckPopoverModel.DeckRemainingThreshold.allCases,
+                            id: \.self
+                        ) { threshold in
+                            Text(threshold.displayName).tag(threshold)
                         }
                     }
                     .disabled(!deckModel.hideShowEnabled)
+                    // The optional second OR leg keeps the established
+                    // rolling-horizon menu and places it on the same row as
+                    // its switch. A hidden Picker label remains available
+                    // to VoiceOver so the two controls stay distinguishable.
+                    HStack {
+                        Toggle(
+                            "Also show accounts renewing within",
+                            isOn: $deckModel.hideRenewingSoonEnabled
+                        )
+                        .disabled(!deckModel.hideShowEnabled)
+                        Spacer()
+                        Picker("Renewal window", selection: $deckModel.hideResetsHorizon) {
+                            ForEach(
+                                DeckPopoverModel.DeckResetsHorizon.allCases,
+                                id: \.self
+                            ) { horizon in
+                                Text(horizon.displayName).tag(horizon)
+                            }
+                        }
+                        .labelsHidden()
+                        .accessibilityLabel("Renewal window")
+                        .disabled(
+                            !deckModel.hideShowEnabled || !deckModel.hideRenewingSoonEnabled)
+                    }
                 }
                 // State-honest caption (the PR #196 precedent): describe
                 // what the CURRENT selection actually does.

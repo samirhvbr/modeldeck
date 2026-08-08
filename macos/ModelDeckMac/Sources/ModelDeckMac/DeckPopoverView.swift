@@ -106,9 +106,10 @@ struct DeckPopoverView: View {
         .background { if !isFloating { DeckWindowCaptureView() } }
         .onAppear {
             // Tim directive 2026-08-02: one diff per open, against the
-            // snapshot stored at the PREVIOUS open — the changed cards glow
-            // and roll their percent (see DeckAccountRowView). Cards animate
-            // via onChange, so parent-after-child onAppear ordering is fine.
+            // snapshot stored at the PREVIOUS open — changed cards glow, and
+            // any display-safe number transition runs in DeckAccountRowView.
+            // Cards animate via onChange, so parent-after-child onAppear
+            // ordering is fine.
             deckModel.captureUsageChanges(state: statusModel.deckState)
         }
         .task {
@@ -1270,12 +1271,13 @@ struct DeckAccountRowView: View {
 
     // Tim directive 2026-08-02 ("what changed since I last looked"): when
     // the popover-open diff says this card's headline moved, the card glows
-    // softly for a moment and the percent rolls from the old value to the
-    // new one. Purely decorative — VoiceOver reads the live values only.
+    // softly for a moment. A same-rounded raw change may roll, but a changed
+    // displayed integer snaps to the committed value so it can never disagree
+    // with By remaining visibility. VoiceOver always reads the live values.
     @State private var glowOpacity: Double = 0
-    /// Non-nil only during the roll: the value the headline TEXT renders
-    /// while the odometer transition plays; cleared afterwards so a mid-open
-    /// refresh can never leave a stale number on screen.
+    /// Non-nil only during the decorative animation window: the candidate
+    /// value the headline may render. It is seeded at the committed raw value
+    /// whenever the displayed integer changed and cleared afterwards.
     @State private var rollingRemaining: Double?
     /// The last capture generation this card animated for. Generation-keyed
     /// (not a one-shot flag) because MenuBarExtra window content can stay
@@ -1287,12 +1289,25 @@ struct DeckAccountRowView: View {
     }
 
     private func animateChangeIfNeeded() {
-        guard animatedGeneration != deckModel.usageCaptureGeneration else { return }
-        animatedGeneration = deckModel.usageCaptureGeneration
-        guard let change = usageChange else { return }
+        let generation = deckModel.usageCaptureGeneration
+        guard animatedGeneration != generation else { return }
+        animatedGeneration = generation
+        guard let change = usageChange else {
+            // A newer no-change capture invalidates the prior generation's
+            // delayed cleanup callbacks, so clear their transient state here.
+            glowOpacity = 0
+            rollingRemaining = nil
+            return
+        }
         glowOpacity = 1
-        rollingRemaining = change.previousRemaining
+        // A rounded-value change can also change By remaining visibility.
+        // Seed at the committed value in that case so a newly visible 5%
+        // card never spends a frame reading the stale 4% the filter rejected.
+        // Same-rounded raw drift may keep the old seed: both values render
+        // the same integer, preserving the display/filter invariant.
+        rollingRemaining = change.headlineAnimationStartRemaining
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+            guard animatedGeneration == generation else { return }
             withAnimation(.easeOut(duration: 1.1)) {
                 rollingRemaining = change.currentRemaining
             }
@@ -1301,21 +1316,21 @@ struct DeckAccountRowView: View {
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+            guard animatedGeneration == generation else { return }
             rollingRemaining = nil
         }
     }
 
-    /// The collapsed headline's text: the old value only while the roll
-    /// plays AND the diffed window is still the one displayed (same scope,
-    /// percent form) — a card whose binding window switched mid-open renders
-    /// the live truth immediately.
+    /// The collapsed headline's text may use animation state only while it
+    /// belongs to the displayed scope and rounds to the currently committed
+    /// percentage. A scope switch, spend headline, or stale delayed state
+    /// renders the live truth immediately.
     private func headlineText(worst: DeckWindow, live: String) -> String {
-        guard let rolling = rollingRemaining,
-              let change = usageChange,
-              change.scope == worst.scope,
-              worst.remainingText != nil
-        else { return live }
-        return "\(Int(rolling.rounded()))% left"
+        usageChange?.headlineText(
+            animationRemaining: rollingRemaining,
+            displayedWindow: worst,
+            liveText: live
+        ) ?? live
     }
 
     /// Issue #118 — the one-click path from the sign-in-needed notice into
@@ -1686,14 +1701,14 @@ struct DeckAccountRowView: View {
                 )
             }
             // Issue #319: the manual Hide/Show line (third line). Enabled in
-            // By-account and By-resets modes; DISABLED — visible and grayed,
+            // By-account and By-remaining modes; DISABLED — visible and grayed,
             // never hidden — in By-zero-weightings, whose hiding is
             // automatic. Keyed to the stable account id. Manual wins both
             // ways: the label follows the MODE's verdict for this row
             // (master switch aside), so while peeking with the eye off a
             // window-hidden row reads "Show on Deck" — and that Show
-            // persists as a pin that keeps the account visible even when
-            // it resets outside the By-resets window.
+            // persists as a pin that keeps the account visible even when it
+            // fails both of By remaining's automatic visibility legs.
             Button(deckModel.manualToggleOffersShow(row)
                 ? "Show on Deck"
                 : "Hide from Deck") {
@@ -1865,8 +1880,8 @@ struct DeckAccountRowView: View {
                         .font(DeckType.value)
                         .foregroundStyle(valueColor(for: worst))
                         .monospacedDigit()
-                        // The old→new odometer roll during the change
-                        // animation; inert (no text change) otherwise.
+                        // Numeric transition for display-safe animation
+                        // state; rounded-value changes snap and leave it inert.
                         .contentTransition(.numericText(
                             countsDown: (usageChange?.currentRemaining ?? 0) < (usageChange?.previousRemaining ?? 0)
                         ))
@@ -2111,10 +2126,23 @@ func availabilityColor(_ verdict: AvailabilityVerdict?) -> Color {
 /// click-to-explain idiom; tooltips are unreliable inside MenuBarExtra
 /// windows) — tooltip, popover, and the VoiceOver summary are identical in
 /// both label modes.
+/// Issue #328: HOVERING the icon presents the same popover after a short
+/// hover-intent delay (Tim: nothing indicated the icon was clickable);
+/// leaving both the icon and the popover dismisses it after a brief grace,
+/// so the pointer can cross the gap between them without flicker. Click
+/// stays as the second path and the accessibility/touch fallback; a click
+/// on a hover-opened popover pins it (today's click-owned lifecycle)
+/// rather than toggle-dismissing the thing being reached for. All timing
+/// and ownership decisions live in Core's `HealthHoverMachine`; this view
+/// only runs its effects against the model's presentation slot, so hover
+/// and click share ONE popover binding and can never double-present.
 struct AvailabilityHealthChip: View {
     let presentation: AvailabilityHealthPresentation
     @ObservedObject var deckModel: DeckPopoverModel
     let warningID: DeckWarningID
+
+    @State private var hoverMachine = HealthHoverMachine()
+    @State private var hoverTimer: Task<Void, Never>?
 
     var body: some View {
         let display = AvailabilityHealthChipDisplay.make(
@@ -2123,7 +2151,7 @@ struct AvailabilityHealthChip: View {
             showsVerdictLabels: deckModel.showsHealthVerdictLabels
         )
         Button {
-            deckModel.toggleWarning(warningID)
+            apply(hoverMachine.clicked())
         } label: {
             HStack(spacing: 4) {
                 VerdictDotView(
@@ -2140,12 +2168,72 @@ struct AvailabilityHealthChip: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .onHover { inside in
+            apply(hoverMachine.iconHoverChanged(inside))
+        }
         .help(presentation.chipTooltip)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(presentation.accessibilitySummary)
         .accessibilityHint("Shows the availability details")
         .popover(isPresented: deckModel.warningBinding(warningID), arrowEdge: .bottom) {
             AvailabilityHealthPopoverView(presentation: presentation)
+                .onHover { inside in
+                    apply(hoverMachine.popoverHoverChanged(inside))
+                }
+        }
+        .onChange(of: deckModel.presentedWarning) { _, presented in
+            // External dismissal or slot steal (Escape, outside click,
+            // another affordance, the #113 reconcile): reset the machine
+            // so the next hover starts clean. The machine distinguishes a
+            // steal (another warning now presented) from the slot merely
+            // clearing — a clear must not kill an in-flight hover intent
+            // whose pointer is still parked on the icon. Our own
+            // `present`/`dismiss` effects land here too; the machine
+            // no-ops them by construction.
+            if presented != warningID {
+                apply(hoverMachine.slotChanged(toPresented: presented != nil))
+            }
+        }
+        .onAppear {
+            // The presented-warning slot survives a deck close/reopen
+            // (#113), but this machine is @State and rebuilds as idle —
+            // idle over a live popover would make the first click emit a
+            // slot-no-op present, a visibly swallowed click. Adopt the
+            // reopened popover as click-pinned.
+            if deckModel.isWarningPresented(warningID) {
+                apply(hoverMachine.adoptPresentedSlot())
+            }
+        }
+        .onDisappear {
+            // Layout switch or column removal mid-hover: kill the pending
+            // timer so it can't fire into a rebuilt hierarchy.
+            hoverTimer?.cancel()
+            hoverTimer = nil
+        }
+    }
+
+    /// Run the machine's effects. Presentation goes through the model's
+    /// one-at-a-time slot exactly like a click always has; `dismiss` uses
+    /// the same guarded setter, so a stale hover can never tear down a
+    /// popover the slot has since handed to someone else.
+    private func apply(_ effects: [HealthHoverMachine.Effect]) {
+        for effect in effects {
+            switch effect {
+            case .scheduleTimer(let delay, let generation):
+                hoverTimer?.cancel()
+                hoverTimer = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    guard !Task.isCancelled else { return }
+                    apply(hoverMachine.timerFired(generation: generation))
+                }
+            case .cancelTimer:
+                hoverTimer?.cancel()
+                hoverTimer = nil
+            case .present:
+                deckModel.setWarningPresented(warningID, true)
+            case .dismiss:
+                deckModel.setWarningPresented(warningID, false)
+            }
         }
     }
 }

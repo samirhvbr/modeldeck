@@ -115,8 +115,8 @@ struct Issue321NoOpCalloutTests {
     @Test func calloutCopyIsTheGrillingRecordVerbatim() {
         #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byAccount)
             == "Right-click any account to hide it.")
-        #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byResets)
-            == "All accounts renew within your window — tighten it in Settings.")
+        #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byRemaining)
+            == "Every account has enough remaining or renews within your window.")
         #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byZeroWeightings)
             == "No accounts are at zero weight right now.")
     }
@@ -136,14 +136,15 @@ struct Issue321NoOpCalloutTests {
         #expect(!model.eyeToggleChangesNothingVisible(state: resetsFixture(), now: now))
     }
 
-    @Test func byResetsPredicateFollowsTheHorizon() {
+    @Test func byRemainingPredicateFollowsThresholdAndHorizon() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         let state = resetsFixture()
-        // Default 24 h horizon hides r2/r3/r5 — visibly NOT a no-op.
+        // Default threshold/horizon combo hides r5 — visibly NOT a no-op.
         #expect(!model.eyeToggleChangesNothingVisible(state: state, now: now))
         // 7 days (All): every dated reset is inside the window and the
-        // undated r4 is always visible — nothing to hide, a true no-op.
+        // undated r4 already has enough remaining — nothing hides, a true
+        // no-op.
         model.hideResetsHorizon = .sevenDays
         #expect(model.eyeToggleChangesNothingVisible(state: state, now: now))
         // A manual hide re-enters through the same derivation the rows
@@ -167,7 +168,7 @@ struct Issue321NoOpCalloutTests {
         // The verdict must read the same before and after the flip — it is
         // the MODE's judgment, not the switch position's.
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         let state = resetsFixture()
         let whileOn = model.eyeToggleChangesNothingVisible(state: state, now: now)
         model.toggleHideShowSystem() // OFF
@@ -218,11 +219,11 @@ struct Issue321NoOpCalloutTests {
 
     @Test func calloutCopyFollowsTheCurrentMode() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         model.hideResetsHorizon = .sevenDays // everything within the window
         model.toggleHideShowSystemFromEye(state: resetsFixture(), now: now)
         #expect(model.eyeCalloutText
-            == "All accounts renew within your window — tighten it in Settings.")
+            == "Every account has enough remaining or renews within your window.")
         let zeroModel = DeckPopoverModel(defaults: freshDefaults())
         zeroModel.hideMode = .byZeroWeightings
         zeroModel.toggleHideShowSystemFromEye(state: poolAllRouted(), now: now)
@@ -306,8 +307,8 @@ struct Issue321NoOpCalloutTests {
         let model = DeckPopoverModel(defaults: freshDefaults())
         model.hideMode = .byAccount
         #expect(model.contextMenuHideShowEnabled, "caption renders in By account")
-        model.hideMode = .byResets
-        #expect(model.contextMenuHideShowEnabled, "caption renders in By resets")
+        model.hideMode = .byRemaining
+        #expect(model.contextMenuHideShowEnabled, "caption renders in By remaining")
         model.hideMode = .byZeroWeightings
         #expect(!model.contextMenuHideShowEnabled,
                 "caption hidden in By zero weightings — the gesture is off there")

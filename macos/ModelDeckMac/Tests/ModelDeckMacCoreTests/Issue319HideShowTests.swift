@@ -3,12 +3,14 @@ import Testing
 @testable import ModelDeckMacCore
 
 // Issue #319: the Hide/Show Accounts system — master switch (default ON),
-// three mutually exclusive modes (By account / By resets / By zero
+// three mutually exclusive modes (By account / By remaining / By zero
 // weightings), the right-click manual override, and the migration from the
 // 0.4.1 eye toggle. Per the grilled design (Tim-confirmed on the issue):
-// the By-resets horizon is a fixed DROPDOWN of rolling windows (12 hours …
+// the By-remaining renewal horizon is a fixed DROPDOWN of rolling windows
+// (12 hours …
 // "7 days (All)", default 24 hours), and manual wins BOTH ways — Hide
-// always hides, Show pins visible even outside the window. Every mode
+// always hides, Show pins visible even when both automatic legs fail. Every
+// mode
 // keeps the #315/#316/#317 visual-only contract: nothing here may touch
 // routing, health, renewal, or the menu-bar number, and counts keep
 // stating roster totals. Placeholder names/emails only.
@@ -127,6 +129,8 @@ struct Issue319HideShowTests {
         let model = DeckPopoverModel(defaults: freshDefaults())
         #expect(model.hideShowEnabled, "the master switch defaults ON")
         #expect(model.hideMode == .byAccount)
+        #expect(model.hideRemainingThreshold == .five, "threshold defaults to 5%")
+        #expect(model.hideRenewingSoonEnabled, "renewing-soon leg defaults ON")
         #expect(model.hideResetsHorizon == .oneDay, "dropdown defaults to 24 hours")
         #expect(model.manuallyHiddenAccountIDs.isEmpty)
         #expect(model.manuallyShownAccountIDs.isEmpty)
@@ -158,17 +162,19 @@ struct Issue319HideShowTests {
         let defaults = freshDefaults()
         defaults.set(true, forKey: DeckPopoverModel.hideZeroWeightDefaultsKey)
         let model = DeckPopoverModel(defaults: defaults)
-        model.hideMode = .byResets
-        #expect(DeckPopoverModel(defaults: defaults).hideMode == .byResets)
+        model.hideMode = .byRemaining
+        #expect(DeckPopoverModel(defaults: defaults).hideMode == .byRemaining)
     }
 
-    // MARK: Persistence (all five pieces of state)
+    // MARK: Persistence (all seven pieces of state)
 
     @Test func allStatePersistsAcrossInstances() {
         let defaults = freshDefaults()
         let model = DeckPopoverModel(defaults: defaults)
         model.toggleHideShowSystem() // OFF
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
+        model.hideRemainingThreshold = .twentyFive
+        model.hideRenewingSoonEnabled = false
         model.hideResetsHorizon = .fourDays
         model.setManualVisibility(.hidden, for: "r2")
         model.setManualVisibility(.shown, for: "r5")
@@ -176,7 +182,9 @@ struct Issue319HideShowTests {
         model.setManualVisibility(nil, for: "r3") // and cleared again
         let relaunched = DeckPopoverModel(defaults: defaults)
         #expect(relaunched.hideShowEnabled == false)
-        #expect(relaunched.hideMode == .byResets)
+        #expect(relaunched.hideMode == .byRemaining)
+        #expect(relaunched.hideRemainingThreshold == .twentyFive)
+        #expect(!relaunched.hideRenewingSoonEnabled)
         #expect(relaunched.hideResetsHorizon == .fourDays)
         #expect(relaunched.manuallyHiddenAccountIDs == ["r2"])
         #expect(relaunched.manuallyShownAccountIDs == ["r5"],
@@ -186,13 +194,17 @@ struct Issue319HideShowTests {
     @Test func masterSwitchRoundTripKeepsEverythingElse() {
         let defaults = freshDefaults()
         let model = DeckPopoverModel(defaults: defaults)
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
+        model.hideRemainingThreshold = .ten
+        model.hideRenewingSoonEnabled = false
         model.hideResetsHorizon = .threeDays
         model.setManualVisibility(.hidden, for: "r1")
         model.toggleHideShowSystem()
         model.toggleHideShowSystem()
         #expect(model.hideShowEnabled)
-        #expect(model.hideMode == .byResets)
+        #expect(model.hideMode == .byRemaining)
+        #expect(model.hideRemainingThreshold == .ten)
+        #expect(!model.hideRenewingSoonEnabled)
         #expect(model.hideResetsHorizon == .threeDays)
         #expect(model.manuallyHiddenAccountIDs == ["r1"])
     }
@@ -218,15 +230,30 @@ struct Issue319HideShowTests {
 
     @Test func horizonOptionsOrderAndLabels() {
         #expect(DeckPopoverModel.DeckResetsHorizon.allCases == [
-            .twelveHours, .oneDay, .twoDays, .threeDays,
+            .twelveHours, .oneDay, .fortyEightHours, .threeDays,
             .fourDays, .fiveDays, .sixDays, .sevenDays,
         ], "the dropdown renders allCases in this exact order")
+        // Issue #324 amends the grilled option list: "2 days" reads
+        // "48 hours". Order, default, and intervals are untouched.
         #expect(DeckPopoverModel.DeckResetsHorizon.allCases.map(\.displayName) == [
-            "12 hours", "24 hours", "2 days", "3 days",
+            "12 hours", "24 hours", "48 hours", "3 days",
             "4 days", "5 days", "6 days", "7 days (All)",
         ])
         #expect(DeckPopoverModel.DeckResetsHorizon.twelveHours.interval == 12 * 3_600)
+        #expect(DeckPopoverModel.DeckResetsHorizon.fortyEightHours.interval == 2 * 86_400,
+                "the renamed option keeps the interval the 2-days case had")
         #expect(DeckPopoverModel.DeckResetsHorizon.sevenDays.interval == 7 * 86_400)
+    }
+
+    @Test func legacyTwoDaysRawValueStillDecodesToFortyEightHours() {
+        // Issue #324 renamed the label only: a selection persisted as "2d"
+        // by a pre-rename build must land on 48 hours, not the default.
+        #expect(DeckPopoverModel.DeckResetsHorizon.fortyEightHours.rawValue == "2d")
+        let defaults = freshDefaults()
+        defaults.set("2d", forKey: DeckPopoverModel.hideShowResetsHorizonDefaultsKey)
+        let model = DeckPopoverModel(defaults: defaults)
+        #expect(model.hideResetsHorizon == .fortyEightHours)
+        #expect(model.hideResetsHorizon.interval == 2 * 86_400)
     }
 
     @Test func horizonPersistsAcrossInstances() {
@@ -242,6 +269,7 @@ struct Issue319HideShowTests {
         // 1-day default lands on the new 24-hour default.
         for (days, expected) in [
             (1, DeckPopoverModel.DeckResetsHorizon.oneDay),
+            (2, .fortyEightHours),
             (4, .fourDays),
             (7, .sevenDays),
             (99, .sevenDays),
@@ -296,7 +324,7 @@ struct Issue319HideShowTests {
                 "OFF is a view state; the list survives for the next ON")
     }
 
-    // MARK: By resets — rolling horizon windows
+    // MARK: By remaining — threshold plus rolling renewal windows
 
     @Test func renewalHorizonPredicate() {
         let state = resetsFixture()
@@ -314,27 +342,30 @@ struct Issue319HideShowTests {
             row("r3", in: state), horizon: .sixDays, now: now))
         #expect(DeckPopoverModel.renewsWithinResetHorizon(
             row("r3", in: state), horizon: .sevenDays, now: now))
-        #expect(DeckPopoverModel.renewsWithinResetHorizon(
+        #expect(!DeckPopoverModel.renewsWithinResetHorizon(
             row("r4", in: state), horizon: .twelveHours, now: now),
-            "no displayed reset — the filter can't judge, so the row stays visible")
+            "no displayed reset simply fails the renewing-soon leg")
     }
 
-    @Test func byResetsHidesBeyondTheHorizon() {
+    @Test func byRemainingUsesThresholdOrRenewalHorizon() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         let state = resetsFixture()
-        // Default 24 hours: r1 (18 h) and undated r4 stay.
+        // Default 5% threshold keeps r1-r4 regardless of horizon; r5 is
+        // below threshold and outside the default renewal window.
         var claude = claudeColumn(model, state)
-        #expect(Set(claude.rows.map(\.id)) == ["r1", "r4"])
-        #expect(claude.hiddenAccountCount == 3)
+        #expect(Set(claude.rows.map(\.id)) == ["r1", "r2", "r3", "r4"])
+        #expect(claude.hiddenAccountCount == 1)
         #expect(claude.accountCountText == "5 accounts")
-        // Tighten to 12 hours: the window rolls from now, so r1 (18 h) hides.
+        // Tightening the optional leg cannot hide rows already kept by the
+        // threshold leg.
         model.hideResetsHorizon = .twelveHours
-        #expect(Set(claudeColumn(model, state).rows.map(\.id)) == ["r4"])
-        // Widen to 4 days: r2 (3 d) comes back too.
+        #expect(Set(claudeColumn(model, state).rows.map(\.id))
+            == ["r1", "r2", "r3", "r4"])
+        // Widen to 4 days: the same OR-combo remains visible.
         model.hideResetsHorizon = .fourDays
         claude = claudeColumn(model, state)
-        #expect(Set(claude.rows.map(\.id)) == ["r1", "r2", "r4"])
+        #expect(Set(claude.rows.map(\.id)) == ["r1", "r2", "r3", "r4"])
         // 7 days (All) includes everything.
         model.hideResetsHorizon = .sevenDays
         #expect(claudeColumn(model, state).rows.count == 5)
@@ -344,34 +375,34 @@ struct Issue319HideShowTests {
 
     @Test func manualHideWinsInsideTheWindow() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideMode = .byResets // 24 h default: r1 would be visible
+        model.hideMode = .byRemaining // r1 passes both automatic legs
         model.setManualVisibility(.hidden, for: "r1")
         let claude = claudeColumn(model, resetsFixture())
         #expect(!claude.rows.map(\.id).contains("r1"),
-                "a manual Hide hides an account even when it resets inside the window")
-        #expect(Set(claude.rows.map(\.id)) == ["r4"])
-        #expect(claude.hiddenAccountCount == 4)
+                "a manual Hide hides an account even when both automatic legs pass")
+        #expect(Set(claude.rows.map(\.id)) == ["r2", "r3", "r4"])
+        #expect(claude.hiddenAccountCount == 2)
     }
 
     @Test func manualShowPinsOutsideTheWindow() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideMode = .byResets // 24 h default: r5 (6.9 d) would hide
+        model.hideMode = .byRemaining // r5 fails both automatic legs
         model.setManualVisibility(.shown, for: "r5")
         let claude = claudeColumn(model, resetsFixture())
         #expect(claude.rows.map(\.id).contains("r5"),
-                "a manual Show pins an account visible even when it resets outside the window")
-        #expect(Set(claude.rows.map(\.id)) == ["r1", "r4", "r5"])
+                "a manual Show pins an account visible even when both automatic legs fail")
+        #expect(Set(claude.rows.map(\.id)) == ["r1", "r2", "r3", "r4", "r5"])
     }
 
     @Test func peekingWithTheEyeOffOffersShowAndTheShowPersistsAsAPin() {
-        // The full flow from the grilled design: window-hidden row → eye
-        // off (peek) → right-click reads "Show on Deck" → click → pin
+        // The full flow from the grilled design: automatically hidden row
+        // → eye off (peek) → right-click reads "Show on Deck" → click → pin
         // persists across relaunch and keeps the row visible once the eye
         // is back on.
         let defaults = freshDefaults()
         let state = resetsFixture()
         let model = DeckPopoverModel(defaults: defaults)
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         #expect(!claudeColumn(model, state).rows.map(\.id).contains("r5"))
         model.toggleHideShowSystem() // eye off — peeking
         #expect(claudeColumn(model, state).rows.map(\.id).contains("r5"))
@@ -395,7 +426,7 @@ struct Issue319HideShowTests {
         #expect(model.manuallyHiddenAccountIDs == ["r2"])
         #expect(model.manualToggleOffersShow(row("r2", in: state), now: now))
         // Show in By account returns the row to NEUTRAL, never a pin
-        // (Tim: "Pin only in By resets").
+        // (Tim: "Pin only in By remaining").
         model.toggleManualVisibility(row("r2", in: state), now: now)
         #expect(model.manuallyHiddenAccountIDs.isEmpty)
         #expect(model.manuallyShownAccountIDs.isEmpty,
@@ -403,15 +434,15 @@ struct Issue319HideShowTests {
         #expect(!model.manualToggleOffersShow(row("r2", in: state), now: now))
     }
 
-    @Test func showPinsOnlyInByResets() {
-        // The same Show click is mode-shaped: in By resets it creates the
+    @Test func showPinsOnlyInByRemaining() {
+        // The same Show click is mode-shaped: in By remaining it creates the
         // .shown pin; in By account it clears to neutral.
         let model = DeckPopoverModel(defaults: freshDefaults())
         let state = resetsFixture()
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         #expect(model.manualToggleOffersShow(row("r5", in: state), now: now))
         model.toggleManualVisibility(row("r5", in: state), now: now)
-        #expect(model.manuallyShownAccountIDs == ["r5"], "By-resets Show pins")
+        #expect(model.manuallyShownAccountIDs == ["r5"], "By-remaining Show pins")
         model.hideMode = .byAccount
         model.setManualVisibility(.hidden, for: "r2")
         model.toggleManualVisibility(row("r2", in: state), now: now) // Show
@@ -419,12 +450,12 @@ struct Issue319HideShowTests {
     }
 
     @Test func byAccountShowIsTheEscapeHatchForAStalePin() {
-        // A pin picked up in By resets can be shed in By account: the
+        // A pin picked up in By remaining can be shed in By account: the
         // pinned row reads Hide there (it's visible), Hide replaces the
         // pin with .hidden, and the follow-up Show lands on neutral.
         let model = DeckPopoverModel(defaults: freshDefaults())
         let state = resetsFixture()
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         model.toggleManualVisibility(row("r5", in: state), now: now) // pin
         #expect(model.manuallyShownAccountIDs == ["r5"])
         model.hideMode = .byAccount
@@ -441,7 +472,7 @@ struct Issue319HideShowTests {
 
     @Test func peekDimsExactlyTheWouldBeHiddenRows() {
         let model = DeckPopoverModel(defaults: freshDefaults())
-        model.hideMode = .byResets // 24 h default hides r2, r3, r5
+        model.hideMode = .byRemaining // default hides only r5 in this fixture
         let rows = DeckBuilder.rows(state: resetsFixture(), now: now)
         // Master ON: hidden rows are absent, visible rows never dim.
         #expect(rows.allSatisfy { !model.isRowDimmedForPeek($0, now: now) })
@@ -449,7 +480,7 @@ struct Issue319HideShowTests {
         let dimmed = Set(rows.filter { model.isRowDimmedForPeek($0, now: now) }.map(\.id))
         let wouldHide = Set(rows.filter { model.hiddenUnderCurrentMode($0, now: now) }.map(\.id))
         #expect(dimmed == wouldHide, "the dimmed set IS the would-be-hidden set")
-        #expect(dimmed == ["r2", "r3", "r5"])
+        #expect(dimmed == ["r5"])
         // A Show pin (made while peeking) lifts the dim immediately.
         model.toggleManualVisibility(rows.first { $0.id == "r5" }!, now: now)
         #expect(!model.isRowDimmedForPeek(rows.first { $0.id == "r5" }!, now: now))
@@ -545,7 +576,7 @@ struct Issue319HideShowTests {
         let model = DeckPopoverModel(defaults: freshDefaults())
         model.hideMode = .byAccount
         #expect(model.contextMenuHideShowEnabled)
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         #expect(model.contextMenuHideShowEnabled)
         model.hideMode = .byZeroWeightings
         #expect(!model.contextMenuHideShowEnabled,
@@ -561,6 +592,7 @@ struct Issue319HideShowTests {
 
     @Test func everythingHiddenKeepsTheRosterCountAndTheEscapeHatch() {
         let model = DeckPopoverModel(defaults: freshDefaults())
+        model.hideMode = .byRemaining
         for id in ["r1", "r2", "r3", "r4", "r5"] {
             model.setManualVisibility(.hidden, for: id)
         }
@@ -595,8 +627,8 @@ struct Issue319HideShowTests {
             switch mode {
             case .byAccount:
                 model.setManualVisibility(.hidden, for: "r5")
-            case .byResets:
-                model.hideResetsHorizon = .oneDay // r5 is far outside the window
+            case .byRemaining:
+                model.hideResetsHorizon = .oneDay // r5 fails threshold and renewal legs
             case .byZeroWeightings:
                 break // exercised on the pool fixture below
             }
@@ -625,9 +657,9 @@ struct Issue319HideShowTests {
     @Test func interleavedLayoutHonorsEveryMode() {
         let model = DeckPopoverModel(defaults: freshDefaults())
         model.layout = .singleColumn
-        model.hideMode = .byResets
+        model.hideMode = .byRemaining
         let ids = Set(model.interleavedRows(for: resetsFixture(), now: now).map(\.id))
-        #expect(ids == ["r1", "r4"])
+        #expect(ids == ["r1", "r2", "r3", "r4"])
         model.hideMode = .byAccount
         model.setManualVisibility(.hidden, for: "r3")
         #expect(Set(model.interleavedRows(for: resetsFixture(), now: now).map(\.id))
