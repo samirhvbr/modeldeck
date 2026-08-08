@@ -7,7 +7,8 @@ import Testing
 // row set, no dim-peek difference, glyph unchanged) presents an anchored
 // transient callout with mode-honest copy — every time, no seen-it state.
 // A click that DOES change rows never shows it. Plus the none→some eye
-// pulse trigger (decision 5). Copy is the grilling record's, verbatim.
+// pulse trigger (decision 5). #330 makes By remaining's copy aware of its
+// four independent-criterion configurations.
 // Placeholder names/emails only.
 
 private let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -110,13 +111,13 @@ struct Issue321NoOpCalloutTests {
         return defaults
     }
 
-    // MARK: Copy — verbatim per the grilling record (approved as drafted)
+    // MARK: Copy — mode-honest, with #330's configuration-aware line
 
-    @Test func calloutCopyIsTheGrillingRecordVerbatim() {
+    @Test func calloutCopyIsModeHonest() {
         #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byAccount)
             == "Right-click any account to hide it.")
         #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byRemaining)
-            == "Every account has enough remaining or renews within your window.")
+            == "No accounts are hidden by your 5% remaining and 24-hour renewal filters.")
         #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byZeroWeightings)
             == "No accounts are at zero weight right now.")
     }
@@ -142,10 +143,13 @@ struct Issue321NoOpCalloutTests {
         let state = resetsFixture()
         // Default threshold/horizon combo hides r5 — visibly NOT a no-op.
         #expect(!model.eyeToggleChangesNothingVisible(state: state, now: now))
-        // 7 days (All): every dated reset is inside the window and the
-        // undated r4 already has enough remaining — nothing hides, a true
-        // no-op.
+        // 7 days (All) satisfies every known renewal, but strict AND means
+        // r5's displayed 4% still fails the threshold criterion.
         model.hideResetsHorizon = .sevenDays
+        #expect(!model.eyeToggleChangesNothingVisible(state: state, now: now))
+        // Lowering the threshold to 1% makes every known percentage pass;
+        // r4's unknown reset is exempt, so nothing hides — a true no-op.
+        model.hideRemainingThreshold = .one
         #expect(model.eyeToggleChangesNothingVisible(state: state, now: now))
         // A manual hide re-enters through the same derivation the rows
         // render from — manual wins both ways, so the no-op is gone.
@@ -221,9 +225,10 @@ struct Issue321NoOpCalloutTests {
         let model = DeckPopoverModel(defaults: freshDefaults())
         model.hideMode = .byRemaining
         model.hideResetsHorizon = .sevenDays // everything within the window
+        model.hideRemainingThreshold = .one // every displayed percentage passes
         model.toggleHideShowSystemFromEye(state: resetsFixture(), now: now)
         #expect(model.eyeCalloutText
-            == "Every account has enough remaining or renews within your window.")
+            == "No accounts are hidden by your 1% remaining and 7-day renewal filters.")
         let zeroModel = DeckPopoverModel(defaults: freshDefaults())
         zeroModel.hideMode = .byZeroWeightings
         zeroModel.toggleHideShowSystemFromEye(state: poolAllRouted(), now: now)

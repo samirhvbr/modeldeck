@@ -1491,25 +1491,54 @@ struct GeneralSettingsPane: View {
                         .foregroundStyle(.secondary)
                 }
                 if deckModel.hideMode == .byRemaining {
-                    Picker("Remaining at least", selection: $deckModel.hideRemainingThreshold) {
-                        ForEach(
-                            DeckPopoverModel.DeckRemainingThreshold.allCases,
-                            id: \.self
-                        ) { threshold in
-                            Text(threshold.displayName).tag(threshold)
+                    // Issue #330 Variant A: each criterion owns its dropdown
+                    // and a trailing mini switch. Turning one off leaves its
+                    // remembered value visible but quiet; only the switch
+                    // remains interactive so the rule can be re-enabled.
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Remaining at least")
+                            Text("Hides accounts below the threshold")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
-                    }
-                    .disabled(!deckModel.hideShowEnabled)
-                    // The optional second OR leg keeps the established
-                    // rolling-horizon menu and places it on the same row as
-                    // its switch. A hidden Picker label remains available
-                    // to VoiceOver so the two controls stay distinguishable.
-                    HStack {
+                        .opacity(deckModel.hideRemainingThresholdEnabled ? 1 : 0.45)
+                        Spacer()
+                        Picker(
+                            "Remaining threshold",
+                            selection: $deckModel.hideRemainingThreshold
+                        ) {
+                            ForEach(
+                                DeckPopoverModel.DeckRemainingThreshold.allCases,
+                                id: \.self
+                            ) { threshold in
+                                Text(threshold.displayName).tag(threshold)
+                            }
+                        }
+                        .labelsHidden()
+                        .accessibilityLabel("Remaining threshold")
+                        .disabled(
+                            !deckModel.hideShowEnabled
+                                || !deckModel.hideRemainingThresholdEnabled)
+                        .opacity(deckModel.hideRemainingThresholdEnabled ? 1 : 0.45)
                         Toggle(
-                            "Also show accounts renewing within",
-                            isOn: $deckModel.hideRenewingSoonEnabled
+                            "Use remaining threshold",
+                            isOn: $deckModel.hideRemainingThresholdEnabled
                         )
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
                         .disabled(!deckModel.hideShowEnabled)
+                        .accessibilityLabel("Use remaining threshold")
+                    }
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Renewing within")
+                            Text(DeckPopoverModel.byRemainingRenewalCriterionCaption)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .opacity(deckModel.hideRenewingSoonEnabled ? 1 : 0.45)
                         Spacer()
                         Picker("Renewal window", selection: $deckModel.hideResetsHorizon) {
                             ForEach(
@@ -1523,6 +1552,16 @@ struct GeneralSettingsPane: View {
                         .accessibilityLabel("Renewal window")
                         .disabled(
                             !deckModel.hideShowEnabled || !deckModel.hideRenewingSoonEnabled)
+                        .opacity(deckModel.hideRenewingSoonEnabled ? 1 : 0.45)
+                        Toggle(
+                            "Use renewal window",
+                            isOn: $deckModel.hideRenewingSoonEnabled
+                        )
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .disabled(!deckModel.hideShowEnabled)
+                        .accessibilityLabel("Use renewal window")
                     }
                 }
                 // State-honest caption (the PR #196 precedent): describe
@@ -1530,6 +1569,12 @@ struct GeneralSettingsPane: View {
                 Text(hideShowCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if deckModel.hideMode == .byRemaining,
+                   let missingDataCaption = deckModel.byRemainingMissingDataCaption {
+                    Text(missingDataCaption)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             // Menu bar percent source (Tim, 2026-07-22): "lowest across

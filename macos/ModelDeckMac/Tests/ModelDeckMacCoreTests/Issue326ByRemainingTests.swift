@@ -4,8 +4,9 @@ import Testing
 
 // Issue #326 replaces the middle "By resets" radio with "By remaining":
 // the percentage rendered on the collapsed card passes an inclusive
-// threshold OR, when enabled, that same binding window renews soon. All
-// fixture identities are placeholders.
+// threshold, and the same binding window supplies the optional renewal
+// criterion. Issue #330 makes those criteria independently enabled and a
+// strict AND when both are on. All fixture identities are placeholders.
 
 private let issue326Now = Date(timeIntervalSince1970: 1_800_000_000)
 
@@ -56,7 +57,7 @@ struct Issue326ByRemainingTests {
         Set(model.columns(for: state, now: issue326Now).flatMap(\.rows).map(\.id))
     }
 
-    // MARK: Threshold OR renewing-soon
+    // MARK: Independent threshold and renewal criteria
 
     @Test func expiredResetFailsTheRenewingSoonLegAtEveryHorizon() throws {
         let state = DeckState(
@@ -110,7 +111,7 @@ struct Issue326ByRemainingTests {
             justOutside, horizon: .twelveHours, now: issue326Now))
     }
 
-    @Test func thresholdAndRenewingSoonAreAnORCombination() {
+    @Test func thresholdAndRenewingSoonAreIndependentAndStrictWhenCombined() {
         let state = DeckState(
             accounts: [
                 issue326Account("threshold-only", label: "Studio"),
@@ -133,16 +134,22 @@ struct Issue326ByRemainingTests {
         model.hideMode = .byRemaining
 
         #expect(model.hideRemainingThreshold == .five)
+        #expect(model.hideRemainingThresholdEnabled)
         #expect(model.hideRenewingSoonEnabled)
         #expect(model.hideResetsHorizon == .oneDay)
-        #expect(visibleIDs(from: state, using: model) == [
-            "threshold-only", "renewing-only", "both",
-        ])
+        #expect(visibleIDs(from: state, using: model) == ["both"],
+                "with both criteria enabled, every criterion must pass")
 
         model.hideRenewingSoonEnabled = false
         #expect(visibleIDs(from: state, using: model) == [
             "threshold-only", "both",
-        ], "with the sub-filter off, only the percentage leg can show a row")
+        ], "with renewal off, the percentage criterion acts alone")
+
+        model.hideRemainingThresholdEnabled = false
+        model.hideRenewingSoonEnabled = true
+        #expect(visibleIDs(from: state, using: model) == [
+            "renewing-only", "both",
+        ], "with threshold off, the renewal criterion acts alone")
     }
 
     @Test func inclusiveBoundaryUsesTheRoundedPercentageTheCardDisplays() throws {
@@ -199,12 +206,14 @@ struct Issue326ByRemainingTests {
         #expect(!DeckPopoverModel.isVisibleByRemainingFilter(
             previous,
             threshold: .five,
+            thresholdEnabled: true,
             renewingSoonEnabled: false,
             horizon: .oneDay,
             now: issue326Now))
         #expect(DeckPopoverModel.isVisibleByRemainingFilter(
             committed,
             threshold: .five,
+            thresholdEnabled: true,
             renewingSoonEnabled: false,
             horizon: .oneDay,
             now: issue326Now))
@@ -257,18 +266,19 @@ struct Issue326ByRemainingTests {
         let model = DeckPopoverModel(defaults: freshDefaults())
         model.hideMode = .byRemaining
         model.hideRemainingThreshold = .five
+        model.hideRemainingThresholdEnabled = false
         model.hideRenewingSoonEnabled = true
         model.hideResetsHorizon = .twelveHours
 
         #expect(model.eyeToggleChangesNothingVisible(
             state: state(resetsIn: 0), now: issue326Now),
-            "the low row is visible only because reset == now satisfies the renewal leg")
+            "with renewal acting alone, reset == now keeps the low row visible")
         #expect(!model.eyeToggleChangesNothingVisible(
             state: state(resetsIn: -3_600), now: issue326Now),
-            "once that reset is stale, the low row hides and the eye click visibly restores it")
+            "once that reset is stale, renewal fails and the eye visibly restores the row")
     }
 
-    @Test func missingResetFailsOnlyThatLegAndUnknownDisplayedPercentStaysVisible() {
+    @Test func missingResetExemptsOnlyRenewalAndUnknownPercentExemptsThreshold() {
         let state = DeckState(
             accounts: [
                 issue326Account("low-no-reset", label: "Studio"),
@@ -283,7 +293,11 @@ struct Issue326ByRemainingTests {
         model.hideMode = .byRemaining
 
         #expect(visibleIDs(from: state, using: model) == ["unknown"],
-                "a missing reset cannot rescue a known-low row; unknown displayed usage never hides")
+                "the known-low row still fails threshold; fully unknown data never hides")
+
+        model.hideRemainingThresholdEnabled = false
+        #expect(visibleIDs(from: state, using: model) == ["low-no-reset", "unknown"],
+                "an unknown reset exempts a row when renewal is the only active criterion")
     }
 
     @Test func filterUsesThePreferenceSelectedBindingWindow() throws {
@@ -336,8 +350,12 @@ struct Issue326ByRemainingTests {
         let defaults = freshDefaults()
         let model = DeckPopoverModel(defaults: defaults)
         #expect(model.hideRemainingThreshold == .five)
+        #expect(model.hideRemainingThresholdEnabled)
         model.hideRemainingThreshold = .twentyFive
-        #expect(DeckPopoverModel(defaults: defaults).hideRemainingThreshold == .twentyFive)
+        model.hideRemainingThresholdEnabled = false
+        let relaunched = DeckPopoverModel(defaults: defaults)
+        #expect(relaunched.hideRemainingThreshold == .twentyFive)
+        #expect(!relaunched.hideRemainingThresholdEnabled)
     }
 
     @Test func renewingSoonDefaultsOptionsAndPersistence() {
@@ -365,22 +383,18 @@ struct Issue326ByRemainingTests {
 
     @Test func literalByResetsRawValueMigratesInPlaceWithoutStrandingState() {
         let defaults = freshDefaults()
-        defaults.set("by-resets", forKey: DeckPopoverModel.hideShowModeDefaultsKey)
-        defaults.set(
-            DeckPopoverModel.DeckResetsHorizon.fourDays.rawValue,
-            forKey: DeckPopoverModel.hideShowResetsHorizonDefaultsKey)
-        defaults.set(
-            ["manual-hidden"],
-            forKey: DeckPopoverModel.hideShowManualHiddenDefaultsKey)
-        defaults.set(
-            ["manual-pinned"],
-            forKey: DeckPopoverModel.hideShowManualShownDefaultsKey)
+        defaults.set("by-resets", forKey: "modeldeck.popover.hideShow.mode")
+        defaults.set("4d", forKey: "modeldeck.popover.hideShow.resetsHorizon")
+        defaults.set(["manual-hidden"], forKey: "modeldeck.popover.hideShow.manualHidden")
+        defaults.set(["manual-pinned"], forKey: "modeldeck.popover.hideShow.manualShown")
 
         let migrated = DeckPopoverModel(defaults: defaults)
         #expect(DeckPopoverModel.DeckHideMode.byRemaining.rawValue == "by-resets",
                 "the shipped raw value remains decodable instead of falling back")
         #expect(migrated.hideMode == .byRemaining)
         #expect(migrated.hideRemainingThreshold == .five)
+        #expect(migrated.hideRemainingThresholdEnabled,
+                "0.4.4's structural threshold migrates explicitly enabled")
         #expect(migrated.hideRenewingSoonEnabled)
         #expect(migrated.hideResetsHorizon == .fourDays)
         #expect(migrated.manuallyHiddenAccountIDs == ["manual-hidden"])
@@ -404,9 +418,8 @@ struct Issue326ByRemainingTests {
                     "automatic-hidden", remaining: 2, resetsIn: 6 * 86_400),
             ]
         )
-        #expect(visibleIDs(from: state, using: migrated)
-            == ["manual-pinned", "automatic-high"],
-            "migration deliberately shows a healthy far-renewing row while old hides and pins still win")
+        #expect(visibleIDs(from: state, using: migrated) == ["manual-pinned"],
+                "strict AND hides the far-renewing high row while manual overrides still win")
     }
 
     // MARK: Verbatim, selection-live Settings caption
@@ -414,15 +427,15 @@ struct Issue326ByRemainingTests {
     @Test func settingsCaptionIsVerbatimAndTracksBothLiveSelections() {
         let model = DeckPopoverModel(defaults: freshDefaults())
         #expect(model.byRemainingCaption
-            == "Accounts with 5% or more remaining stay visible — plus any renewing within 24 hours. Right-click overrides win both ways.")
+            == "Accounts with 5% or more remaining AND renewing within 24 hours stay visible.")
 
         model.hideRemainingThreshold = .twentyFive
         model.hideResetsHorizon = .sixDays
         #expect(model.byRemainingCaption
-            == "Accounts with 25% or more remaining stay visible — plus any renewing within 6 days. Right-click overrides win both ways.")
+            == "Accounts with 25% or more remaining AND renewing within 6 days stay visible.")
 
         model.hideRenewingSoonEnabled = false
         #expect(model.byRemainingCaption
-            == "Accounts with 25% or more remaining stay visible. Right-click overrides win both ways.")
+            == "Accounts with 25% or more remaining stay visible. Everything else is hidden.")
     }
 }

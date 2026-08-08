@@ -202,7 +202,9 @@ struct HealthDetailGuidanceTests {
         // Non-goal check: no facts were dropped along with the legend.
         let p = busyPresentation
         #expect(!p.readout.isEmpty)
-        #expect(p.chipTooltip.hasSuffix("Click for details."))
+        // Issue #332 removed the chip tooltip; the readout still reaches
+        // VoiceOver through the accessibility summary.
+        #expect(p.accessibilitySummary.contains(p.readout))
         #expect(AvailabilityHealthPresentation.pointsFootnote.contains("Pro plan-week is 100"))
     }
 }

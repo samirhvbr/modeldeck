@@ -107,6 +107,37 @@ struct WindowAnchorDetectionTests {
         #expect(anchor == .unanchored(windowDuration: week))
     }
 
+    // Older daemons omitted observedAt. This placeholder was minted by a
+    // probe one hour ago, so substituting render-time `now` misses the
+    // ±5-minute signature and treats its far reset as known. With no probe
+    // timestamp the shape is ambiguous; bias it to unknown/visible.
+    @Test func oldDaemonCachedPlaceholderWithoutObservedAtBiasesUnanchored() {
+        let originalProbe = now.addingTimeInterval(-3_600)
+        let anchor = WindowPresentation.anchor(
+            remainingPercent: 100,
+            resetsAt: originalProbe.addingTimeInterval(week),
+            observedAt: nil,
+            windowDuration: week,
+            now: now
+        )
+        #expect(anchor == .unanchored(windowDuration: week))
+    }
+
+    // Deliberate conservative residual: this fixture is semantically a real
+    // anchored window, but its <=0.05%-used value and one-duration reset are
+    // indistinguishable from a floating placeholder in a single snapshot.
+    // A false-visible row is accepted instead of risking a false hide.
+    @Test func realNearZeroWindowMatchingPlaceholderSignatureUsesVisibleBias() {
+        let anchor = WindowPresentation.anchor(
+            remainingPercent: 99.95,
+            resetsAt: now.addingTimeInterval(week),
+            observedAt: now,
+            windowDuration: week,
+            now: now
+        )
+        #expect(anchor == .unanchored(windowDuration: week))
+    }
+
     // Tim's 10:19 AM case: the weekly window rolled minutes ago, the new
     // window is anchored (heavy use continued), usage reads ~0.
     @Test func freshlyRolledAnchoredWindowIsRecentlyRolled() {

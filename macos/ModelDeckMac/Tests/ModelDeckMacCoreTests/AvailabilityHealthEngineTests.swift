@@ -585,8 +585,10 @@ struct AvailabilityReportTests {
         #expect(relief?.spokenValue.hasPrefix("Studio +\(pts(300)) pts") == true)
         #expect(presentation.unknownTierLine == "Tier unknown, counted as 1×: Mystery")
         #expect(presentation.excludedLine == nil)
-        #expect(presentation.chipTooltip.hasSuffix("Click for details."))
+        // Issue #332: the chip tooltip is gone (the hover popover is the
+        // single hover surface); VoiceOver still gets the readout.
         #expect(presentation.accessibilitySummary.hasPrefix("Claude availability"))
+        #expect(presentation.accessibilitySummary.contains(presentation.readout))
     }
 
     @Test func redReportCarriesTheDroughtTime() {

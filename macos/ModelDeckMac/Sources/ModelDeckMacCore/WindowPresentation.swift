@@ -18,10 +18,15 @@ import Foundation
 //    base, NOT `now`: the server computed `resetsAt` at probe time, so the
 //    relation holds regardless of how old the snapshot is. The ±5-minute
 //    tolerance absorbs server-side rounding and probe latency while
-//    staying far tighter than any plausible anchored window's remaining
-//    time. Drift-tracking across refreshes was considered and rejected:
-//    it needs cross-refresh state for something a single snapshot already
-//    proves, and it cannot classify the FIRST snapshot after launch.
+//    keeping the known-observation collision band narrow. Older daemons may
+//    omit `observedAt`; a near-zero window is then observationally ambiguous,
+//    so it is classified unanchored. This
+//    deliberately biases the deck toward visible/unknown instead of hiding
+//    a cached placeholder as a known far reset. The unavoidable residual is
+//    that a genuinely anchored ≤0.05%-used window with the same signature
+//    is also presented and filtered as unanchored. Drift-tracking across
+//    refreshes was considered and rejected: it needs cross-refresh state
+//    and it cannot classify the FIRST snapshot after launch.
 //
 //    Issue #247 adds the NULL form of the same state: after a rollover and
 //    before the first request, Anthropic's usage API reports 100%
@@ -130,11 +135,18 @@ public enum WindowPresentation {
         }
 
         // Unanchored, placeholder form: zero usage + resetsAt sits exactly
-        // one window length after the probe that produced it.
-        let reference = observedAt ?? now
-        if usedPercent <= unanchoredMaxUsedPercent,
-           abs(resetsAt.timeIntervalSince(reference) - windowDuration) <= unanchoredTolerance {
-            return .unanchored(windowDuration: windowDuration)
+        // one window length after the probe that produced it. Without the
+        // probe timestamp, a cached placeholder and a real near-zero window
+        // cannot be distinguished offline; classify that ambiguity toward
+        // visible/unknown instead of manufacturing `now` as an observation.
+        if usedPercent <= unanchoredMaxUsedPercent {
+            guard let observedAt else {
+                return .unanchored(windowDuration: windowDuration)
+            }
+            if abs(resetsAt.timeIntervalSince(observedAt) - windowDuration)
+                <= unanchoredTolerance {
+                return .unanchored(windowDuration: windowDuration)
+            }
         }
 
         // Recently rolled: anchored window whose inferred start is moments

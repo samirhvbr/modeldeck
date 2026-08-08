@@ -1708,7 +1708,7 @@ struct DeckAccountRowView: View {
             // (master switch aside), so while peeking with the eye off a
             // window-hidden row reads "Show on Deck" — and that Show
             // persists as a pin that keeps the account visible even when it
-            // fails both of By remaining's automatic visibility legs.
+            // fails an enabled By remaining criterion.
             Button(deckModel.manualToggleOffersShow(row)
                 ? "Show on Deck"
                 : "Hide from Deck") {
@@ -2124,8 +2124,8 @@ func availabilityColor(_ verdict: AvailabilityVerdict?) -> Color {
 /// only signal even without the word. Clicking opens the detail popover
 /// through the model's one-at-a-time presentation slot (the #113
 /// click-to-explain idiom; tooltips are unreliable inside MenuBarExtra
-/// windows) — tooltip, popover, and the VoiceOver summary are identical in
-/// both label modes.
+/// windows) — popover and the VoiceOver summary are identical in both
+/// label modes.
 /// Issue #328: HOVERING the icon presents the same popover after a short
 /// hover-intent delay (Tim: nothing indicated the icon was clickable);
 /// leaving both the icon and the popover dismisses it after a brief grace,
@@ -2136,6 +2136,10 @@ func availabilityColor(_ verdict: AvailabilityVerdict?) -> Color {
 /// and ownership decisions live in Core's `HealthHoverMachine`; this view
 /// only runs its effects against the model's presentation slot, so hover
 /// and click share ONE popover binding and can never double-present.
+/// Issue #332: the `.help` tooltip is GONE — with #328's hover popover it
+/// showed two pop-ups at once, and its "Click for details" copy was stale.
+/// The hover popover is the single hover surface; VoiceOver keeps the full
+/// meaning via the explicit accessibility label (summary) and hint below.
 struct AvailabilityHealthChip: View {
     let presentation: AvailabilityHealthPresentation
     @ObservedObject var deckModel: DeckPopoverModel
@@ -2171,7 +2175,6 @@ struct AvailabilityHealthChip: View {
         .onHover { inside in
             apply(hoverMachine.iconHoverChanged(inside))
         }
-        .help(presentation.chipTooltip)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(presentation.accessibilitySummary)
         .accessibilityHint("Shows the availability details")

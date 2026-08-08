@@ -974,9 +974,10 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
     public var unknownTierLine: String?
     /// Popover title, e.g. "Claude availability".
     public var title: String
-    /// Hover tooltip on the chip (progressive enhancement; the click-open
-    /// popover is the reliable surface inside MenuBarExtra windows).
-    public var chipTooltip: String
+    // Issue #332: `chipTooltip` is gone — the #328 hover popover made the
+    // `.help` tooltip a duplicate pop-up, and its "Click for details" copy
+    // went stale once hover showed the details. `accessibilitySummary`
+    // still carries the same readout for VoiceOver.
     public var accessibilitySummary: String
 
     /// One short non-jargon paragraph on what the colors mean as decisions
@@ -1048,7 +1049,6 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
                 excludedLine: excludedLine(report.excluded),
                 unknownTierLine: unknownTierLine(report.unknownTierLabels),
                 title: title,
-                chipTooltip: "\(readout) Click for details.",
                 accessibilitySummary: "\(providerName) availability: no data. \(readout)"
             )
         }
@@ -1195,7 +1195,6 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
             excludedLine: excludedLine(report.excluded),
             unknownTierLine: unknownTierLine(report.unknownTierLabels),
             title: title,
-            chipTooltip: "\(readout) Click for details.",
             accessibilitySummary: "\(providerName) availability \(verdict.displayWord). \(readout)"
         )
     }
