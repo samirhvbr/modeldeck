@@ -1,0 +1,36 @@
+{
+  "resourceLogs": [
+    {
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "timeUnixNano": "1786278900000000000",
+              "body": {
+                "stringValue": "unknown-event-with-placeholder"
+              },
+              "attributes": [
+                {
+                  "key": "user.email",
+                  "value": {
+                    "stringValue": "unknown@example.invalid"
+                  }
+                },
+                {
+                  "key": "placeholder.detail",
+                  "value": {
+                    "stringValue": "retained-placeholder"
+                  }
+                }
+              ],
+              "authorization": "authorization-placeholder",
+              "nested": {
+                "client_secret": "secret-placeholder"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

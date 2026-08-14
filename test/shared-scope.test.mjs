@@ -949,14 +949,19 @@ test('a settings PUT conflict restores the prior shared-scope opt-in value', asy
   t.after(() => store.close());
   const conflict = new Error('a shared-scope operation is already in progress');
   conflict.statusCode = 409;
+  const queueReschedules = [];
   const service = {
     applySharedScopeSettings: async () => { throw conflict; },
+    rescheduleUsageQueueConsumer: async (settings) => { queueReschedules.push(settings); },
     stopAutoRefresh() {},
   };
   const port = 43210;
   const token = 'settings-conflict-token';
   const app = createApp({ store, service, host: '127.0.0.1', port, mutationToken: token });
-  const request = Readable.from([Buffer.from(JSON.stringify({ sharedUserScopeEnabled: true }))]);
+  const request = Readable.from([Buffer.from(JSON.stringify({
+    sharedUserScopeEnabled: true,
+    usageQueueConsumerEnabled: true,
+  }))]);
   Object.assign(request, {
     method: 'PUT',
     url: '/api/settings',
@@ -984,4 +989,7 @@ test('a settings PUT conflict restores the prior shared-scope opt-in value', asy
   assert.equal(status, 409);
   assert.deepEqual(payload, { error: conflict.message });
   assert.equal(store.getSettings().sharedUserScopeEnabled, false);
+  assert.equal(store.getSettings().usageQueueConsumerEnabled, false);
+  assert.equal(queueReschedules.length, 1);
+  assert.equal(queueReschedules[0].usageQueueConsumerEnabled, false);
 });

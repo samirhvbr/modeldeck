@@ -28,6 +28,7 @@ function releaseRepository(t) {
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(root, 'dist'));
   fs.copyFileSync(releaseScript, path.join(root, 'scripts', 'release-dmg.sh'));
+  fs.writeFileSync(path.join(root, 'scripts', 'release-checks.mjs'), '#!/usr/bin/env node\n');
   fs.writeFileSync(path.join(root, 'VERSION'), '0.0.0\n');
   fs.writeFileSync(path.join(root, 'tracked.txt'), 'clean\n');
   fs.writeFileSync(path.join(root, 'dist', 'tracked.txt'), 'allowed\n');
@@ -53,6 +54,17 @@ test('release guard accepts a clean origin/main checkout and ignores dist change
   fs.appendFileSync(path.join(root, 'dist', 'tracked.txt'), 'rebuilt\n');
   result = runGuard(root);
   assert.equal(result.status, 0, result.stderr);
+});
+
+test('release path runs the existing analytics click and boundary tests', () => {
+  const script = fs.readFileSync(releaseScript, 'utf8');
+  const checks = fs.readFileSync(new URL('../scripts/release-checks.mjs', import.meta.url), 'utf8');
+  assert.match(script, /node "\$REPO_ROOT\/scripts\/release-checks\.mjs"/);
+  assert.match(script, /release analytics checks missing/);
+  assert.match(checks, /test\/dashboard-overview-clicktest\.test\.mjs/);
+  assert.match(checks, /test\/usage-estimate\.test\.mjs/);
+  assert.match(checks, /prototype chart round-trip click-test/);
+  assert.match(checks, /#374 fit-floor boundary test/);
 });
 
 test('release guard refuses tracked changes and --allow-dirty warns loudly', (t) => {

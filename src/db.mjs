@@ -27,6 +27,9 @@ function now() {
 // margin. The newest row is protected independently of age for idle accounts.
 export const USAGE_SNAPSHOT_RETENTION_DAYS = 90;
 export const USAGE_SNAPSHOT_PRUNE_BATCH_SIZE = 500;
+// Raw history retains the newest rows; truncated=true means older matching
+// observations were omitted from the response.
+export const USAGE_HISTORY_RAW_LIMIT = 10_000;
 
 export const DEFAULT_SETTINGS = Object.freeze({
   autoRefreshEnabled: true,
@@ -35,6 +38,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // independently switchable from usage refreshes so the background
   // invocation can be stopped without making the deck stale.
   autoRenewEnabled: true,
+  // Issue #342: the unauthenticated OTLP exporter endpoints are reachable
+  // only over the daemon's loopback listener and remain absent until the
+  // operator explicitly enables collection.
+  otelReceiverEnabled: false,
   autoRefreshIntervalSeconds: 300,
   // Issue #90 change-event provenance: flips to true — permanently — the
   // first time a settings write CHANGES autoRefreshIntervalSeconds (or the
@@ -53,6 +60,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // deliberately opt-in. The engine never infers consent from shared files
   // left behind by an earlier enable/disable cycle.
   sharedUserScopeEnabled: false,
+  // Issue #338/#388: usage-queue reads drain the proxy queue. This stays an
+  // operator-owned cutover switch: release day retires both old consumers,
+  // then enables the guarded daemon consumer in the same motion.
+  usageQueueConsumerEnabled: false,
   layout: 'two-column',
   defaultSort: 'next-reset',
   notificationThresholdPercent: 25,
@@ -81,11 +92,15 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // round-trip each other's values safely. Display-only: the chip's
   // tooltip, detail popover, and VoiceOver strings are unaffected.
   deckHealthLabels: '',
+  // Issue #388 (charter d10): 0.4.6 defaults the dashboard ON. The setting is
+  // retained as a kill switch, and a stored value always wins — changing this
+  // default never rewrites an existing database's settings document.
+  usageAnalyticsEnabled: true,
 });
 
 function validateSetting(key, value) {
   if (!Object.hasOwn(DEFAULT_SETTINGS, key)) throw new Error(`unknown setting: ${key}`);
-  if (['autoRefreshEnabled', 'autoRenewEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive', 'sharedUserScopeEnabled'].includes(key) && typeof value !== 'boolean') {
+  if (['autoRefreshEnabled', 'autoRenewEnabled', 'otelReceiverEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive', 'sharedUserScopeEnabled', 'usageAnalyticsEnabled', 'usageQueueConsumerEnabled'].includes(key) && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean`);
   }
   if (key === 'autoRefreshIntervalSeconds' && (!Number.isInteger(value) || value < 60 || value > 3600)) {
@@ -162,6 +177,413 @@ function usageRow(row) {
   };
 }
 
+const USAGE_HISTORY_BUCKETS = new Set(['raw', 'hour', 'day']);
+const USAGE_HISTORY_INDEX_PADDING_MS = 24 * 60 * 60 * 1_000;
+const ISO_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/;
+
+function usageHistoryString(value, label) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`usage history ${label} is required`);
+  const normalized = value.trim();
+  if (/\p{Cc}/u.test(normalized)) throw new Error(`usage history ${label} is invalid`);
+  return normalized;
+}
+
+function usageHistoryTimestamp(value, label) {
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`usage history ${label} is required`);
+  const normalized = value.trim();
+  const parts = normalized.match(ISO_TIMESTAMP_PATTERN);
+  const year = Number(parts?.[1]);
+  const month = Number(parts?.[2]);
+  const day = Number(parts?.[3]);
+  const hour = Number(parts?.[4]);
+  const minute = Number(parts?.[5]);
+  const second = Number(parts?.[6]);
+  const offsetHour = Number(parts?.[8] || 0);
+  const offsetMinute = Number(parts?.[9] || 0);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  const timestamp = Date.parse(normalized);
+  if (!parts || month < 1 || month > 12 || day < 1 || day > daysInMonth
+      || hour > 23 || minute > 59 || second > 59 || offsetHour > 23 || offsetMinute > 59
+      || !Number.isFinite(timestamp)) {
+    throw new Error(`usage history ${label} must be an ISO timestamp`);
+  }
+  return new Date(timestamp).toISOString();
+}
+
+function usageHistoryBucketStart(observedAt, bucket) {
+  const size = bucket === 'hour' ? 60 * 60 * 1_000 : 24 * 60 * 60 * 1_000;
+  return new Date(Math.floor(Date.parse(observedAt) / size) * size).toISOString();
+}
+
+function bucketUsageHistory(rows, bucket) {
+  const buckets = new Map();
+  for (const row of rows) {
+    const bucketStart = usageHistoryBucketStart(row.observed_at, bucket);
+    let entry = buckets.get(bucketStart);
+    if (!entry) {
+      entry = {
+        bucketStart,
+        lastUsedPercent: row.used_percent,
+        lastObservedTime: Date.parse(row.observed_at),
+        lastId: row.id,
+        minUsedPercent: null,
+        maxUsedPercent: null,
+        resetsAtValues: new Set(),
+      };
+      buckets.set(bucketStart, entry);
+    } else {
+      const observedTime = Date.parse(row.observed_at);
+      if (observedTime > entry.lastObservedTime
+          || (observedTime === entry.lastObservedTime && row.id > entry.lastId)) {
+        entry.lastUsedPercent = row.used_percent;
+        entry.lastObservedTime = observedTime;
+        entry.lastId = row.id;
+      }
+    }
+    if (row.used_percent != null) {
+      entry.minUsedPercent = entry.minUsedPercent == null
+        ? row.used_percent
+        : Math.min(entry.minUsedPercent, row.used_percent);
+      entry.maxUsedPercent = entry.maxUsedPercent == null
+        ? row.used_percent
+        : Math.max(entry.maxUsedPercent, row.used_percent);
+    }
+    if (row.resets_at != null) entry.resetsAtValues.add(row.resets_at);
+  }
+  return [...buckets.values()]
+    .sort((left, right) => right.bucketStart.localeCompare(left.bucketStart))
+    .map((entry) => ({
+      bucketStart: entry.bucketStart,
+      lastUsedPercent: entry.lastUsedPercent,
+      minUsedPercent: entry.minUsedPercent,
+      maxUsedPercent: entry.maxUsedPercent,
+      resetsAtValues: [...entry.resetsAtValues].sort(),
+    }));
+}
+
+const REQUEST_USAGE_NUMBER_FIELDS = [
+  'latencyMs',
+  'ttftMs',
+  'inputUncached',
+  'inputCacheRead',
+  'inputCacheWrite',
+  'outputTotal',
+  'outputReasoning',
+  'total',
+];
+
+const CODEX_TURN_TOKEN_FIELDS = [
+  'inputTokens',
+  'cachedInputTokens',
+  'cacheWriteInputTokens',
+  'outputTokens',
+  'reasoningOutputTokens',
+  'totalTokens',
+];
+
+function validateRequestUsageRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) throw new Error('request usage record must be an object');
+  for (const key of ['requestId', 'machine', 'observedAt', 'source', 'provider', 'model']) {
+    if (typeof record[key] !== 'string' || !record[key].trim()) throw new Error(`request usage ${key} is required`);
+  }
+  if (!['claude', 'codex'].includes(record.provider)) throw new Error('request usage provider must be claude or codex');
+  const observedMs = Date.parse(record.observedAt);
+  if (!Number.isFinite(observedMs) || new Date(observedMs).toISOString() !== record.observedAt) {
+    throw new Error('request usage observedAt must be a canonical ISO timestamp');
+  }
+  if (typeof record.failed !== 'boolean') throw new Error('request usage failed must be a boolean');
+  if (record.statusCode != null && (!Number.isInteger(record.statusCode) || record.statusCode < 0)) {
+    throw new Error('request usage statusCode must be a non-negative integer or null');
+  }
+  for (const key of REQUEST_USAGE_NUMBER_FIELDS) {
+    if (record[key] != null && (!Number.isFinite(record[key]) || record[key] < 0)) {
+      throw new Error(`request usage ${key} must be a non-negative number or null`);
+    }
+  }
+  for (const key of ['inputUncached', 'inputCacheRead', 'inputCacheWrite', 'outputTotal', 'outputReasoning', 'total']) {
+    if (record[key] != null && !Number.isInteger(record[key])) {
+      throw new Error(`request usage ${key} must be an integer`);
+    }
+  }
+}
+
+function validateCodexSessionRecord(session, turns) {
+  if (!session || typeof session !== 'object' || Array.isArray(session)) throw new Error('Codex session must be an object');
+  for (const key of ['sessionId', 'profileSlug', 'machine', 'firstTimestamp', 'lastTimestamp']) {
+    if (typeof session[key] !== 'string' || !session[key].trim()) throw new Error(`Codex session ${key} is required`);
+  }
+  for (const key of ['firstTimestamp', 'lastTimestamp']) {
+    const parsed = Date.parse(session[key]);
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== session[key]) {
+      throw new Error(`Codex session ${key} must be a canonical ISO timestamp`);
+    }
+  }
+  if (session.firstTimestamp > session.lastTimestamp) throw new Error('Codex session firstTimestamp must not follow lastTimestamp');
+  if (typeof session.archived !== 'boolean') throw new Error('Codex session archived must be a boolean');
+  if (!turns || typeof turns[Symbol.iterator] !== 'function') throw new Error('Codex turns must be iterable');
+  for (const turn of turns) {
+    if (!turn || typeof turn !== 'object' || Array.isArray(turn)) throw new Error('Codex turn must be an object');
+    if (!Number.isInteger(turn.turnIndex) || turn.turnIndex < 0) throw new Error('Codex turn turnIndex must be a non-negative integer');
+    if (turn.turnId != null && (typeof turn.turnId !== 'string' || !turn.turnId.trim())) throw new Error('Codex turn turnId must be text or null');
+    if (turn.timestamp != null) {
+      const parsed = typeof turn.timestamp === 'string' ? Date.parse(turn.timestamp) : NaN;
+      if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== turn.timestamp) {
+        throw new Error('Codex turn timestamp must be a canonical ISO timestamp or null');
+      }
+    }
+    for (const key of ['durationMs', 'timeToFirstTokenMs']) {
+      if (turn[key] != null && (!Number.isFinite(turn[key]) || turn[key] < 0)) {
+        throw new Error(`Codex turn ${key} must be a non-negative number or null`);
+      }
+    }
+    for (const key of CODEX_TURN_TOKEN_FIELDS) {
+      if (!Number.isSafeInteger(turn[key]) || turn[key] < 0) throw new Error(`Codex turn ${key} must be a non-negative safe integer`);
+    }
+  }
+}
+
+function usageAggregateRow(row) {
+  return {
+    requests: Number(row?.requests || 0),
+    failed: Number(row?.failed || 0),
+    latencyMs: Number(row?.latency_ms || 0),
+    ttftMs: Number(row?.ttft_ms || 0),
+    inputUncached: Number(row?.input_uncached || 0),
+    inputCacheRead: Number(row?.input_cache_read || 0),
+    inputCacheWrite: Number(row?.input_cache_write || 0),
+    outputTotal: Number(row?.output_total || 0),
+    outputReasoning: Number(row?.output_reasoning || 0),
+    total: Number(row?.total || 0),
+  };
+}
+
+// Allowlisted usage-summary groupings. `day` is the original UTC calendar day;
+// local_day / hour / hour_of_day (issue #344) bucket in the daemon host's local
+// time, which is what the burn timeline states on the view. `model_effort`
+// (issue #345) is the one two-dimension grouping — model × reasoning effort.
+const USAGE_SUMMARY_GROUPINGS = [
+  'account', 'model', 'model_effort', 'reasoning_effort', 'day', 'local_day', 'hour', 'hour_of_day',
+];
+
+// Issue #344: the burn-timeline view filters the same aggregate by account,
+// model, and provider. Filters are equality-only and validated in the reader's
+// existing style so the route stays a pass-through of raw query strings.
+function usageSummaryFilter(value, label, subject = 'usage summary') {
+  if (value == null) return null;
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`${subject} ${label} must be a non-empty string`);
+  return value;
+}
+
+function canonicalSummaryBound(value, label, subject = 'usage summary') {
+  if (value == null) return null;
+  const timestamp = typeof value === 'string' ? Date.parse(value) : NaN;
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== value) {
+    throw new Error(`${subject} ${label} must be a canonical ISO timestamp`);
+  }
+  return value;
+}
+
+// Issue #347: session explorer bounds. The leaderboard is a ranked list, not a
+// pagination surface — a limit exists so one read can never walk the whole
+// corpus, and the response says when it clipped.
+export const USAGE_SESSIONS_DEFAULT_LIMIT = 25;
+export const USAGE_SESSIONS_MAX_LIMIT = 200;
+// Per-session context-size samples returned by the detail read. A long session
+// has thousands of requests; the trend only needs enough points to read.
+export const USAGE_SESSION_TREND_LIMIT = 500;
+export const SESSION_ANATOMY_BUCKETS = [
+  30_000, 60_000, 120_000, 300_000, 600_000, 900_000, 1_800_000,
+  3_600_000, 7_200_000, 10_800_000, 21_600_000, 43_200_000, 86_400_000,
+];
+export const SESSION_ANATOMY_MAX_BUCKETS = 72;
+export const SESSION_ANATOMY_CURVE_LIMIT = 4000;
+export const SESSION_ANATOMY_ROW_LIMIT = 100000;
+export const SESSION_ANATOMY_EVENT_LIMIT = 2000;
+export const SESSION_ANATOMY_SUBAGENT_LIMIT = 500;
+
+function localBucketKey(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+    + `T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function usageSessionsLimit(value) {
+  if (value == null || value === '') return USAGE_SESSIONS_DEFAULT_LIMIT;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > USAGE_SESSIONS_MAX_LIMIT) {
+    throw new Error(`usage sessions limit must be an integer between 1 and ${USAGE_SESSIONS_MAX_LIMIT}`);
+  }
+  return parsed;
+}
+
+// Claude transcripts store the four token splits; the session total is their
+// sum. Codex rollouts store a per-turn total the ingester validated, so it is
+// used as given rather than re-derived.
+const TRANSCRIPT_TOTAL = '(r.input_tokens + r.cache_creation_input_tokens + r.cache_read_input_tokens + r.output_tokens)';
+const TRANSCRIPT_INPUT = '(r.input_tokens + r.cache_creation_input_tokens + r.cache_read_input_tokens)';
+const CODEX_INPUT = '(t.input_tokens + t.cached_input_tokens + t.cache_write_input_tokens)';
+
+function sessionAverage(total, count) {
+  if (!count) return 0;
+  return Math.round(total / count);
+}
+
+// Issue #346 (decision 10b): project burn. A project is derived from the
+// session's cwd — the only project identity the ingested transcript/rollout
+// corpus carries. Issue #365 folds ModelDeck's exact linked-worktree layout
+// back into the parent checkout while retaining the worktree name as detail.
+// Traffic whose session has no cwd (or whose session row is missing) is NOT
+// dropped: it lands in this explicitly keyed bucket. Real cwds are absolute
+// paths, so this non-path key cannot collide with one.
+export const PROJECT_BURN_UNATTRIBUTED = 'unattributed';
+export const PROJECT_BURN_DEFAULT_LIMIT = 25;
+export const PROJECT_BURN_MAX_LIMIT = 200;
+
+function projectBurnLimit(value) {
+  if (value == null || value === '') return PROJECT_BURN_DEFAULT_LIMIT;
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > PROJECT_BURN_MAX_LIMIT) {
+    throw new Error(`project burn limit must be an integer between 1 and ${PROJECT_BURN_MAX_LIMIT}`);
+  }
+  return parsed;
+}
+
+// The measures a project row carries. inputUncached / inputCacheRead /
+// inputCacheWrite / outputTotal are exactly the four token classes the Claude
+// window-burn estimate model is fitted on (issue #348), so the view can apply
+// an account's fitted weights without re-deriving anything client-side.
+const PROJECT_BURN_MEASURES = Object.freeze([
+  'requests', 'sessions', 'totalTokens', 'reasoningTokens',
+  'inputUncached', 'inputCacheRead', 'inputCacheWrite', 'outputTotal',
+]);
+
+function emptyProjectBurnAggregate() {
+  return Object.fromEntries(PROJECT_BURN_MEASURES.map((measure) => [measure, 0]));
+}
+
+function projectBurnAggregate(row) {
+  return {
+    requests: Number(row?.requests || 0),
+    sessions: Number(row?.sessions || 0),
+    totalTokens: Number(row?.total_tokens || 0),
+    reasoningTokens: Number(row?.reasoning_tokens || 0),
+    inputUncached: Number(row?.input_uncached || 0),
+    inputCacheRead: Number(row?.input_cache_read || 0),
+    inputCacheWrite: Number(row?.input_cache_write || 0),
+    outputTotal: Number(row?.output_total || 0),
+  };
+}
+
+function addProjectBurnAggregate(target, source) {
+  for (const measure of PROJECT_BURN_MEASURES) target[measure] += source[measure];
+  return target;
+}
+
+// The estimate model's feature vector, in its own object so a caller cannot
+// accidentally feed it a derived figure (inputTokens) the fit never saw.
+function projectBurnTokenFlows(aggregate) {
+  return {
+    inputUncached: aggregate.inputUncached,
+    inputCacheRead: aggregate.inputCacheRead,
+    inputCacheWrite: aggregate.inputCacheWrite,
+    outputTotal: aggregate.outputTotal,
+  };
+}
+
+// The public shape of one aggregate: the stored measures plus the derived
+// input total, so a row reads like a session-explorer row.
+function projectBurnPayload(aggregate) {
+  return {
+    ...aggregate,
+    inputTokens: aggregate.inputUncached + aggregate.inputCacheRead + aggregate.inputCacheWrite,
+    tokenFlows: projectBurnTokenFlows(aggregate),
+  };
+}
+
+// Allowlisted local-time buckets for per-project burn over time. Keys are the
+// offset-free wall-clock strings the burn timeline already uses, so the
+// browser reads them straight back as local instants.
+const PROJECT_BURN_BUCKETS = Object.freeze({
+  local_day: (column) => `strftime('%Y-%m-%d', ${column}, 'localtime')`,
+  hour: (column) => `strftime('%Y-%m-%dT%H:00', ${column}, 'localtime')`,
+});
+
+// Both field checkout conventions fold: <repo>/.claude/worktrees/<name> AND
+// <repo>/.worktrees/<name>, including session cwds nested BELOW the worktree
+// root (…/<name>/plugin) and worktrees cut from worktrees (peeled to the
+// outermost repo). An ordinary path containing `.claude`, or the bare marker
+// directory with no name segment, remains its own project. Paths are
+// otherwise kept verbatim (never trimmed into a different path).
+const WORKTREE_MARKER_RE = /^(.+)\/(?:\.claude\/worktrees|\.worktrees)\/[^/]+(?:\/.*)?$/;
+
+function projectKeyOf(cwd) {
+  if (typeof cwd !== 'string' || !cwd.trim()) {
+    return PROJECT_BURN_UNATTRIBUTED;
+  }
+  let key = cwd;
+  for (let match = key.match(WORKTREE_MARKER_RE); match; match = key.match(WORKTREE_MARKER_RE)) {
+    key = match[1];
+  }
+  return key;
+}
+
+function projectIdentityOf(cwd) {
+  const key = projectKeyOf(cwd);
+  if (key === PROJECT_BURN_UNATTRIBUTED) return { key, project: null, worktree: null };
+  if (key === cwd) return { key, project: key, worktree: null };
+  const worktree = cwd
+    .slice(key.length + 1)
+    .replace(/^(?:\.claude\/worktrees|\.worktrees)\//, '');
+  return { key, project: key, worktree };
+}
+
+// The project predicate, in both readers' SQL, over whichever session table
+// carries the cwd. The unattributed key selects the rows a cwd cannot name —
+// including sessions missing entirely, which the LEFT JOIN leaves NULL. A
+// parent checkout selects itself plus everything under either worktree
+// marker (nested cwds included — they fold to the same parent); an explicit
+// worktree path narrows to that checkout, nested cwds included.
+function projectPredicate(column, project) {
+  if (project === PROJECT_BURN_UNATTRIBUTED) {
+    return { sql: `(${column} IS NULL OR TRIM(${column}) = '')`, params: [] };
+  }
+  // Prefix boundaries are computed by SQLite's own length(): JS .length
+  // counts UTF-16 code units while SQLite counts Unicode characters, and the
+  // two disagree the moment a path carries a non-BMP character.
+  if (projectIdentityOf(project).worktree != null) {
+    const inside = `${project}/`;
+    return {
+      sql: `(${column} = ? OR substr(${column}, 1, length(?)) = ?)`,
+      params: [project, inside, inside],
+    };
+  }
+  const claudePrefix = `${project}/.claude/worktrees/`;
+  const barePrefix = `${project}/.worktrees/`;
+  return {
+    sql: `(${column} = ? OR substr(${column}, 1, length(?)) = ? OR substr(${column}, 1, length(?)) = ?)`,
+    params: [
+      project,
+      claudePrefix,
+      claudePrefix,
+      barePrefix,
+      barePrefix,
+    ],
+  };
+}
+
+function earlier(left, right) {
+  if (left == null) return right;
+  if (right == null) return left;
+  return left < right ? left : right;
+}
+
+function later(left, right) {
+  if (left == null) return right;
+  if (right == null) return left;
+  return left > right ? left : right;
+}
+
 export class Store {
   constructor(dbPath) {
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
@@ -193,6 +615,246 @@ export class Store {
       );
       CREATE UNIQUE INDEX IF NOT EXISTS one_default_per_provider
         ON accounts(provider) WHERE is_default = 1;
+
+      CREATE TABLE IF NOT EXISTS request_usage (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL UNIQUE,
+        machine TEXT NOT NULL DEFAULT 'studio',
+        observed_at TEXT NOT NULL,
+        account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+        -- Raw proxy source: plaintext email for Claude. Store it only when
+        -- account_id is NULL.
+        source_raw TEXT,
+        provider TEXT NOT NULL CHECK(provider IN ('claude','codex')),
+        model TEXT NOT NULL,
+        alias TEXT,
+        reasoning_effort TEXT,
+        endpoint TEXT,
+        user_agent_class TEXT NOT NULL DEFAULT 'unknown',
+        failed INTEGER NOT NULL DEFAULT 0 CHECK(failed IN (0,1)),
+        status_code INTEGER,
+        latency_ms REAL,
+        ttft_ms REAL,
+        input_uncached INTEGER NOT NULL DEFAULT 0,
+        input_cache_read INTEGER NOT NULL DEFAULT 0,
+        input_cache_write INTEGER NOT NULL DEFAULT 0,
+        output_total INTEGER NOT NULL DEFAULT 0,
+        output_reasoning INTEGER NOT NULL DEFAULT 0,
+        total INTEGER NOT NULL DEFAULT 0,
+        CHECK(account_id IS NULL OR source_raw IS NULL)
+      );
+      CREATE INDEX IF NOT EXISTS request_usage_observed
+        ON request_usage(observed_at);
+      CREATE INDEX IF NOT EXISTS request_usage_account_observed
+        ON request_usage(account_id, observed_at);
+      CREATE INDEX IF NOT EXISTS request_usage_model
+        ON request_usage(model);
+      CREATE INDEX IF NOT EXISTS request_usage_reasoning_effort
+        ON request_usage(reasoning_effort);
+
+      CREATE TABLE IF NOT EXISTS codex_sessions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL UNIQUE,
+        profile_slug TEXT NOT NULL,
+        machine TEXT NOT NULL DEFAULT 'studio',
+        cwd TEXT,
+        originator TEXT,
+        source TEXT,
+        cli_version TEXT,
+        git_branch TEXT,
+        git_repo TEXT,
+        git_commit TEXT,
+        first_timestamp TEXT NOT NULL,
+        last_timestamp TEXT NOT NULL,
+        archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1))
+      );
+      CREATE INDEX IF NOT EXISTS codex_sessions_profile_last
+        ON codex_sessions(profile_slug, last_timestamp);
+      CREATE INDEX IF NOT EXISTS codex_sessions_git_repo
+        ON codex_sessions(git_repo);
+
+      CREATE TABLE IF NOT EXISTS codex_turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES codex_sessions(session_id) ON DELETE CASCADE,
+        turn_index INTEGER NOT NULL,
+        turn_id TEXT,
+        model TEXT,
+        reasoning_effort TEXT,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_write_input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        duration_ms REAL,
+        time_to_first_token_ms REAL,
+        timestamp TEXT,
+        UNIQUE(session_id, turn_index)
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS codex_turns_session_turn_id
+        ON codex_turns(session_id, turn_id) WHERE turn_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS codex_turns_timestamp
+        ON codex_turns(timestamp);
+      CREATE INDEX IF NOT EXISTS codex_turns_model_effort
+        ON codex_turns(model, reasoning_effort);
+      CREATE TABLE IF NOT EXISTS transcript_sessions (
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        machine TEXT NOT NULL DEFAULT 'studio',
+        cwd TEXT,
+        git_branch TEXT,
+        entrypoint TEXT,
+        client_version TEXT,
+        first_at TEXT,
+        last_at TEXT,
+        title TEXT,
+        -- Internal precedence marker: a custom title must not be replaced by
+        -- a later last-prompt record during a replay.
+        title_source TEXT CHECK(title_source IN ('custom-title','last-prompt')),
+        PRIMARY KEY(session_id, profile_slug)
+      );
+      CREATE INDEX IF NOT EXISTS transcript_sessions_profile_last
+        ON transcript_sessions(profile_slug, last_at);
+      CREATE INDEX IF NOT EXISTS transcript_sessions_cwd
+        ON transcript_sessions(cwd);
+
+      CREATE TABLE IF NOT EXISTS transcript_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        -- Older transcripts use request:<requestId>. Current requestId-less
+        -- transcripts use message:<sessionId>:<message.id>, falling back to
+        -- record:<sessionId>:<uuid> only when message.id is absent.
+        dedupe_key TEXT NOT NULL,
+        request_id TEXT,
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        message_id TEXT,
+        record_uuid TEXT,
+        model TEXT NOT NULL,
+        effort TEXT,
+        observed_at TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_ephemeral_5m_input_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_ephemeral_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
+        is_sidechain INTEGER NOT NULL DEFAULT 0 CHECK(is_sidechain IN (0,1)),
+        agent_id TEXT,
+        FOREIGN KEY(session_id, profile_slug)
+          REFERENCES transcript_sessions(session_id, profile_slug) ON DELETE CASCADE,
+        UNIQUE(dedupe_key, profile_slug)
+      );
+      -- Within one profile, this deliberately makes INSERT OR IGNORE drop
+      -- provider-side requestId collisions even when the dedupe_key differs.
+      CREATE UNIQUE INDEX IF NOT EXISTS transcript_requests_request_id
+        ON transcript_requests(request_id, profile_slug) WHERE request_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS transcript_requests_session_observed
+        ON transcript_requests(session_id, profile_slug, observed_at);
+      CREATE INDEX IF NOT EXISTS transcript_requests_model_effort
+        ON transcript_requests(model, effort);
+      CREATE INDEX IF NOT EXISTS transcript_requests_agent
+        ON transcript_requests(agent_id) WHERE agent_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS transcript_subagents (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        agent_type TEXT,
+        resolved_model TEXT,
+        total_tokens INTEGER,
+        tool_stats_json TEXT,
+        duration_ms INTEGER,
+        observed_at TEXT,
+        PRIMARY KEY(agent_id, profile_slug),
+        FOREIGN KEY(session_id, profile_slug)
+          REFERENCES transcript_sessions(session_id, profile_slug) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS transcript_subagents_session
+        ON transcript_subagents(session_id, profile_slug);
+
+      CREATE TABLE IF NOT EXISTS transcript_skill_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_key TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        skill TEXT,
+        command_name TEXT,
+        observed_at TEXT NOT NULL,
+        CHECK((skill IS NOT NULL AND command_name IS NULL)
+          OR (skill IS NULL AND command_name IS NOT NULL)),
+        FOREIGN KEY(session_id, profile_slug)
+          REFERENCES transcript_sessions(session_id, profile_slug) ON DELETE CASCADE,
+        UNIQUE(event_key, profile_slug)
+      );
+      CREATE INDEX IF NOT EXISTS transcript_skill_events_session_observed
+        ON transcript_skill_events(session_id, profile_slug, observed_at);
+      CREATE INDEX IF NOT EXISTS transcript_skill_events_skill
+        ON transcript_skill_events(skill) WHERE skill IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS transcript_skill_events_command
+        ON transcript_skill_events(command_name) WHERE command_name IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS otel_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ingest_key TEXT NOT NULL UNIQUE,
+        machine TEXT NOT NULL DEFAULT 'studio',
+        metric_name TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        value REAL NOT NULL,
+        model TEXT,
+        effort TEXT,
+        speed TEXT,
+        query_source TEXT,
+        agent_name TEXT,
+        skill_name TEXT,
+        session_id TEXT,
+        account_uuid TEXT,
+        organization_id TEXT,
+        token_type TEXT,
+        details_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS otel_metrics_observed ON otel_metrics(observed_at);
+      CREATE INDEX IF NOT EXISTS otel_metrics_account_observed ON otel_metrics(account_uuid, observed_at);
+      CREATE INDEX IF NOT EXISTS otel_metrics_session ON otel_metrics(session_id);
+      CREATE INDEX IF NOT EXISTS otel_metrics_model_effort ON otel_metrics(model, effort);
+
+      CREATE TABLE IF NOT EXISTS otel_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ingest_key TEXT NOT NULL UNIQUE,
+        machine TEXT NOT NULL DEFAULT 'studio',
+        event_name TEXT NOT NULL,
+        observed_at TEXT NOT NULL,
+        model TEXT,
+        effort TEXT,
+        speed TEXT,
+        query_source TEXT,
+        agent_name TEXT,
+        skill_name TEXT,
+        session_id TEXT,
+        account_uuid TEXT,
+        organization_id TEXT,
+        token_type TEXT,
+        request_id TEXT,
+        input_tokens INTEGER,
+        output_tokens INTEGER,
+        cache_read_tokens INTEGER,
+        cache_creation_tokens INTEGER,
+        cost_usd REAL,
+        details_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS otel_events_observed ON otel_events(observed_at);
+      CREATE INDEX IF NOT EXISTS otel_events_account_observed ON otel_events(account_uuid, observed_at);
+      CREATE INDEX IF NOT EXISTS otel_events_session ON otel_events(session_id);
+      CREATE INDEX IF NOT EXISTS otel_events_request ON otel_events(request_id);
+      CREATE INDEX IF NOT EXISTS otel_events_model_effort ON otel_events(model, effort);
+
+      CREATE TABLE IF NOT EXISTS otel_quarantine (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ingest_key TEXT NOT NULL UNIQUE,
+        received_at TEXT NOT NULL,
+        endpoint TEXT NOT NULL CHECK(endpoint IN ('metrics','logs')),
+        reason TEXT NOT NULL,
+        raw_json TEXT NOT NULL,
+        truncated INTEGER NOT NULL DEFAULT 0 CHECK(truncated IN (0,1))
+      );
 
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
@@ -229,6 +891,59 @@ export class Store {
       CREATE INDEX IF NOT EXISTS usage_observed
         ON usage_snapshots(observed_at, id);
 
+      -- Issue #383: learned weights live at provider-pool grain. Claude's
+      -- profiles are proxy routing identities within one subscription pool,
+      -- so an account-grain fit is not provider truth.
+      CREATE TABLE IF NOT EXISTS usage_estimate_fits (
+        pool_id TEXT NOT NULL,
+        provider TEXT NOT NULL CHECK(provider IN ('claude','codex')),
+        scope TEXT NOT NULL CHECK(scope IN ('weekly','5-hour')),
+        input_uncached_weight REAL,
+        input_cache_read_weight REAL,
+        input_cache_write_weight REAL,
+        output_total_weight REAL,
+        fit_quality REAL,
+        identifiability TEXT NOT NULL
+          CHECK(identifiability IN ('well-conditioned','ill-conditioned','not-assessed')),
+        condition_ratio REAL,
+        intervals_used INTEGER NOT NULL CHECK(intervals_used >= 0),
+        method TEXT NOT NULL,
+        reason TEXT,
+        fitted_at TEXT NOT NULL,
+        PRIMARY KEY(pool_id, scope),
+        CHECK(input_uncached_weight IS NULL OR input_uncached_weight >= 0),
+        CHECK(input_cache_read_weight IS NULL OR input_cache_read_weight >= 0),
+        CHECK(input_cache_write_weight IS NULL OR input_cache_write_weight >= 0),
+        CHECK(output_total_weight IS NULL OR output_total_weight >= 0),
+        CHECK(fit_quality IS NULL OR (fit_quality >= 0 AND fit_quality <= 1)),
+        CHECK(condition_ratio IS NULL OR (condition_ratio >= 0 AND condition_ratio <= 1)),
+        CHECK(
+          (reason IS NULL
+            AND input_uncached_weight IS NOT NULL
+            AND input_cache_read_weight IS NOT NULL
+            AND input_cache_write_weight IS NOT NULL
+            AND output_total_weight IS NOT NULL
+            AND fit_quality IS NOT NULL
+            AND identifiability = 'well-conditioned'
+            AND condition_ratio IS NOT NULL
+            AND condition_ratio >= 0.00000001)
+          OR
+          (reason IS NOT NULL
+            AND input_uncached_weight IS NULL
+            AND input_cache_read_weight IS NULL
+            AND input_cache_write_weight IS NULL
+            AND output_total_weight IS NULL
+            AND fit_quality IS NULL
+            AND (
+              (identifiability = 'ill-conditioned'
+                AND condition_ratio IS NOT NULL
+                AND condition_ratio < 0.00000001)
+              OR
+              (identifiability = 'not-assessed' AND condition_ratio IS NULL)
+            ))
+        )
+      );
+
       CREATE TABLE IF NOT EXISTS launch_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
@@ -248,6 +963,78 @@ export class Store {
     this.db.prepare(`
       INSERT OR IGNORE INTO settings(id, value_json, updated_at) VALUES (1, '{}', ?)
     `).run(now());
+    // Take the write lock BEFORE probing the schema: two Stores opening
+    // concurrently (daemon + CLI refit) could otherwise both see the legacy
+    // table, and the second would re-migrate the already-migrated table,
+    // downgrading a fresh fit to 'not-assessed'.
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const estimateFitColumns = new Set(
+        this.db.prepare('PRAGMA table_info(usage_estimate_fits)').all().map((column) => column.name),
+      );
+      if (!estimateFitColumns.has('pool_id')) {
+        // Account-grain weights are invalid for a pooled provider and cannot
+        // be promoted. Drop them during the idempotent shape migration; the
+        // recurring ingest immediately writes fresh pool-grain fits.
+        this.db.exec(`
+        ALTER TABLE usage_estimate_fits RENAME TO usage_estimate_fits_legacy;
+        CREATE TABLE usage_estimate_fits (
+          pool_id TEXT NOT NULL,
+          provider TEXT NOT NULL CHECK(provider IN ('claude','codex')),
+          scope TEXT NOT NULL CHECK(scope IN ('weekly','5-hour')),
+          input_uncached_weight REAL,
+          input_cache_read_weight REAL,
+          input_cache_write_weight REAL,
+          output_total_weight REAL,
+          fit_quality REAL,
+          identifiability TEXT NOT NULL
+            CHECK(identifiability IN ('well-conditioned','ill-conditioned','not-assessed')),
+          condition_ratio REAL,
+          intervals_used INTEGER NOT NULL CHECK(intervals_used >= 0),
+          method TEXT NOT NULL,
+          reason TEXT,
+          fitted_at TEXT NOT NULL,
+          PRIMARY KEY(pool_id, scope),
+          CHECK(input_uncached_weight IS NULL OR input_uncached_weight >= 0),
+          CHECK(input_cache_read_weight IS NULL OR input_cache_read_weight >= 0),
+          CHECK(input_cache_write_weight IS NULL OR input_cache_write_weight >= 0),
+          CHECK(output_total_weight IS NULL OR output_total_weight >= 0),
+          CHECK(fit_quality IS NULL OR (fit_quality >= 0 AND fit_quality <= 1)),
+          CHECK(condition_ratio IS NULL OR (condition_ratio >= 0 AND condition_ratio <= 1)),
+          CHECK(
+            (reason IS NULL
+              AND input_uncached_weight IS NOT NULL
+              AND input_cache_read_weight IS NOT NULL
+              AND input_cache_write_weight IS NOT NULL
+              AND output_total_weight IS NOT NULL
+              AND fit_quality IS NOT NULL
+              AND identifiability = 'well-conditioned'
+              AND condition_ratio IS NOT NULL
+              AND condition_ratio >= 0.00000001)
+            OR
+            (reason IS NOT NULL
+              AND input_uncached_weight IS NULL
+              AND input_cache_read_weight IS NULL
+              AND input_cache_write_weight IS NULL
+              AND output_total_weight IS NULL
+              AND fit_quality IS NULL
+              AND (
+                (identifiability = 'ill-conditioned'
+                  AND condition_ratio IS NOT NULL
+                  AND condition_ratio < 0.00000001)
+                OR
+                (identifiability = 'not-assessed' AND condition_ratio IS NULL)
+              ))
+          )
+        );
+        DROP TABLE usage_estimate_fits_legacy;
+        `);
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
     const accountColumns = new Set(this.db.prepare('PRAGMA table_info(accounts)').all().map((column) => column.name));
     if (!accountColumns.has('identity')) this.db.exec("ALTER TABLE accounts ADD COLUMN identity TEXT NOT NULL DEFAULT ''");
   }
@@ -480,6 +1267,1668 @@ export class Store {
       ORDER BY u.account_id, u.scope
     `).all();
     return rows.map(usageRow);
+  }
+
+  usageHistory({ accountId, scope, since, until, bucket = 'raw' } = {}) {
+    const normalizedAccountId = usageHistoryString(accountId, 'accountId');
+    const normalizedScope = usageHistoryString(scope, 'scope');
+    const normalizedSince = usageHistoryTimestamp(since, 'since');
+    const normalizedUntil = usageHistoryTimestamp(until, 'until');
+    if (normalizedSince > normalizedUntil) throw new Error('usage history since must not be after until');
+    if (!USAGE_HISTORY_BUCKETS.has(bucket)) throw new Error('usage history bucket must be raw, hour, or day');
+
+    // observed_at predates this reader and may use another valid ISO offset or
+    // omit milliseconds. Pad the index range, then compare/order exact instants.
+    const indexedSince = new Date(Date.parse(normalizedSince) - USAGE_HISTORY_INDEX_PADDING_MS).toISOString();
+    const indexedUntil = new Date(Date.parse(normalizedUntil) + USAGE_HISTORY_INDEX_PADDING_MS).toISOString();
+    const selection = bucket === 'raw' ? '*' : 'id, used_percent, resets_at, observed_at';
+    const orderAndLimit = bucket === 'raw' ? 'ORDER BY julianday(observed_at) DESC, id DESC LIMIT ?' : '';
+    const statement = this.db.prepare(`
+      SELECT ${selection} FROM usage_snapshots INDEXED BY usage_account_scope_observed
+      WHERE account_id = ? AND scope = ?
+        AND observed_at >= ? AND observed_at <= ?
+        AND julianday(observed_at) >= julianday(?)
+        AND julianday(observed_at) <= julianday(?)
+      ${orderAndLimit}
+    `);
+    const parameters = [
+      normalizedAccountId,
+      normalizedScope,
+      indexedSince,
+      indexedUntil,
+      normalizedSince,
+      normalizedUntil,
+    ];
+    const rows = bucket === 'raw'
+      ? statement.all(...parameters, USAGE_HISTORY_RAW_LIMIT + 1)
+      : statement.iterate(...parameters);
+
+    const result = {
+      accountId: normalizedAccountId,
+      scope: normalizedScope,
+      since: normalizedSince,
+      until: normalizedUntil,
+      bucket,
+      rows: bucket === 'raw'
+        ? rows.slice(0, USAGE_HISTORY_RAW_LIMIT).map(usageRow)
+        : bucketUsageHistory(rows, bucket),
+      truncated: bucket === 'raw' && rows.length > USAGE_HISTORY_RAW_LIMIT,
+    };
+    return result;
+  }
+
+  /// Insert normalized proxy request records as one transaction. The archive
+  /// source resolves only Claude accounts in this slice: Codex account
+  /// identities are intentionally blank until the explicit mapping follow-up.
+  /// INSERT OR IGNORE makes request_id the durable replay/idempotency key.
+  ingestRequestUsage(records) {
+    if (!records || typeof records[Symbol.iterator] !== 'function') throw new Error('request usage records must be iterable');
+    const resolveAccount = this.db.prepare(`
+      SELECT id FROM accounts
+      WHERE provider = 'claude' AND identity <> '' AND identity = ? COLLATE NOCASE
+      ORDER BY id LIMIT 2
+    `);
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO request_usage(
+        request_id, machine, observed_at, account_id, source_raw,
+        provider, model, alias, reasoning_effort, endpoint, user_agent_class,
+        failed, status_code, latency_ms, ttft_ms,
+        input_uncached, input_cache_read, input_cache_write,
+        output_total, output_reasoning, total
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const summary = { inserted: 0, duplicates: 0, resolved: 0, unresolved: 0 };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const record of records) {
+        validateRequestUsageRecord(record);
+        const matches = record.provider === 'claude' ? resolveAccount.all(record.source) : [];
+        const accountId = matches.length === 1 ? matches[0].id : null;
+        const result = insert.run(
+          record.requestId,
+          record.machine,
+          record.observedAt,
+          accountId,
+          accountId == null ? record.source : null,
+          record.provider,
+          record.model,
+          record.alias || null,
+          record.reasoningEffort || null,
+          record.endpoint || null,
+          record.userAgentClass || 'unknown',
+          record.failed ? 1 : 0,
+          record.statusCode ?? null,
+          record.latencyMs ?? null,
+          record.ttftMs ?? null,
+          record.inputUncached ?? 0,
+          record.inputCacheRead ?? 0,
+          record.inputCacheWrite ?? 0,
+          record.outputTotal ?? 0,
+          record.outputReasoning ?? 0,
+          record.total ?? 0,
+        );
+        if (result.changes === 0) {
+          summary.duplicates += 1;
+        } else {
+          summary.inserted += 1;
+          if (accountId == null) summary.unresolved += 1;
+          else summary.resolved += 1;
+        }
+      }
+      this.resolveRequestUsageAccounts();
+      this.db.exec('COMMIT');
+      return summary;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /// Upsert one streamed Codex rollout summary. Active rollout files grow in
+  /// place, so replay safety cannot be INSERT-only: the session bounds and
+  /// existing turn aggregates must advance on later scans. The stable
+  /// (session_id, turn_index) key keeps the operation idempotent, while the
+  /// partial turn_id index preserves the provider identifier when present.
+  ingestCodexSession(session, turns) {
+    turns = [...turns];
+    validateCodexSessionRecord(session, turns);
+    const insertSession = this.db.prepare(`
+      INSERT INTO codex_sessions(
+        session_id, profile_slug, machine, cwd, originator, source, cli_version,
+        git_branch, git_repo, git_commit, first_timestamp, last_timestamp, archived
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        profile_slug=excluded.profile_slug,
+        machine=excluded.machine,
+        cwd=COALESCE(excluded.cwd, codex_sessions.cwd),
+        originator=COALESCE(excluded.originator, codex_sessions.originator),
+        source=COALESCE(excluded.source, codex_sessions.source),
+        cli_version=COALESCE(excluded.cli_version, codex_sessions.cli_version),
+        git_branch=COALESCE(excluded.git_branch, codex_sessions.git_branch),
+        git_repo=COALESCE(excluded.git_repo, codex_sessions.git_repo),
+        git_commit=COALESCE(excluded.git_commit, codex_sessions.git_commit),
+        first_timestamp=MIN(codex_sessions.first_timestamp, excluded.first_timestamp),
+        last_timestamp=MAX(codex_sessions.last_timestamp, excluded.last_timestamp),
+        archived=MAX(codex_sessions.archived, excluded.archived)
+    `);
+    const insertTurn = this.db.prepare(`
+      INSERT INTO codex_turns(
+        session_id, turn_index, turn_id, model, reasoning_effort,
+        input_tokens, cached_input_tokens, cache_write_input_tokens,
+        output_tokens, reasoning_output_tokens, total_tokens,
+        duration_ms, time_to_first_token_ms, timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, turn_index) DO UPDATE SET
+        turn_id=COALESCE(excluded.turn_id, codex_turns.turn_id),
+        model=COALESCE(excluded.model, codex_turns.model),
+        reasoning_effort=COALESCE(excluded.reasoning_effort, codex_turns.reasoning_effort),
+        input_tokens=excluded.input_tokens,
+        cached_input_tokens=excluded.cached_input_tokens,
+        cache_write_input_tokens=excluded.cache_write_input_tokens,
+        output_tokens=excluded.output_tokens,
+        reasoning_output_tokens=excluded.reasoning_output_tokens,
+        total_tokens=excluded.total_tokens,
+        duration_ms=COALESCE(excluded.duration_ms, codex_turns.duration_ms),
+        time_to_first_token_ms=COALESCE(excluded.time_to_first_token_ms, codex_turns.time_to_first_token_ms),
+        timestamp=COALESCE(excluded.timestamp, codex_turns.timestamp)
+    `);
+    const existingSession = this.db.prepare('SELECT 1 FROM codex_sessions WHERE session_id = ?');
+    const existingTurn = this.db.prepare('SELECT 1 FROM codex_turns WHERE session_id = ? AND turn_index = ?');
+    const summary = { sessionsInserted: 0, sessionsUpdated: 0, turnsInserted: 0, turnsUpdated: 0 };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const sessionExists = Boolean(existingSession.get(session.sessionId));
+      insertSession.run(
+        session.sessionId,
+        session.profileSlug,
+        session.machine,
+        session.cwd ?? null,
+        session.originator ?? null,
+        session.source ?? null,
+        session.cliVersion ?? null,
+        session.gitBranch ?? null,
+        session.gitRepo ?? null,
+        session.gitCommit ?? null,
+        session.firstTimestamp,
+        session.lastTimestamp,
+        session.archived ? 1 : 0,
+      );
+      if (sessionExists) summary.sessionsUpdated += 1;
+      else summary.sessionsInserted += 1;
+      for (const turn of turns) {
+        const turnExists = Boolean(existingTurn.get(session.sessionId, turn.turnIndex));
+        insertTurn.run(
+          session.sessionId,
+          turn.turnIndex,
+          turn.turnId ?? null,
+          turn.model ?? null,
+          turn.reasoningEffort ?? null,
+          turn.inputTokens,
+          turn.cachedInputTokens,
+          turn.cacheWriteInputTokens,
+          turn.outputTokens,
+          turn.reasoningOutputTokens,
+          turn.totalTokens,
+          turn.durationMs ?? null,
+          turn.timeToFirstTokenMs ?? null,
+          turn.timestamp ?? null,
+        );
+        if (turnExists) summary.turnsUpdated += 1;
+        else summary.turnsInserted += 1;
+      }
+      this.db.exec('COMMIT');
+      return summary;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /// Insert one bounded streaming batch from Claude transcript JSONL files.
+  /// Parent Agent rollup totals belong only in transcript_subagents; callers
+  /// put the subagent file's actual API calls in transcript_requests so token
+  /// accounting never adds both descriptions of the same work.
+  ingestTranscriptBatch({ sessions = [], requests = [], subagents = [], skills = [] } = {}) {
+    const insertSession = this.db.prepare(`
+      INSERT OR IGNORE INTO transcript_sessions(
+        session_id, profile_slug, machine, cwd, git_branch, entrypoint,
+        client_version, first_at, last_at, title, title_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const updateSession = this.db.prepare(`
+      UPDATE transcript_sessions SET
+        cwd = COALESCE(?, cwd),
+        git_branch = COALESCE(?, git_branch),
+        entrypoint = COALESCE(?, entrypoint),
+        client_version = COALESCE(?, client_version),
+        first_at = CASE
+          WHEN ? IS NULL THEN first_at
+          WHEN first_at IS NULL OR ? < first_at THEN ?
+          ELSE first_at
+        END,
+        last_at = CASE
+          WHEN ? IS NULL THEN last_at
+          WHEN last_at IS NULL OR ? > last_at THEN ?
+          ELSE last_at
+        END,
+        title = CASE
+          WHEN ? IS NULL THEN title
+          WHEN title_source = 'custom-title' AND ? <> 'custom-title' THEN title
+          ELSE ?
+        END,
+        title_source = CASE
+          WHEN ? IS NULL THEN title_source
+          WHEN title_source = 'custom-title' AND ? <> 'custom-title' THEN title_source
+          ELSE ?
+        END
+      WHERE session_id = ? AND profile_slug = ?
+    `);
+    const insertRequest = this.db.prepare(`
+      INSERT OR IGNORE INTO transcript_requests(
+        dedupe_key, request_id, session_id, profile_slug, message_id, record_uuid,
+        model, effort, observed_at, input_tokens,
+        cache_creation_input_tokens, cache_read_input_tokens, output_tokens,
+        cache_creation_ephemeral_5m_input_tokens,
+        cache_creation_ephemeral_1h_input_tokens, is_sidechain, agent_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertSubagent = this.db.prepare(`
+      INSERT OR IGNORE INTO transcript_subagents(
+        agent_id, session_id, profile_slug, agent_type, resolved_model, total_tokens,
+        tool_stats_json, duration_ms, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const updateSubagent = this.db.prepare(`
+      UPDATE transcript_subagents SET
+        agent_type = COALESCE(?, agent_type),
+        resolved_model = COALESCE(?, resolved_model),
+        total_tokens = COALESCE(?, total_tokens),
+        tool_stats_json = COALESCE(?, tool_stats_json),
+        duration_ms = COALESCE(?, duration_ms),
+        observed_at = COALESCE(?, observed_at)
+      WHERE agent_id = ? AND profile_slug = ?
+    `);
+    const insertSkill = this.db.prepare(`
+      INSERT OR IGNORE INTO transcript_skill_events(
+        event_key, session_id, profile_slug, skill, command_name, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const summary = { sessions: 0, requests: 0, subagents: 0, skills: 0 };
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const session of sessions) {
+        const inserted = insertSession.run(
+          session.sessionId,
+          session.profileSlug,
+          session.machine,
+          session.cwd ?? null,
+          session.gitBranch ?? null,
+          session.entrypoint ?? null,
+          session.clientVersion ?? null,
+          session.firstAt ?? null,
+          session.lastAt ?? null,
+          session.title ?? null,
+          session.titleSource ?? null,
+        );
+        if (inserted.changes > 0) summary.sessions += 1;
+        else updateSession.run(
+          session.cwd ?? null,
+          session.gitBranch ?? null,
+          session.entrypoint ?? null,
+          session.clientVersion ?? null,
+          session.firstAt ?? null,
+          session.firstAt ?? null,
+          session.firstAt ?? null,
+          session.lastAt ?? null,
+          session.lastAt ?? null,
+          session.lastAt ?? null,
+          session.title ?? null,
+          session.titleSource ?? null,
+          session.title ?? null,
+          session.titleSource ?? null,
+          session.titleSource ?? null,
+          session.titleSource ?? null,
+          session.sessionId,
+          session.profileSlug,
+        );
+      }
+      for (const request of requests) {
+        const result = insertRequest.run(
+          request.dedupeKey,
+          request.requestId ?? null,
+          request.sessionId,
+          request.profileSlug,
+          request.messageId ?? null,
+          request.recordUuid ?? null,
+          request.model,
+          request.effort ?? null,
+          request.observedAt,
+          request.inputTokens,
+          request.cacheCreationInputTokens,
+          request.cacheReadInputTokens,
+          request.outputTokens,
+          request.cacheCreationEphemeral5mInputTokens,
+          request.cacheCreationEphemeral1hInputTokens,
+          request.isSidechain ? 1 : 0,
+          request.agentId ?? null,
+        );
+        if (result.changes > 0) summary.requests += 1;
+      }
+      for (const subagent of subagents) {
+        const inserted = insertSubagent.run(
+          subagent.agentId,
+          subagent.sessionId,
+          subagent.profileSlug,
+          subagent.agentType ?? null,
+          subagent.resolvedModel ?? null,
+          subagent.totalTokens ?? null,
+          subagent.toolStatsJson ?? null,
+          subagent.durationMs ?? null,
+          subagent.observedAt ?? null,
+        );
+        if (inserted.changes > 0) summary.subagents += 1;
+        else updateSubagent.run(
+          subagent.agentType ?? null,
+          subagent.resolvedModel ?? null,
+          subagent.totalTokens ?? null,
+          subagent.toolStatsJson ?? null,
+          subagent.durationMs ?? null,
+          subagent.observedAt ?? null,
+          subagent.agentId,
+          subagent.profileSlug,
+        );
+      }
+      for (const skill of skills) {
+        const result = insertSkill.run(
+          skill.eventKey,
+          skill.sessionId,
+          skill.profileSlug,
+          skill.skill ?? null,
+          skill.commandName ?? null,
+          skill.observedAt,
+        );
+        if (result.changes > 0) summary.skills += 1;
+      }
+      this.db.exec('COMMIT');
+      return summary;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /// Attach previously unresolved Claude rows when their raw proxy source now
+  /// identifies exactly one account. LIMIT 2 preserves the ingest ambiguity
+  /// guard: zero or multiple case-insensitive identity matches remain NULL.
+  resolveRequestUsageAccounts() {
+    const unresolvedSources = this.db.prepare(`
+      SELECT DISTINCT source_raw FROM request_usage
+      WHERE account_id IS NULL AND provider = 'claude' AND source_raw IS NOT NULL
+    `).all();
+    const resolveAccount = this.db.prepare(`
+      SELECT id FROM accounts
+      WHERE provider = 'claude' AND identity <> '' AND identity = ? COLLATE NOCASE
+      ORDER BY id LIMIT 2
+    `);
+    const resolveRows = this.db.prepare(`
+      UPDATE request_usage
+      SET account_id = ?, source_raw = NULL
+      WHERE account_id IS NULL AND provider = 'claude' AND source_raw = ? COLLATE NOCASE
+    `);
+    let resolved = 0;
+    for (const row of unresolvedSources) {
+      const matches = resolveAccount.all(row.source_raw);
+      if (matches.length === 1) resolved += resolveRows.run(matches[0].id, row.source_raw).changes;
+    }
+    return resolved;
+  }
+
+  ingestOtelMetrics(records) {
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO otel_metrics(
+        ingest_key, machine, metric_name, observed_at, value, model, effort,
+        speed, query_source, agent_name, skill_name, session_id, account_uuid,
+        organization_id, token_type, details_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    return this.#ingestOtel(records, (record) => insert.run(
+      record.ingestKey, 'studio', record.metricName, record.observedAt, record.value,
+      record.model, record.effort, record.speed, record.querySource, record.agentName,
+      record.skillName, record.sessionId, record.accountUuid, record.organizationId,
+      record.tokenType, JSON.stringify(record.details || {}),
+    ));
+  }
+
+  ingestOtelEvents(records) {
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO otel_events(
+        ingest_key, machine, event_name, observed_at, model, effort, speed,
+        query_source, agent_name, skill_name, session_id, account_uuid,
+        organization_id, token_type, request_id, input_tokens, output_tokens,
+        cache_read_tokens, cache_creation_tokens, cost_usd, details_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    return this.#ingestOtel(records, (record) => insert.run(
+      record.ingestKey, 'studio', record.eventName, record.observedAt, record.model,
+      record.effort, record.speed, record.querySource, record.agentName, record.skillName,
+      record.sessionId, record.accountUuid, record.organizationId, record.tokenType,
+      record.requestId, record.inputTokens, record.outputTokens, record.cacheReadTokens,
+      record.cacheCreationTokens, record.costUsd, JSON.stringify(record.details || {}),
+    ));
+  }
+
+  ingestOtelQuarantine(records) {
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO otel_quarantine(
+        ingest_key, received_at, endpoint, reason, raw_json, truncated
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    const receivedAt = now();
+    return this.#ingestOtel(records, (record) => insert.run(
+      record.ingestKey, receivedAt, record.endpoint, record.reason, record.rawJson,
+      record.truncated ? 1 : 0,
+    ));
+  }
+
+  #ingestOtel(records, runInsert) {
+    if (!Array.isArray(records)) throw new Error('OTLP records must be an array');
+    const summary = { inserted: 0, duplicates: 0 };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const record of records) {
+        const result = runInsert(record);
+        if (result.changes === 0) summary.duplicates += 1;
+        else summary.inserted += 1;
+      }
+      this.db.exec('COMMIT');
+      return summary;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /// Aggregate the request warehouse over a half-open [since, until) range.
+  /// One allowlisted grouping is selected per read; no groupBy returns totals
+  /// only. Stored timestamps are canonical UTC, so indexed text bounds and
+  /// UTC-day grouping agree.
+  ///
+  /// Issue #344 adds three local-time groupings for the burn timeline — hour,
+  /// local_day, and the 24-bucket hour_of_day fold — plus account/model/
+  /// provider filters. The filters narrow totals and groups alike, so a
+  /// filtered chart always reconciles with the filtered totals it is drawn
+  /// beside. The pre-existing UTC `day` grouping is untouched.
+  usageSummary({
+    since = null, until = null, groupBy = null,
+    accountId = null, model = null, provider = null,
+  } = {}) {
+    since = canonicalSummaryBound(since, 'since');
+    until = canonicalSummaryBound(until, 'until');
+    if (since && until && since >= until) throw new Error('usage summary since must be earlier than until');
+    if (groupBy != null && !USAGE_SUMMARY_GROUPINGS.includes(groupBy)) {
+      throw new Error(`usage summary groupBy must be ${USAGE_SUMMARY_GROUPINGS.slice(0, -1).join(', ')}, or ${USAGE_SUMMARY_GROUPINGS.at(-1)}`);
+    }
+    accountId = usageSummaryFilter(accountId, 'accountId');
+    model = usageSummaryFilter(model, 'model');
+    provider = usageSummaryFilter(provider, 'provider');
+    if (provider != null && !['claude', 'codex'].includes(provider)) {
+      throw new Error('usage summary provider must be claude or codex');
+    }
+
+    const clauses = [];
+    const params = [];
+    if (since) { clauses.push('ru.observed_at >= ?'); params.push(since); }
+    if (until) { clauses.push('ru.observed_at < ?'); params.push(until); }
+    if (accountId) { clauses.push('ru.account_id = ?'); params.push(accountId); }
+    if (model) { clauses.push('ru.model = ?'); params.push(model); }
+    if (provider) { clauses.push('ru.provider = ?'); params.push(provider); }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const aggregates = `
+      COUNT(*) AS requests,
+      COALESCE(SUM(ru.failed), 0) AS failed,
+      COALESCE(SUM(ru.latency_ms), 0) AS latency_ms,
+      COALESCE(SUM(ru.ttft_ms), 0) AS ttft_ms,
+      COALESCE(SUM(ru.input_uncached), 0) AS input_uncached,
+      COALESCE(SUM(ru.input_cache_read), 0) AS input_cache_read,
+      COALESCE(SUM(ru.input_cache_write), 0) AS input_cache_write,
+      COALESCE(SUM(ru.output_total), 0) AS output_total,
+      COALESCE(SUM(ru.output_reasoning), 0) AS output_reasoning,
+      COALESCE(SUM(ru.total), 0) AS total
+    `;
+    // Totals and groups are one logical response. Hold a read snapshot across
+    // both SELECTs so a separate ingester connection cannot commit between
+    // them and produce totals that disagree with the grouped subtotals.
+    this.db.exec('BEGIN');
+    try {
+      const totals = usageAggregateRow(this.db.prepare(`
+        SELECT ${aggregates} FROM request_usage ru ${where}
+      `).get(...params));
+
+      let groups = [];
+      if (groupBy === 'account') {
+        groups = this.db.prepare(`
+          SELECT ru.account_id, ru.source_raw, ru.provider, a.label AS account_label, ${aggregates}
+          FROM request_usage ru
+          LEFT JOIN accounts a ON a.id = ru.account_id
+          ${where}
+          GROUP BY ru.account_id, ru.source_raw, ru.provider, a.label
+          ORDER BY COALESCE(a.label, ru.source_raw, ''), ru.provider, ru.account_id
+        `).all(...params).map((row) => {
+          const unresolvedSource = row.account_id == null && row.source_raw != null
+            ? `unresolved-${crypto.createHash('sha256').update(row.source_raw).digest('hex').slice(0, 8)}`
+            : null;
+          return {
+            accountId: row.account_id,
+            accountLabel: row.account_label,
+            source: unresolvedSource,
+            provider: row.provider,
+            ...usageAggregateRow(row),
+          };
+        });
+      } else if (groupBy === 'model_effort') {
+        // Issue #345: the one two-dimension grouping — model × reasoning
+        // effort. reasoning_effort stays NULL where the wire carried none;
+        // the caller classes NULL as its own 'none' tier and never folds it
+        // into 'low'. Grouping on the raw columns keeps the cell subtotals
+        // summing exactly to totals for the same filters.
+        groups = this.db.prepare(`
+          SELECT ru.model AS model, ru.reasoning_effort AS reasoning_effort, ${aggregates}
+          FROM request_usage ru
+          ${where}
+          GROUP BY ru.model, ru.reasoning_effort
+          ORDER BY ru.model, ru.reasoning_effort IS NULL DESC, ru.reasoning_effort
+        `).all(...params).map((row) => ({
+          model: row.model,
+          reasoningEffort: row.reasoning_effort,
+          ...usageAggregateRow(row),
+        }));
+      } else if (groupBy != null) {
+        // Local-time buckets are wall-clock strings with no offset, so the
+        // browser parses them straight back into local Date instants and the
+        // view never re-derives a timezone. `day` stays UTC for compatibility.
+        const dimensions = {
+          model: { expression: 'ru.model', output: 'model' },
+          reasoning_effort: { expression: 'ru.reasoning_effort', output: 'reasoningEffort' },
+          day: { expression: 'substr(ru.observed_at, 1, 10)', output: 'day' },
+          local_day: { expression: "strftime('%Y-%m-%d', ru.observed_at, 'localtime')", output: 'localDay' },
+          hour: { expression: "strftime('%Y-%m-%dT%H:00', ru.observed_at, 'localtime')", output: 'hour' },
+          hour_of_day: {
+            expression: "strftime('%H', ru.observed_at, 'localtime')",
+            output: 'hourOfDay',
+            cast: (value) => Number(value),
+          },
+        };
+        const dimension = dimensions[groupBy];
+        groups = this.db.prepare(`
+          SELECT ${dimension.expression} AS group_value, ${aggregates}
+          FROM request_usage ru
+          ${where}
+          GROUP BY ${dimension.expression}
+          ORDER BY group_value
+        `).all(...params).map((row) => ({
+          [dimension.output]: dimension.cast ? dimension.cast(row.group_value) : row.group_value,
+          ...usageAggregateRow(row),
+        }));
+      }
+      this.db.exec('COMMIT');
+      return { totals, groupBy, groups };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /// Issue #347 session explorer. Accounts are keyed by a filesystem profile
+  /// REF (an absolute CODEX_HOME / Claude profile directory); transcript and
+  /// rollout rows are keyed by that directory's SLUG. Derive the mapping here,
+  /// once, and keep the ingest ambiguity guard: a slug claimed by two accounts
+  /// resolves to neither, exactly like resolveRequestUsageAccounts().
+  accountsByProfileSlug() {
+    const bySlug = new Map();
+    const ambiguous = new Set();
+    for (const row of this.db.prepare('SELECT id, provider, label, profile_ref FROM accounts').all()) {
+      const slug = path.basename(String(row.profile_ref || ''));
+      if (!slug) continue;
+      const key = `${row.provider}:${slug}`;
+      if (bySlug.has(key)) { ambiguous.add(key); continue; }
+      bySlug.set(key, { accountId: row.id, accountLabel: row.label, slug });
+    }
+    for (const key of ambiguous) bySlug.delete(key);
+    return bySlug;
+  }
+
+  /// Rank sessions across BOTH providers by tokens burned in [since, until).
+  ///
+  /// Membership is "this session had a request/turn inside the range", and the
+  /// aggregates then cover the in-range requests only — the same half-open
+  /// convention usageSummary() uses, so a leaderboard row reconciles with a
+  /// direct warehouse query over the same bounds.
+  ///
+  /// SUBAGENT TOKENS ARE COUNTED ONCE. A Claude subagent's own requests are
+  /// rows in transcript_requests carrying agent_id, so they are already inside
+  /// the session total; subagentTokens re-reports that SUBSET and the
+  /// transcript_subagents rollup's total_tokens is never added to anything.
+  /// (Adding the rollup is the documented ~2× inflation trap.)
+  usageSessions({
+    since = null, until = null, provider = null, accountId = null, limit = null, project = null,
+  } = {}) {
+    since = canonicalSummaryBound(since, 'since', 'usage sessions');
+    until = canonicalSummaryBound(until, 'until', 'usage sessions');
+    if (since && until && since >= until) throw new Error('usage sessions since must be earlier than until');
+    provider = usageSummaryFilter(provider, 'provider', 'usage sessions');
+    if (provider != null && !['claude', 'codex'].includes(provider)) {
+      throw new Error('usage sessions provider must be claude or codex');
+    }
+    accountId = usageSummaryFilter(accountId, 'accountId', 'usage sessions');
+    // Issue #346: the project-burn drill-down is the same leaderboard narrowed
+    // to one project (or to the 'unattributed' bucket), not a second reader.
+    project = usageSummaryFilter(project, 'project', 'usage sessions');
+    const rowLimit = usageSessionsLimit(limit);
+
+    const accounts = this.accountsByProfileSlug();
+    // An account filter narrows to that account's profile slug. An account
+    // whose profile ref is not a transcript/rollout profile (or is claimed by
+    // two accounts) selects nothing rather than silently widening.
+    // The slug alone is not enough: an unrelated profile directory for the
+    // OTHER provider may share the same basename, and filtering both tables by
+    // the bare slug would mix that profile's sessions into this account's
+    // leaderboard. Scope the filter to the account's own provider's table.
+    let scopedSlug = null;
+    let scopedProvider = null;
+    if (accountId) {
+      for (const [key, entry] of accounts.entries()) {
+        if (entry.accountId === accountId) {
+          scopedSlug = entry.slug;
+          scopedProvider = key.slice(0, key.indexOf(':'));
+          break;
+        }
+      }
+      if (!scopedSlug) {
+        return { since, until, provider, accountId, project, limit: rowLimit, truncated: false, sessions: [] };
+      }
+    }
+
+    const claudeRows = provider === 'codex' || (scopedProvider && scopedProvider !== 'claude') ? [] : this.transcriptSessionRows({
+      since, until, profileSlug: scopedSlug, project, limit: rowLimit + 1,
+    });
+    const codexRows = provider === 'claude' || (scopedProvider && scopedProvider !== 'codex') ? [] : this.codexSessionRows({
+      since, until, profileSlug: scopedSlug, project, limit: rowLimit + 1,
+    });
+    const merged = [...claudeRows, ...codexRows].sort(
+      (a, b) => b.totalTokens - a.totalTokens || String(b.lastAt).localeCompare(String(a.lastAt)),
+    );
+    const sessions = merged.slice(0, rowLimit);
+    for (const session of sessions) {
+      const account = accounts.get(`${session.provider}:${session.profileSlug}`) || null;
+      session.accountId = account ? account.accountId : null;
+      session.accountLabel = account ? account.accountLabel : null;
+    }
+    return {
+      since,
+      until,
+      provider,
+      accountId,
+      project,
+      limit: rowLimit,
+      truncated: merged.length > sessions.length,
+      sessions,
+    };
+  }
+
+  /// Claude transcript half of the leaderboard. The per-session model, skill
+  /// and subagent reads run per returned row (bounded by the limit) so the
+  /// leaderboard never fans out over the whole corpus.
+  transcriptSessionRows({
+    since = null, until = null, profileSlug = null, limit = 1, sessionId = null, project = null,
+  } = {}) {
+    const clauses = [];
+    const params = [];
+    if (since) { clauses.push('r.observed_at >= ?'); params.push(since); }
+    if (until) { clauses.push('r.observed_at < ?'); params.push(until); }
+    if (profileSlug) { clauses.push('s.profile_slug = ?'); params.push(profileSlug); }
+    if (sessionId) { clauses.push('s.session_id = ?'); params.push(sessionId); }
+    // Issue #346 drill-down: the project burn view asks this same reader for
+    // one project's sessions rather than growing a parallel session shape.
+    if (project) {
+      const predicate = projectPredicate('s.cwd', project);
+      clauses.push(predicate.sql);
+      params.push(...predicate.params);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db.prepare(`
+      SELECT s.session_id AS session_id, s.profile_slug AS profile_slug, s.title AS title,
+             s.title_source AS title_source, s.cwd AS cwd, s.git_branch AS git_branch,
+             MIN(r.observed_at) AS first_at, MAX(r.observed_at) AS last_at,
+             COUNT(*) AS requests,
+             COALESCE(SUM(${TRANSCRIPT_TOTAL}), 0) AS total_tokens,
+             COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+             COALESCE(SUM(${TRANSCRIPT_INPUT}), 0) AS input_tokens,
+             COUNT(DISTINCT r.agent_id) AS subagent_count,
+             COALESCE(SUM(CASE WHEN r.agent_id IS NOT NULL THEN ${TRANSCRIPT_TOTAL} ELSE 0 END), 0) AS subagent_tokens
+      FROM transcript_sessions s
+      JOIN transcript_requests r
+        ON r.session_id = s.session_id AND r.profile_slug = s.profile_slug
+      ${where}
+      GROUP BY s.session_id, s.profile_slug
+      ORDER BY total_tokens DESC, last_at DESC
+      LIMIT ?
+    `).all(...params, limit);
+
+    const models = this.db.prepare(`
+      SELECT r.model AS model, r.effort AS effort, COUNT(*) AS requests
+      FROM transcript_requests r
+      WHERE r.session_id = ? AND r.profile_slug = ?
+        ${since ? 'AND r.observed_at >= ?' : ''} ${until ? 'AND r.observed_at < ?' : ''}
+      GROUP BY r.model, r.effort
+      ORDER BY requests DESC, r.model
+    `);
+    const skills = this.db.prepare(`
+      SELECT skill, command_name, COUNT(*) AS events
+      FROM transcript_skill_events
+      WHERE session_id = ? AND profile_slug = ?
+        ${since ? 'AND observed_at >= ?' : ''} ${until ? 'AND observed_at < ?' : ''}
+      GROUP BY skill, command_name
+      ORDER BY events DESC, skill IS NULL, skill, command_name
+    `);
+    const bounds = [since, until].filter((value) => value != null);
+
+    return rows.map((row) => {
+      const modelRows = models.all(row.session_id, row.profile_slug, ...bounds);
+      const skillRows = skills.all(row.session_id, row.profile_slug, ...bounds);
+      const identity = projectIdentityOf(row.cwd);
+      return {
+        provider: 'claude',
+        sessionId: row.session_id,
+        profileSlug: row.profile_slug,
+        title: row.title,
+        titleSource: row.title_source,
+        cwd: row.cwd,
+        project: identity.project,
+        worktree: identity.worktree,
+        gitBranch: row.git_branch,
+        firstAt: row.first_at,
+        lastAt: row.last_at,
+        requests: Number(row.requests || 0),
+        totalTokens: Number(row.total_tokens || 0),
+        outputTokens: Number(row.output_tokens || 0),
+        inputTokens: Number(row.input_tokens || 0),
+        // Context-size signal: the average input (prompt + cache) a request in
+        // this session carried. A big number means a big working context.
+        avgInputTokens: sessionAverage(Number(row.input_tokens || 0), Number(row.requests || 0)),
+        subagents: Number(row.subagent_count || 0),
+        // A SUBSET of totalTokens, never an addition to it.
+        subagentTokens: Number(row.subagent_tokens || 0),
+        models: modelRows.map((model) => model.model).filter(Boolean),
+        efforts: [...new Set(modelRows.map((model) => model.effort).filter(Boolean))],
+        skills: skillRows.filter((skill) => skill.skill).map((skill) => skill.skill),
+        commands: skillRows.filter((skill) => skill.command_name).map((skill) => skill.command_name),
+        archived: null,
+      };
+    });
+  }
+
+  /// Codex rollout half of the leaderboard. Turn totals come from the rollout's
+  /// own token_count events, which the ingester already de-duplicates.
+  codexSessionRows({
+    since = null, until = null, profileSlug = null, limit = 1, sessionId = null, project = null,
+  } = {}) {
+    // A turn with no timestamp still belongs to its session; fall back to the
+    // session's last timestamp so it can never drop out of every range.
+    const turnAt = 'COALESCE(t.timestamp, c.last_timestamp)';
+    const clauses = [];
+    const params = [];
+    if (since) { clauses.push(`${turnAt} >= ?`); params.push(since); }
+    if (until) { clauses.push(`${turnAt} < ?`); params.push(until); }
+    if (profileSlug) { clauses.push('c.profile_slug = ?'); params.push(profileSlug); }
+    if (sessionId) { clauses.push('c.session_id = ?'); params.push(sessionId); }
+    if (project) {
+      const predicate = projectPredicate('c.cwd', project);
+      clauses.push(predicate.sql);
+      params.push(...predicate.params);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db.prepare(`
+      SELECT c.session_id AS session_id, c.profile_slug AS profile_slug, c.cwd AS cwd,
+             c.git_branch AS git_branch, c.archived AS archived,
+             MIN(${turnAt}) AS first_at, MAX(${turnAt}) AS last_at,
+             COUNT(*) AS turns,
+             COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+             COALESCE(SUM(t.output_tokens), 0) AS output_tokens,
+             COALESCE(SUM(${CODEX_INPUT}), 0) AS input_tokens
+      FROM codex_sessions c
+      JOIN codex_turns t ON t.session_id = c.session_id
+      ${where}
+      GROUP BY c.session_id
+      ORDER BY total_tokens DESC, last_at DESC
+      LIMIT ?
+    `).all(...params, limit);
+
+    const models = this.db.prepare(`
+      SELECT t.model AS model, t.reasoning_effort AS effort, COUNT(*) AS turns
+      FROM codex_turns t
+      JOIN codex_sessions c ON c.session_id = t.session_id
+      WHERE t.session_id = ?
+        ${since ? `AND ${turnAt} >= ?` : ''} ${until ? `AND ${turnAt} < ?` : ''}
+      GROUP BY t.model, t.reasoning_effort
+      ORDER BY turns DESC, t.model
+    `);
+    const bounds = [since, until].filter((value) => value != null);
+
+    return rows.map((row) => {
+      const modelRows = models.all(row.session_id, ...bounds);
+      const identity = projectIdentityOf(row.cwd);
+      return {
+        provider: 'codex',
+        sessionId: row.session_id,
+        profileSlug: row.profile_slug,
+        // Codex rollouts carry no session title; the working directory and git
+        // branch are the only human handles, so the view labels them as such.
+        title: null,
+        titleSource: null,
+        cwd: row.cwd,
+        project: identity.project,
+        worktree: identity.worktree,
+        gitBranch: row.git_branch,
+        firstAt: row.first_at,
+        lastAt: row.last_at,
+        requests: Number(row.turns || 0),
+        totalTokens: Number(row.total_tokens || 0),
+        outputTokens: Number(row.output_tokens || 0),
+        inputTokens: Number(row.input_tokens || 0),
+        avgInputTokens: sessionAverage(Number(row.input_tokens || 0), Number(row.turns || 0)),
+        // Codex rollouts have no subagent rollups; 0 is a fact here, not a gap.
+        subagents: 0,
+        subagentTokens: 0,
+        models: modelRows.map((model) => model.model).filter(Boolean),
+        efforts: [...new Set(modelRows.map((model) => model.effort).filter(Boolean))],
+        skills: [],
+        commands: [],
+        archived: row.archived === 1,
+      };
+    });
+  }
+
+  /// One session in full: its leaderboard row (over the session's whole life,
+  /// not a range), the subagent rollup rows with their OWN request aggregates,
+  /// the skill/slash-command events, and the context-size trend.
+  usageSessionDetail({ sessionId = null, profile = null, provider = null } = {}) {
+    sessionId = usageSummaryFilter(sessionId, 'sessionId', 'usage sessions');
+    profile = usageSummaryFilter(profile, 'profile', 'usage sessions');
+    if (!sessionId) throw new Error('usage sessions sessionId is required');
+    if (!profile) throw new Error('usage sessions profile is required');
+    provider = usageSummaryFilter(provider, 'provider', 'usage sessions');
+    if (provider != null && !['claude', 'codex'].includes(provider)) {
+      throw new Error('usage sessions provider must be claude or codex');
+    }
+
+    const accounts = this.accountsByProfileSlug();
+    const claude = provider === 'codex' ? [] : this.transcriptSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const codex = provider === 'claude' || claude.length
+      ? []
+      : this.codexSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const session = claude[0] || codex[0] || null;
+    if (!session) return { session: null, subagents: [], skills: [], contextTrend: [], truncated: false };
+    const account = accounts.get(`${session.provider}:${session.profileSlug}`) || null;
+    session.accountId = account ? account.accountId : null;
+    session.accountLabel = account ? account.accountLabel : null;
+
+    const subagents = session.provider !== 'claude' ? [] : this.db.prepare(`
+      SELECT sa.agent_id AS agent_id, sa.agent_type AS agent_type, sa.resolved_model AS resolved_model,
+             sa.total_tokens AS rollup_total_tokens, sa.tool_stats_json AS tool_stats_json,
+             sa.duration_ms AS duration_ms, sa.observed_at AS observed_at,
+             COALESCE(SUM(${TRANSCRIPT_TOTAL}), 0) AS total_tokens,
+             COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+             COUNT(r.id) AS requests
+      FROM transcript_subagents sa
+      LEFT JOIN transcript_requests r
+        ON r.session_id = sa.session_id AND r.agent_id = sa.agent_id AND r.profile_slug = sa.profile_slug
+      WHERE sa.session_id = ? AND sa.profile_slug = ?
+      GROUP BY sa.agent_id, sa.profile_slug
+      ORDER BY total_tokens DESC, sa.observed_at
+    `).all(session.sessionId, session.profileSlug).map((row) => ({
+      agentId: row.agent_id,
+      agentType: row.agent_type,
+      resolvedModel: row.resolved_model,
+      // The transcript's own rollup, reported beside the measured sum rather
+      // than added to it: the session total already contains these requests.
+      rollupTotalTokens: row.rollup_total_tokens == null ? null : Number(row.rollup_total_tokens),
+      totalTokens: Number(row.total_tokens || 0),
+      outputTokens: Number(row.output_tokens || 0),
+      requests: Number(row.requests || 0),
+      durationMs: row.duration_ms == null ? null : Number(row.duration_ms),
+      observedAt: row.observed_at,
+      toolStats: row.tool_stats_json == null ? null : row.tool_stats_json,
+    }));
+
+    const skills = session.provider !== 'claude' ? [] : this.db.prepare(`
+      SELECT skill, command_name, COUNT(*) AS events,
+             MIN(observed_at) AS first_at, MAX(observed_at) AS last_at
+      FROM transcript_skill_events
+      WHERE session_id = ? AND profile_slug = ?
+      GROUP BY skill, command_name
+      ORDER BY events DESC, skill IS NULL, skill, command_name
+    `).all(session.sessionId, session.profileSlug).map((row) => ({
+      skill: row.skill,
+      commandName: row.command_name,
+      events: Number(row.events || 0),
+      firstAt: row.first_at,
+      lastAt: row.last_at,
+    }));
+
+    const trendRows = session.provider === 'claude'
+      ? this.db.prepare(`
+        SELECT r.observed_at AS observed_at, r.model AS model, r.agent_id AS agent_id,
+               ${TRANSCRIPT_INPUT} AS input_tokens, r.output_tokens AS output_tokens,
+               ${TRANSCRIPT_TOTAL} AS total_tokens
+        FROM transcript_requests r
+        WHERE r.session_id = ? AND r.profile_slug = ?
+        ORDER BY r.observed_at
+        LIMIT ?
+      `).all(session.sessionId, session.profileSlug, USAGE_SESSION_TREND_LIMIT + 1)
+      : this.db.prepare(`
+        SELECT t.timestamp AS observed_at, t.model AS model, NULL AS agent_id,
+               ${CODEX_INPUT} AS input_tokens, t.output_tokens AS output_tokens,
+               t.total_tokens AS total_tokens
+        FROM codex_turns t
+        WHERE t.session_id = ?
+        ORDER BY t.turn_index
+        LIMIT ?
+      `).all(session.sessionId, USAGE_SESSION_TREND_LIMIT + 1);
+
+    const truncated = trendRows.length > USAGE_SESSION_TREND_LIMIT;
+    const contextTrend = trendRows.slice(0, USAGE_SESSION_TREND_LIMIT).map((row, index) => ({
+      index,
+      observedAt: row.observed_at,
+      model: row.model,
+      agentId: row.agent_id,
+      inputTokens: Number(row.input_tokens || 0),
+      outputTokens: Number(row.output_tokens || 0),
+      totalTokens: Number(row.total_tokens || 0),
+    }));
+    return { session, subagents, skills, contextTrend, truncated };
+  }
+
+  subagentTypesForSessions(pairs = []) {
+    if (!pairs.length) return new Map();
+    const placeholders = pairs.map(() => '(?, ?)').join(', ');
+    const params = pairs.flatMap(({ sessionId, profileSlug }) => [sessionId, profileSlug]);
+    const rows = this.db.prepare(`
+      WITH requested(session_id, profile_slug) AS (VALUES ${placeholders})
+      SELECT sa.session_id, sa.profile_slug, sa.agent_type
+      FROM transcript_subagents sa
+      JOIN requested r
+        ON r.session_id = sa.session_id AND r.profile_slug = sa.profile_slug
+      WHERE sa.agent_type IS NOT NULL
+      GROUP BY sa.session_id, sa.profile_slug, sa.agent_type
+    `).all(...params);
+    const result = new Map(pairs.map(({ sessionId, profileSlug }) => [`${sessionId}\u001f${profileSlug}`, []]));
+    for (const row of rows) result.get(`${row.session_id}\u001f${row.profile_slug}`).push(row.agent_type);
+    return result;
+  }
+
+  /// Supported anatomy read: four cuts of the same ordered session rows, so
+  /// totals, timeline, composition, context curve, and cache inputs reconcile.
+  /// Codex exposes only the cuts its rollout schema records and says so in
+  /// supports; turns are never mislabeled as provider requests.
+  sessionAnatomy({
+    sessionId = null, profile = null, provider = null,
+    maxBuckets = SESSION_ANATOMY_MAX_BUCKETS, curveLimit = SESSION_ANATOMY_CURVE_LIMIT,
+  } = {}) {
+    sessionId = usageSummaryFilter(sessionId, 'sessionId', 'session anatomy');
+    profile = usageSummaryFilter(profile, 'profile', 'session anatomy');
+    if (!sessionId) throw new Error('session anatomy sessionId is required');
+    if (!profile) throw new Error('session anatomy profile is required');
+    provider = usageSummaryFilter(provider, 'provider', 'session anatomy');
+    if (provider != null && !['claude', 'codex'].includes(provider)) {
+      throw new Error('session anatomy provider must be claude or codex');
+    }
+    const claude = provider === 'codex' ? [] : this.transcriptSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const codex = provider === 'claude' || claude.length ? [] : this.codexSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const session = claude[0] || codex[0] || null;
+    if (!session) return {
+      session: null, supports: null, totals: null, timeline: null,
+      composition: [], compositionTruncated: false, compositionTotal: 0,
+      curve: [], curveStride: 1, events: { skills: [], launches: [] }, truncated: false,
+    };
+    const isClaude = session.provider === 'claude';
+    const read = isClaude ? this.db.prepare(`
+      SELECT observed_at AS at, model, effort, agent_id, input_tokens AS fresh,
+             cache_creation_input_tokens AS write, cache_read_input_tokens AS read, output_tokens AS out
+      FROM transcript_requests WHERE session_id = ? AND profile_slug = ?
+      ORDER BY observed_at, id LIMIT ?
+    `).all(session.sessionId, session.profileSlug, SESSION_ANATOMY_ROW_LIMIT + 1) : this.db.prepare(`
+      SELECT COALESCE(t.timestamp, c.last_timestamp) AS at, t.model, t.reasoning_effort AS effort,
+             NULL AS agent_id, t.input_tokens AS fresh, t.cache_write_input_tokens AS write,
+             t.cached_input_tokens AS read, t.output_tokens AS out, t.total_tokens AS reported
+      FROM codex_turns t JOIN codex_sessions c ON c.session_id = t.session_id
+      WHERE t.session_id = ? ORDER BY t.turn_index LIMIT ?
+    `).all(session.sessionId, SESSION_ANATOMY_ROW_LIMIT + 1);
+    const truncated = read.length > SESSION_ANATOMY_ROW_LIMIT;
+    const rows = read.slice(0, SESSION_ANATOMY_ROW_LIMIT);
+    const rollupRead = isClaude ? this.db.prepare(`
+      SELECT agent_id, agent_type, resolved_model, total_tokens, duration_ms, observed_at, tool_stats_json,
+             COUNT(*) OVER () AS total_count
+      FROM transcript_subagents WHERE session_id = ? AND profile_slug = ?
+      ORDER BY observed_at, agent_id
+      LIMIT ?
+    `).all(session.sessionId, session.profileSlug, SESSION_ANATOMY_SUBAGENT_LIMIT) : [];
+    const rollupTotal = Number(rollupRead[0]?.total_count || 0);
+    const compositionTruncated = rollupTotal > rollupRead.length;
+    const rollups = rollupRead;
+    const skillRows = isClaude ? this.db.prepare(`
+      SELECT skill, command_name, observed_at FROM transcript_skill_events
+      WHERE session_id = ? AND profile_slug = ? ORDER BY observed_at LIMIT ?
+    `).all(session.sessionId, session.profileSlug, SESSION_ANATOMY_EVENT_LIMIT) : [];
+
+    const totals = {
+      requests: 0, tokens: 0, inputUncached: 0, inputCacheWrite: 0, inputCacheRead: 0, output: 0,
+      reportedTokens: 0, mainRequests: 0, mainTokens: 0, laneRequests: 0, laneTokens: 0,
+      contextSum: 0, contextMax: 0,
+    };
+    const parts = new Map();
+    const ensurePart = (agentId) => {
+      const key = agentId || '__main';
+      if (!parts.has(key)) parts.set(key, {
+        key, kind: agentId ? 'lane' : 'main', agentId: agentId || null, agentType: null,
+        resolvedModel: null, rollupTotalTokens: null, durationMs: null, toolStats: null,
+        requests: 0, tokens: 0, inputUncached: 0, inputCacheWrite: 0, inputCacheRead: 0,
+        output: 0, firstAt: null, lastAt: null, modelCounts: new Map(),
+      });
+      return parts.get(key);
+    };
+    ensurePart(null);
+    const firstMs = rows.length ? Date.parse(rows[0].at) : Date.parse(session.firstAt);
+    const lastMs = rows.reduce((latest, row) => Math.max(latest, Date.parse(row.at) || 0), firstMs || 0);
+    const durationMs = Math.max(0, lastMs - firstMs);
+    let bucketMs = SESSION_ANATOMY_BUCKETS.find((size) => durationMs / size <= maxBuckets) || SESSION_ANATOMY_BUCKETS.at(-1);
+    const bucketSizeClamped = durationMs / bucketMs > maxBuckets;
+    if (bucketSizeClamped) bucketMs = Math.ceil(durationMs / maxBuckets);
+    const firstDate = new Date(firstMs || Date.now());
+    const anchor = bucketSizeClamped
+      ? firstMs
+      : new Date(firstDate.getFullYear(), firstDate.getMonth(), firstDate.getDate()).getTime();
+    const buckets = new Map();
+    const ensureBucket = (index) => {
+      if (!buckets.has(index)) buckets.set(index, {
+        index, startMs: anchor + index * bucketMs, requests: 0, tokens: 0, mainTokens: 0, laneTokens: 0,
+        inputUncached: 0, inputCacheWrite: 0, inputCacheRead: 0, output: 0,
+        contextSum: 0, contextMax: 0, skills: 0, launches: 0,
+      });
+      return buckets.get(index);
+    };
+    const bucketIndex = (at) => {
+      const index = Math.floor(((Date.parse(at) || firstMs || 0) - anchor) / bucketMs);
+      return bucketSizeClamped ? Math.min(index, maxBuckets - 1) : index;
+    };
+    const curveStride = Math.max(1, Math.ceil(rows.length / curveLimit));
+    const curve = [];
+    rows.forEach((row, index) => {
+      const fresh = Number(row.fresh || 0);
+      const write = Number(row.write || 0);
+      const readTokens = Number(row.read || 0);
+      const output = Number(row.out || 0);
+      const tokens = fresh + write + readTokens + output;
+      const context = fresh + write + readTokens;
+      const agentId = isClaude ? row.agent_id : null;
+      totals.requests += 1; totals.tokens += tokens; totals.inputUncached += fresh;
+      totals.reportedTokens += isClaude ? tokens : Number(row.reported || 0);
+      totals.inputCacheWrite += write; totals.inputCacheRead += readTokens; totals.output += output;
+      totals.contextSum += context; totals.contextMax = Math.max(totals.contextMax, context);
+      if (agentId) { totals.laneRequests += 1; totals.laneTokens += tokens; }
+      else { totals.mainRequests += 1; totals.mainTokens += tokens; }
+      const part = ensurePart(agentId);
+      part.requests += 1; part.tokens += tokens; part.inputUncached += fresh; part.inputCacheWrite += write;
+      part.inputCacheRead += readTokens; part.output += output; part.firstAt ||= row.at; part.lastAt = row.at;
+      if (row.model) part.modelCounts.set(row.model, (part.modelCounts.get(row.model) || 0) + 1);
+      const bucket = ensureBucket(bucketIndex(row.at));
+      bucket.requests += 1; bucket.tokens += tokens; bucket.inputUncached += fresh; bucket.inputCacheWrite += write;
+      bucket.inputCacheRead += readTokens; bucket.output += output; bucket.contextSum += context;
+      bucket.contextMax = Math.max(bucket.contextMax, context);
+      if (agentId) bucket.laneTokens += tokens; else bucket.mainTokens += tokens;
+      if (index % curveStride === 0) curve.push({ i: index, at: row.at, context, output, lane: agentId ? 1 : 0, model: row.model || null });
+    });
+    let lanesWithoutRequests = 0;
+    for (const row of rollups) {
+      const part = ensurePart(row.agent_id);
+      part.agentType = row.agent_type; part.resolvedModel = row.resolved_model;
+      part.rollupTotalTokens = row.total_tokens == null ? null : Number(row.total_tokens);
+      part.durationMs = row.duration_ms == null ? null : Number(row.duration_ms);
+      part.toolStats = row.tool_stats_json; part.firstAt ||= row.observed_at; part.lastAt ||= row.observed_at;
+      if (!part.requests) lanesWithoutRequests += 1;
+    }
+    const composition = [...parts.values()].map((part) => {
+      const models = [...part.modelCounts].sort((left, right) => right[1] - left[1]).map(([model]) => model);
+      const { modelCounts, ...payload } = part;
+      return { ...payload, models, model: models[0] || part.resolvedModel || null };
+    }).sort((left, right) => (left.kind === 'main' ? -1 : right.kind === 'main' ? 1 : right.tokens - left.tokens));
+    const skills = skillRows.map((row) => ({ at: row.observed_at, name: row.skill || row.command_name, kind: row.skill ? 'skill' : 'command' }));
+    // Events outside the request span remain in the event list but cannot widen its request timeline.
+    const inRequestSpan = (at) => {
+      const timestamp = Date.parse(at);
+      return Number.isFinite(timestamp) && timestamp >= firstMs && timestamp <= lastMs;
+    };
+    for (const event of skills) if (inRequestSpan(event.at)) ensureBucket(bucketIndex(event.at)).skills += 1;
+    const launches = composition.filter((part) => part.kind === 'lane' && part.firstAt).map((part) => ({
+      at: part.firstAt, agentId: part.agentId, agentType: part.agentType, tokens: part.tokens, requests: part.requests,
+    })).sort((left, right) => left.at.localeCompare(right.at));
+    for (const launch of launches) if (inRequestSpan(launch.at)) ensureBucket(bucketIndex(launch.at)).launches += 1;
+    const indexes = [...buckets.keys()].sort((left, right) => left - right);
+    const timeline = [];
+    if (indexes.length) for (let index = indexes[0]; index <= indexes.at(-1); index += 1) {
+      const bucket = ensureBucket(index);
+      timeline.push({ ...bucket, key: localBucketKey(new Date(bucket.startMs)) });
+    }
+    return {
+      session,
+      supports: {
+        timeline: true, curve: true, cache: true, cacheRate: isClaude, unit: isClaude ? 'request' : 'turn',
+        composition: isClaude, skillEvents: isClaude, laneLaunches: isClaude,
+        agentTypes: isClaude && composition.some((part) => part.kind === 'lane' && part.agentType),
+        note: isClaude ? null : 'Codex rollouts record turns only — no subagent or skill records exist to dissect. '
+          + 'tokens is the displayed token-class sum; reportedTokens preserves the rollout total without reinterpreting it.',
+      },
+      totals: { ...totals, lanes: composition.filter((part) => part.kind === 'lane').length, lanesWithoutRequests, durationMs, firstAt: firstMs ? new Date(firstMs).toISOString() : session.firstAt, lastAt: lastMs ? new Date(lastMs).toISOString() : session.lastAt },
+      timeline: { bucketMs, buckets: timeline }, composition,
+      compositionTruncated, compositionTotal: rollupTotal + 1, curve, curveStride,
+      events: { skills, launches }, truncated,
+    };
+  }
+
+  /// Claude half of the project-burn fold: transcript requests grouped by the
+  /// project (session cwd), branch, and profile they were recorded under.
+  ///
+  /// COMPOSITE KEY: the session join and the distinct-session count both carry
+  /// (session_id, profile_slug) together. The same session id under two
+  /// profiles is two different sessions; mixing them is this repo's recurring
+  /// defect class. The LEFT JOIN is deliberate — a request whose session row is
+  /// missing must surface in the unattributed bucket, never vanish.
+  transcriptProjectRows({ since = null, until = null, project = null } = {}) {
+    const clauses = [];
+    const params = [];
+    if (since) { clauses.push('r.observed_at >= ?'); params.push(since); }
+    if (until) { clauses.push('r.observed_at < ?'); params.push(until); }
+    if (project) {
+      const predicate = projectPredicate('s.cwd', project);
+      clauses.push(predicate.sql);
+      params.push(...predicate.params);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    // char(31) is the ASCII unit separator: it cannot occur in a session id or
+    // a profile slug, so the concatenated key is a faithful tuple.
+    return this.db.prepare(`
+      SELECT s.cwd AS cwd, s.git_branch AS git_branch, r.profile_slug AS profile_slug,
+             COUNT(*) AS requests,
+             COUNT(DISTINCT r.session_id || char(31) || r.profile_slug) AS sessions,
+             COALESCE(SUM(r.input_tokens), 0) AS input_uncached,
+             COALESCE(SUM(r.cache_read_input_tokens), 0) AS input_cache_read,
+             COALESCE(SUM(r.cache_creation_input_tokens), 0) AS input_cache_write,
+             COALESCE(SUM(r.output_tokens), 0) AS output_total,
+             0 AS reasoning_tokens,
+             COALESCE(SUM(${TRANSCRIPT_TOTAL}), 0) AS total_tokens,
+             MIN(r.observed_at) AS first_at, MAX(r.observed_at) AS last_at
+      FROM transcript_requests r
+      LEFT JOIN transcript_sessions s
+        ON s.session_id = r.session_id AND s.profile_slug = r.profile_slug
+      ${where}
+      GROUP BY s.cwd, s.git_branch, r.profile_slug
+    `).all(...params).map((row) => ({
+      provider: 'claude',
+      cwd: row.cwd,
+      gitBranch: row.git_branch,
+      profileSlug: row.profile_slug,
+      firstAt: row.first_at,
+      lastAt: row.last_at,
+      // Claude transcripts record no reasoning-token split, so reasoningTokens
+      // is 0 here as a stated absence rather than an inferred number.
+      aggregate: projectBurnAggregate(row),
+    }));
+  }
+
+  /// Codex half of the fold. Turn totals are the rollout's own token_count
+  /// figures (never re-derived), and an undated turn falls back to its
+  /// session's last timestamp — the same convention the session explorer uses,
+  /// so a turn can never drop out of every range.
+  codexProjectRows({ since = null, until = null, project = null } = {}) {
+    const turnAt = 'COALESCE(t.timestamp, c.last_timestamp)';
+    const clauses = [];
+    const params = [];
+    if (since) { clauses.push(`${turnAt} >= ?`); params.push(since); }
+    if (until) { clauses.push(`${turnAt} < ?`); params.push(until); }
+    if (project) {
+      const predicate = projectPredicate('c.cwd', project);
+      clauses.push(predicate.sql);
+      params.push(...predicate.params);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    return this.db.prepare(`
+      SELECT c.cwd AS cwd, c.git_branch AS git_branch, c.profile_slug AS profile_slug,
+             COUNT(*) AS requests,
+             COUNT(DISTINCT t.session_id) AS sessions,
+             COALESCE(SUM(t.input_tokens), 0) AS input_uncached,
+             COALESCE(SUM(t.cached_input_tokens), 0) AS input_cache_read,
+             COALESCE(SUM(t.cache_write_input_tokens), 0) AS input_cache_write,
+             COALESCE(SUM(t.output_tokens), 0) AS output_total,
+             COALESCE(SUM(t.reasoning_output_tokens), 0) AS reasoning_tokens,
+             COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+             MIN(${turnAt}) AS first_at, MAX(${turnAt}) AS last_at
+      FROM codex_turns t
+      LEFT JOIN codex_sessions c ON c.session_id = t.session_id
+      ${where}
+      GROUP BY c.cwd, c.git_branch, c.profile_slug
+    `).all(...params).map((row) => ({
+      provider: 'codex',
+      cwd: row.cwd,
+      gitBranch: row.git_branch,
+      profileSlug: row.profile_slug,
+      firstAt: row.first_at,
+      lastAt: row.last_at,
+      aggregate: projectBurnAggregate(row),
+    }));
+  }
+
+  /// Issue #371: model × reasoning effort, FILTERABLE BY PROJECT.
+  ///
+  /// usageSummary's `model_effort` grouping reads the proxy warehouse, which
+  /// records no project and whose request_id ↔ transcript bridge measured a 0%
+  /// join (FINDINGS-336.md) — so a project filter cannot be honoured there at
+  /// all. This reader measures the SESSION corpus instead (transcript_requests
+  /// for Claude, codex_turns for Codex), which is the same universe the project
+  /// treemap and the drill partition. That is what lets a cell be apportioned
+  /// out of the figure the level above printed rather than becoming a second,
+  /// disagreeing absolute.
+  ///
+  /// An unrecorded effort stays NULL — the wire carried none, and inventing a
+  /// bucket for it would put tokens in a column no request was made under.
+  modelEffortBurn({ since = null, until = null, provider = null, project = null } = {}) {
+    since = canonicalSummaryBound(since, 'since', 'model effort burn');
+    until = canonicalSummaryBound(until, 'until', 'model effort burn');
+    if (since && until && since >= until) {
+      throw new Error('model effort burn since must be earlier than until');
+    }
+    provider = usageSummaryFilter(provider, 'provider', 'model effort burn');
+    if (provider != null && !['claude', 'codex'].includes(provider)) {
+      throw new Error('model effort burn provider must be claude or codex');
+    }
+    project = usageSummaryFilter(project, 'project', 'model effort burn');
+
+    const claude = () => {
+      const clauses = [];
+      const params = [];
+      if (since) { clauses.push('r.observed_at >= ?'); params.push(since); }
+      if (until) { clauses.push('r.observed_at < ?'); params.push(until); }
+      if (project) {
+        const predicate = projectPredicate('s.cwd', project);
+        clauses.push(predicate.sql);
+        params.push(...predicate.params);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      return this.db.prepare(`
+        SELECT r.model AS model, r.effort AS effort,
+               COUNT(*) AS requests,
+               COALESCE(SUM(${TRANSCRIPT_TOTAL}), 0) AS total_tokens,
+               COALESCE(SUM(${TRANSCRIPT_INPUT}), 0) AS input_tokens,
+               COALESCE(SUM(r.output_tokens), 0) AS output_tokens
+        FROM transcript_requests r
+        LEFT JOIN transcript_sessions s
+          ON s.session_id = r.session_id AND s.profile_slug = r.profile_slug
+        ${where}
+        GROUP BY r.model, r.effort
+      `).all(...params).map((row) => ({ provider: 'claude', ...row }));
+    };
+
+    const codex = () => {
+      const turnAt = 'COALESCE(t.timestamp, c.last_timestamp)';
+      const clauses = [];
+      const params = [];
+      if (since) { clauses.push(`${turnAt} >= ?`); params.push(since); }
+      if (until) { clauses.push(`${turnAt} < ?`); params.push(until); }
+      if (project) {
+        const predicate = projectPredicate('c.cwd', project);
+        clauses.push(predicate.sql);
+        params.push(...predicate.params);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      return this.db.prepare(`
+        SELECT t.model AS model, t.reasoning_effort AS effort,
+               COUNT(*) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+               COALESCE(SUM(${CODEX_INPUT}), 0) AS input_tokens,
+               COALESCE(SUM(t.output_tokens), 0) AS output_tokens
+        FROM codex_turns t
+        LEFT JOIN codex_sessions c ON c.session_id = t.session_id
+        ${where}
+        GROUP BY t.model, t.reasoning_effort
+      `).all(...params).map((row) => ({ provider: 'codex', ...row }));
+    };
+
+    // Both halves under one read snapshot, like projectBurn: an ingester
+    // committing between them would produce cells that do not sum to the totals
+    // reported beside them.
+    this.db.exec('BEGIN');
+    let rows;
+    try {
+      rows = [
+        ...(provider === 'codex' ? [] : claude()),
+        ...(provider === 'claude' ? [] : codex()),
+      ];
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+
+    const totals = { requests: 0, totalTokens: 0, inputTokens: 0, outputTokens: 0 };
+    const cells = rows.map((row) => {
+      const cell = {
+        provider: row.provider,
+        model: row.model,
+        effort: row.effort,
+        requests: Number(row.requests || 0),
+        totalTokens: Number(row.total_tokens || 0),
+        inputTokens: Number(row.input_tokens || 0),
+        outputTokens: Number(row.output_tokens || 0),
+      };
+      totals.requests += cell.requests;
+      totals.totalTokens += cell.totalTokens;
+      totals.inputTokens += cell.inputTokens;
+      totals.outputTokens += cell.outputTokens;
+      return cell;
+    });
+    cells.sort((a, b) => b.totalTokens - a.totalTokens
+      || String(a.model).localeCompare(String(b.model))
+      || String(a.effort).localeCompare(String(b.effort)));
+    return { since, until, provider, project, cells, totals };
+  }
+
+  /// Per-project burn OVER TIME, in local-time buckets — the same offset-free
+  /// wall-clock keys the burn timeline uses, so the browser parses them back
+  /// into local instants without re-deriving a timezone. One row is one
+  /// project × one bucket; the unattributed bucket is a project key like any
+  /// other, so an idle-looking project can never be an accounting hole.
+  projectBurnSeries({ since = null, until = null, provider = null, project = null, bucket = null } = {}) {
+    const expression = PROJECT_BURN_BUCKETS[bucket];
+    if (!expression) {
+      throw new Error(`project burn bucket must be ${Object.keys(PROJECT_BURN_BUCKETS).join(' or ')}`);
+    }
+    const rows = [];
+    // Both provider halves read under one snapshot, like projectBurn: an
+    // ingest committing between them would make series points disagree with
+    // the leaderboard totals they are reconciled against.
+    this.db.exec('BEGIN');
+    try {
+    if (provider !== 'codex') {
+      const clauses = [];
+      const params = [];
+      if (since) { clauses.push('r.observed_at >= ?'); params.push(since); }
+      if (until) { clauses.push('r.observed_at < ?'); params.push(until); }
+      if (project) {
+        const predicate = projectPredicate('s.cwd', project);
+        clauses.push(predicate.sql);
+        params.push(...predicate.params);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      rows.push(...this.db.prepare(`
+        SELECT s.cwd AS cwd, ${expression('r.observed_at')} AS bucket,
+               COUNT(*) AS requests,
+               COALESCE(SUM(${TRANSCRIPT_TOTAL}), 0) AS total_tokens,
+               COALESCE(SUM(r.output_tokens), 0) AS output_total
+        FROM transcript_requests r
+        LEFT JOIN transcript_sessions s
+          ON s.session_id = r.session_id AND s.profile_slug = r.profile_slug
+        ${where}
+        GROUP BY s.cwd, bucket
+      `).all(...params));
+    }
+    if (provider !== 'claude') {
+      const turnAt = 'COALESCE(t.timestamp, c.last_timestamp)';
+      const clauses = [];
+      const params = [];
+      if (since) { clauses.push(`${turnAt} >= ?`); params.push(since); }
+      if (until) { clauses.push(`${turnAt} < ?`); params.push(until); }
+      if (project) {
+        const predicate = projectPredicate('c.cwd', project);
+        clauses.push(predicate.sql);
+        params.push(...predicate.params);
+      }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      rows.push(...this.db.prepare(`
+        SELECT c.cwd AS cwd, ${expression(turnAt)} AS bucket,
+               COUNT(*) AS requests,
+               COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+               COALESCE(SUM(t.output_tokens), 0) AS output_total
+        FROM codex_turns t
+        LEFT JOIN codex_sessions c ON c.session_id = t.session_id
+        ${where}
+        GROUP BY c.cwd, bucket
+      `).all(...params));
+    }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+
+    const folded = new Map();
+    for (const row of rows) {
+      const identity = projectIdentityOf(row.cwd);
+      const key = identity.key;
+      const cell = `${key}\n${row.bucket}`;
+      if (!folded.has(cell)) {
+        folded.set(cell, {
+          key,
+          project: identity.project,
+          unattributed: key === PROJECT_BURN_UNATTRIBUTED,
+          bucket: row.bucket,
+          requests: 0,
+          totalTokens: 0,
+          outputTotal: 0,
+        });
+      }
+      const entry = folded.get(cell);
+      entry.requests += Number(row.requests || 0);
+      entry.totalTokens += Number(row.total_tokens || 0);
+      entry.outputTotal += Number(row.output_total || 0);
+    }
+    return [...folded.values()].sort(
+      (a, b) => String(a.bucket).localeCompare(String(b.bucket)) || a.key.localeCompare(b.key),
+    );
+  }
+
+  /// Issue #346 (decision 10b): burn by PROJECT over the half-open range
+  /// [since, until), across both providers, with a per-project account
+  /// breakdown the window-burn estimate model can be applied to.
+  ///
+  /// UNIVERSE. Project identity is derived from the session's cwd; an exact
+  /// ModelDeck worktree root folds to its parent checkout while worktree and
+  /// git branch remain secondary detail. The proxy warehouse behind
+  /// usageSummary() records no project,
+  /// and the request_id ↔ transcript requestId bridge measured a 0% join on
+  /// the available history (FINDINGS-336.md), so per-request attribution of
+  /// warehouse rows is not available. This reader therefore measures the
+  /// SESSION token universe — transcript_requests for Claude, codex_turns for
+  /// Codex — and reports the warehouse's own totals for the identical bounds
+  /// beside it in `reconciliation`, instead of implying the two universes are
+  /// one number.
+  ///
+  /// NOTHING IS DROPPED. Rows whose session carries no cwd (or, defensively,
+  /// no session row at all) land in the explicit 'unattributed' bucket, and
+  /// projects past `limit` are summed into `remainder` with their count. The
+  /// reader's own totals always equal attributed + unattributed, and equal
+  /// the sum of the returned projects plus the remainder.
+  projectBurn({
+    since = null, until = null, provider = null, project = null, limit = null, bucket = null,
+  } = {}) {
+    since = canonicalSummaryBound(since, 'since', 'project burn');
+    until = canonicalSummaryBound(until, 'until', 'project burn');
+    if (since && until && since >= until) throw new Error('project burn since must be earlier than until');
+    provider = usageSummaryFilter(provider, 'provider', 'project burn');
+    if (provider != null && !['claude', 'codex'].includes(provider)) {
+      throw new Error('project burn provider must be claude or codex');
+    }
+    project = usageSummaryFilter(project, 'project', 'project burn');
+    bucket = usageSummaryFilter(bucket, 'bucket', 'project burn');
+    if (bucket != null && !Object.hasOwn(PROJECT_BURN_BUCKETS, bucket)) {
+      throw new Error(`project burn bucket must be ${Object.keys(PROJECT_BURN_BUCKETS).join(' or ')}`);
+    }
+    const rowLimit = projectBurnLimit(limit);
+
+    // Read the proxy warehouse FIRST: usageSummary owns its own read snapshot,
+    // and nesting transactions is neither needed nor allowed here.
+    const warehouse = this.usageSummary({ since, until, provider });
+    const accounts = this.accountsByProfileSlug();
+
+    // Both halves under one read snapshot, so an ingester committing between
+    // them cannot produce project rows that disagree with the totals.
+    this.db.exec('BEGIN');
+    let rows;
+    try {
+      rows = [
+        ...(provider === 'codex' ? [] : this.transcriptProjectRows({ since, until, project })),
+        ...(provider === 'claude' ? [] : this.codexProjectRows({ since, until, project })),
+      ];
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+
+    const folded = new Map();
+    const totals = emptyProjectBurnAggregate();
+    for (const row of rows) {
+      const identity = projectIdentityOf(row.cwd);
+      const key = identity.key;
+      if (!folded.has(key)) {
+        folded.set(key, {
+          key,
+          project: identity.project,
+          unattributed: key === PROJECT_BURN_UNATTRIBUTED,
+          providers: new Set(),
+          branches: new Map(),
+          accounts: new Map(),
+          aggregate: emptyProjectBurnAggregate(),
+          firstAt: null,
+          lastAt: null,
+        });
+      }
+      const entry = folded.get(key);
+      entry.providers.add(row.provider);
+      entry.firstAt = earlier(entry.firstAt, row.firstAt);
+      entry.lastAt = later(entry.lastAt, row.lastAt);
+      addProjectBurnAggregate(entry.aggregate, row.aggregate);
+      addProjectBurnAggregate(totals, row.aggregate);
+
+      const branchKey = JSON.stringify([row.provider, row.gitBranch, identity.worktree]);
+      if (!entry.branches.has(branchKey)) {
+        entry.branches.set(branchKey, {
+          provider: row.provider,
+          gitBranch: row.gitBranch,
+          worktree: identity.worktree,
+          aggregate: emptyProjectBurnAggregate(),
+        });
+      }
+      addProjectBurnAggregate(entry.branches.get(branchKey).aggregate, row.aggregate);
+
+      // Account attribution runs through the profile slug, exactly like the
+      // session explorer: a slug claimed by two accounts resolves to neither.
+      const account = accounts.get(`${row.provider}:${row.profileSlug}`) || null;
+      const accountKey = `${row.provider}:${row.profileSlug}`;
+      if (!entry.accounts.has(accountKey)) {
+        entry.accounts.set(accountKey, {
+          provider: row.provider,
+          profileSlug: row.profileSlug,
+          accountId: account ? account.accountId : null,
+          accountLabel: account ? account.accountLabel : null,
+          aggregate: emptyProjectBurnAggregate(),
+        });
+      }
+      addProjectBurnAggregate(entry.accounts.get(accountKey).aggregate, row.aggregate);
+    }
+
+    const byBurn = (a, b) => b.aggregate.totalTokens - a.aggregate.totalTokens
+      || b.aggregate.requests - a.aggregate.requests;
+    const ordered = [...folded.values()].sort((a, b) => byBurn(a, b) || a.key.localeCompare(b.key));
+    const visible = ordered.slice(0, rowLimit);
+    const remainderProjects = ordered.slice(rowLimit);
+    const remainderAggregate = remainderProjects.reduce(
+      (target, entry) => addProjectBurnAggregate(target, entry.aggregate),
+      emptyProjectBurnAggregate(),
+    );
+
+    const attributed = emptyProjectBurnAggregate();
+    const unattributed = emptyProjectBurnAggregate();
+    for (const entry of ordered) {
+      addProjectBurnAggregate(entry.unattributed ? unattributed : attributed, entry.aggregate);
+    }
+
+    const projects = visible.map((entry) => ({
+      key: entry.key,
+      project: entry.project,
+      unattributed: entry.unattributed,
+      providers: [...entry.providers].sort(),
+      firstAt: entry.firstAt,
+      lastAt: entry.lastAt,
+      branches: [...entry.branches.values()]
+        .sort((a, b) => byBurn(a, b)
+          || String(a.gitBranch).localeCompare(String(b.gitBranch))
+          || String(a.worktree).localeCompare(String(b.worktree)))
+        .map((branch) => ({
+          provider: branch.provider,
+          gitBranch: branch.gitBranch,
+          worktree: branch.worktree,
+          ...projectBurnPayload(branch.aggregate),
+        })),
+      accounts: [...entry.accounts.values()]
+        .sort((a, b) => byBurn(a, b) || a.profileSlug.localeCompare(b.profileSlug))
+        .map((account) => ({
+          provider: account.provider,
+          profileSlug: account.profileSlug,
+          accountId: account.accountId,
+          accountLabel: account.accountLabel,
+          ...projectBurnPayload(account.aggregate),
+        })),
+      ...projectBurnPayload(entry.aggregate),
+    }));
+
+    // The drill-down is the session leaderboard narrowed to this project, so
+    // the two views agree by construction rather than by convention.
+    const sessions = project == null
+      ? null
+      : this.usageSessions({ since, until, provider, project, limit: rowLimit });
+    const series = bucket == null
+      ? null
+      : this.projectBurnSeries({ since, until, provider, project, bucket });
+
+    return {
+      range: { since, until, endExclusive: true },
+      provider,
+      project,
+      bucket,
+      series,
+      limit: rowLimit,
+      projects,
+      truncated: remainderProjects.length > 0,
+      remainder: remainderProjects.length
+        ? { projects: remainderProjects.length, ...projectBurnPayload(remainderAggregate) }
+        : null,
+      totals: projectBurnPayload(totals),
+      sessions,
+      reconciliation: {
+        attributed: projectBurnPayload(attributed),
+        unattributed: projectBurnPayload(unattributed),
+        sessionTotals: projectBurnPayload(totals),
+        // The proxy-observed universe for the SAME bounds and provider filter,
+        // straight from usageSummary. It is reported, not reconciled away:
+        // these two universes overlap in reality but cannot be joined per
+        // request (FINDINGS-336.md), so the difference is stated, not hidden.
+        warehouse: { ...warehouse.totals },
+        requestLevelJoinAvailable: false,
+        note: 'Project burn is measured from session records (Claude transcripts, Codex rollouts). '
+          + 'The proxy request warehouse carries no project, and the per-request join to transcripts '
+          + 'measured 0% on the available history, so warehouse totals are reported beside these '
+          + 'figures rather than attributed to a project.',
+      },
+    };
   }
 
   getSettings() {

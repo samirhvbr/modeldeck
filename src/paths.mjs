@@ -10,6 +10,15 @@ export const DATA_DIR = path.resolve(
   process.env.MODELDECK_DATA_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck'),
 );
 export const DB_PATH = process.env.MODELDECK_DB_PATH || path.join(DATA_DIR, 'modeldeck.sqlite');
+// Issue #347: the lane runner's append-only run manifest
+// (.claude/lane-logs/manifest.jsonl in the orchestrated repo). Read-only, and
+// only ever to TAG sessions with a plausible issue number — a missing file
+// simply means no lane tags. The default points at this repo's checkout under
+// the projects root; the override exists for other checkouts and for tests.
+export const LANE_MANIFEST_PATH = path.resolve(
+  process.env.MODELDECK_LANE_MANIFEST_PATH
+    || path.join(PROJECTS_ROOT, 'modeldeck', '.claude', 'lane-logs', 'manifest.jsonl'),
+);
 export const CLAUDE_PATH = process.env.MODELDECK_CLAUDE_PATH || 'claude';
 export const CLAUDE_PROFILES_DIR = path.resolve(
   process.env.MODELDECK_CLAUDE_PROFILES_DIR || path.join(DATA_DIR, 'claude-profiles'),
@@ -46,6 +55,13 @@ export const CODEX_ACTIVE_LINK = path.resolve(
 // directory. Keep binary discovery configurable like Claude/Codex paths.
 export const CLIPROXY_BIN = process.env.MODELDECK_CLIPROXY_BIN || 'cliproxyapi';
 export const CLIPROXY_BASE_URL = process.env.MODELDECK_CLIPROXY_BASE_URL || 'http://127.0.0.1:8317';
+// CLIProxyAPI management credential FILE. The daemon reads and trims it on
+// every enabled usage-queue tick; only this path is configured here, never the
+// key value. The override exists for nonstandard installs and isolated tests.
+export const CLIPROXY_MANAGEMENT_KEY_PATH = path.resolve(
+  process.env.MODELDECK_CLIPROXY_MANAGEMENT_KEY_PATH
+    || path.join(os.homedir(), '.config', 'cliproxyapi', '.mgmt-key'),
+);
 // CLIProxyAPI auth-file directory (an external tool's state, read-only):
 // each account file carries the routing `weight` an external rebalance job
 // maintains from live quota. The daemon only ever READS the non-secret
@@ -53,4 +69,13 @@ export const CLIPROXY_BASE_URL = process.env.MODELDECK_CLIPROXY_BASE_URL || 'htt
 // proxy simply isn't installed and nothing renders.
 export const CLIPROXY_AUTH_DIR = path.resolve(
   process.env.MODELDECK_CLIPROXY_AUTH_DIR || path.join(os.homedir(), '.config', 'cliproxyapi', 'auth'),
+);
+// Rebuildable request-usage archive owned by CLIProxyAPI's puller. The
+// backfill CLI reads it without modifying or deleting source files. Keep the
+// override separate from CLIPROXY_AUTH_DIR: archive ingest never needs access
+// to provider auth material.
+export const CLIPROXY_USAGE_ARCHIVE_DIR = path.resolve(
+  process.env.MODELDECK_CLIPROXY_USAGE_ARCHIVE_DIR
+    || process.env.MODELDECK_USAGE_ARCHIVE_DIR
+    || path.join(os.homedir(), '.config', 'cliproxyapi', 'static', 'modeldeck-test-pulls'),
 );

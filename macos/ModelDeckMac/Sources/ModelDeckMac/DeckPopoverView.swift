@@ -53,6 +53,9 @@ struct DeckPopoverView: View {
     /// SettingsLink, which with the accessory activation policy opened the
     /// window behind the frontmost app or failed to raise an existing one.
     @Environment(\.openSettings) private var openSettings
+    /// Issue #343: the flag-gated "Usage Analytics…" gear-menu item opens
+    /// the daemon-served dashboard in the default browser.
+    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -160,6 +163,17 @@ struct DeckPopoverView: View {
                 Button("Settings…") {
                     openSettings()
                     SettingsWindowFronting.activateAndFront()
+                }
+                // Issue #343: rendered ONLY while the usage-analytics flag
+                // is on (the model publishes a URL only then) — flag off
+                // must leave nothing user-visible. Opens the daemon-served
+                // local dashboard in the default browser; the explicit
+                // accessibility label names that side effect for VoiceOver.
+                if let dashboardURL = deckModel.usageAnalyticsDashboardURL {
+                    Button(UsageAnalytics.menuItemTitle) {
+                        openURL(dashboardURL)
+                    }
+                    .accessibilityLabel(UsageAnalytics.menuItemAccessibilityLabel)
                 }
                 Divider()
                 Toggle("Launch at Login", isOn: Binding(
@@ -2393,7 +2407,7 @@ struct HealthSectionView: View {
     let section: HealthSection
 
     /// The label column, sized to the longest label the redesign can
-    /// produce ("Today's burn" / "Lowest point" at 11 pt ≈ 66 pt). Fixed
+    /// produce ("Current burn" / "Lowest point" at 11 pt ≈ 66 pt). Fixed
     /// rather than intrinsic so the value column's numbers line up down the
     /// WHOLE popover, not just within one group.
     static let labelWidth: CGFloat = 68

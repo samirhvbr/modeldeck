@@ -117,6 +117,13 @@ public final class SettingsSyncModel: ObservableObject {
             { $0.deckHealthLabels != nil },
             { $0.deckHealthLabels = nil }
         ),
+        // Issue #343: pre-analytics daemons don't know the feature flag —
+        // and have no dashboard route the flag could open.
+        (
+            "usageAnalyticsEnabled",
+            { $0.usageAnalyticsEnabled != nil },
+            { $0.usageAnalyticsEnabled = nil }
+        ),
     ]
 
     private func push(_ patch: DaemonSettingsPatch) async {
@@ -228,6 +235,14 @@ public final class SettingsSyncModel: ObservableObject {
     public func setDeckHealthLabels(_ stored: String) async {
         guard stored != settings.deckHealthLabels else { return }
         await update(DaemonSettingsPatch(deckHealthLabels: stored))
+    }
+
+    /// Issue #343/#388: the usage-analytics kill switch ("Enable the usage
+    /// analytics dashboard"). 0.4.6 defaults on; while off the daemon serves
+    /// no dashboard route and the popover shows no menu item.
+    public func setUsageAnalyticsEnabled(_ enabled: Bool) async {
+        guard enabled != settings.usageAnalyticsEnabled else { return }
+        await update(DaemonSettingsPatch(usageAnalyticsEnabled: enabled))
     }
 
     static func message(for error: Error) -> String {

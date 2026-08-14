@@ -1,0 +1,45 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "user.account_uuid", "value": { "stringValue": "account-uuid-placeholder" } },
+          { "key": "user.email", "value": { "stringValue": "placeholder@example.invalid" } },
+          { "key": "organization.id", "value": { "stringValue": "organization-placeholder" } }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": {
+            "attributes": [
+              { "key": "agent.name", "value": { "stringValue": "placeholder-agent" } }
+            ]
+          },
+          "logRecords": [
+            {
+              "timeUnixNano": "1786278900000000000",
+              "body": { "stringValue": "claude_code.api_request" },
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "claude_code.api_request" } },
+                { "key": "model", "value": { "stringValue": "claude-placeholder-model" } },
+                { "key": "effort", "value": { "stringValue": "medium" } },
+                { "key": "speed", "value": { "stringValue": "standard" } },
+                { "key": "query_source", "value": { "stringValue": "user" } },
+                { "key": "skill.name", "value": { "stringValue": "placeholder-skill" } },
+                { "key": "session.id", "value": { "stringValue": "session-placeholder" } },
+                { "key": "request_id", "value": { "stringValue": "request-placeholder" } },
+                { "key": "input_tokens", "value": { "intValue": "100" } },
+                { "key": "output_tokens", "value": { "intValue": "20" } },
+                { "key": "cache_read_tokens", "value": { "intValue": "70" } },
+                { "key": "cache_creation_tokens", "value": { "intValue": "10" } },
+                { "key": "cost_usd", "value": { "doubleValue": 0.025 } },
+                { "key": "terminal.type", "value": { "stringValue": "placeholder-terminal" } },
+                { "key": "authorization", "value": { "stringValue": "credential-placeholder" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

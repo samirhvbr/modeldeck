@@ -46,6 +46,18 @@ import {
 } from './db.mjs';
 import { scanProjectRoot } from './projects.mjs';
 import { SharedScopeEngine } from './shared-scope.mjs';
+import {
+  UsageQueueConsumer,
+  USAGE_QUEUE_CONSUMER_INTERVAL_MS,
+  usageQueueWarningCount,
+} from './usage-queue-consumer.mjs';
+import {
+  detectForeignUsageConsumers,
+  RETIRED_USAGE_CONSUMER_LABELS,
+} from './usage-queue-guard.mjs';
+import { ingestTranscriptArchive } from './transcript-ingest.mjs';
+import { ingestCodexRollouts } from './codex-rollout-ingest.mjs';
+import { refitUsageEstimates } from './usage-estimate.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -63,6 +75,7 @@ const ACTIVE_SESSION_REFRESH_CAP_MS = 30 * 60_000;
 
 const DAY_MS = 24 * 60 * 60_000;
 export const USAGE_SNAPSHOT_PRUNE_INTERVAL_MS = DAY_MS;
+export const WAREHOUSE_INGEST_INTERVAL_MS = 15 * 60_000;
 
 const CLAUDE_RENEWAL_TIMEOUT_MS = 60_000;
 const CLAUDE_RENEWAL_BACKOFF_MS = 30 * 60_000;
@@ -462,6 +475,30 @@ export class ModelDeckService {
     // packaged daemon never relies on a particular interactive shell PATH.
     this.cliproxyPath = options.cliproxyPath || options.cliproxyBin || 'cliproxyapi';
     this.cliproxyBaseUrl = options.cliproxyBaseUrl || DEFAULT_CLIPROXY_BASE_URL;
+    // A plain service fixture never receives a live management-key path. The
+    // production server wires src/paths.mjs explicitly; tests wire only temp
+    // key files and loopback stubs. Credential material is read inside pull().
+    this.usageQueueConsumer = options.usageQueueConsumer || new UsageQueueConsumer({
+      store: this.store,
+      managementKeyPath: options.cliproxyManagementKeyPath ?? null,
+      baseUrl: options.usageQueueBaseUrl || this.cliproxyBaseUrl,
+      machine: options.usageQueueMachine || 'studio',
+      fetcher: options.usageQueueFetch || globalThis.fetch,
+      readFile: options.usageQueueReadFile || fs.promises.readFile,
+      warn: options.warnUsageQueue,
+      log: options.logUsageQueue,
+      requestTimeoutMs: options.usageQueueRequestTimeoutMs,
+    });
+    this.detectForeignUsageConsumers = options.detectForeignUsageConsumers
+      || ((guardOptions) => (options.platform || process.platform) === 'darwin'
+        ? detectForeignUsageConsumers({
+          exec: this.exec,
+          uid: options.uid,
+          ...guardOptions,
+        })
+        : Promise.resolve({ checked: true, consumers: [], probe: 'ok' }));
+    this.logUsageQueueGuard = options.logUsageQueueGuard
+      || ((message) => console.error(`[modeldeck] ${message}`));
     this.spawn = options.spawn || spawnChild;
     const proxyJoinPollIntervalMs = Number(options.proxyJoinPollIntervalMs ?? DEFAULT_PROXY_JOIN_POLL_INTERVAL_MS);
     const proxyJoinTimeoutMs = Number(options.proxyJoinTimeoutMs ?? DEFAULT_PROXY_JOIN_TIMEOUT_MS);
@@ -555,6 +592,31 @@ export class ModelDeckService {
     this.usageSnapshotPrunePromise = null;
     this.usageSnapshotPruneStarted = false;
     this.usageSnapshotPruneGeneration = 0;
+    this.usageQueueConsumerTimer = null;
+    this.usageQueueConsumerPromise = null;
+    this.usageQueueConsumerStarted = false;
+    this.usageQueueConsumerGeneration = 0;
+    this.usageQueueConsumerScheduledEnabled = null;
+    this.usageQueueGuard = {
+      status: 'not-checked',
+      checkedAt: null,
+      foreignConsumers: [],
+      message: null,
+    };
+    this.usageQueueGuardPromise = null;
+    this.usageQueueLastPull = null;
+    this.ingestTranscriptArchive = options.ingestTranscriptArchive || ingestTranscriptArchive;
+    this.ingestCodexRollouts = options.ingestCodexRollouts || ingestCodexRollouts;
+    this.refitUsageEstimates = options.refitUsageEstimates || refitUsageEstimates;
+    this.warehouseIngestMachine = options.warehouseIngestMachine || 'studio';
+    this.logWarehouseIngest = options.logWarehouseIngest
+      || ((message) => console.error(`[modeldeck] ${message}`));
+    this.warehouseIngestTimer = null;
+    this.warehouseIngestPromise = null;
+    this.warehouseIngestStarted = false;
+    this.warehouseIngestGeneration = 0;
+    this.warehouseIngestScheduledEnabled = null;
+    this.warehouseIngestLastPass = null;
     this.autoRefreshInitialDelayMs = Number(options.autoRefreshInitialDelayMs ?? 1_000);
     this.autoRefreshTimer = null;
     this.autoRefreshGeneration = 0;
@@ -741,6 +803,327 @@ export class ModelDeckService {
     };
     void promise.then(clear, clear);
     return promise;
+  }
+
+  // -------------------------------------------------------------------------
+  // Issue #338 — sole CLIProxyAPI usage-queue consumer.
+
+  /// This lifecycle is independent of provider auto-refresh. Enabling starts
+  /// with one immediate pull, then schedules from completion so slow pulls or
+  /// machine sleep never creates overlap/catch-up bursts. Startup always
+  /// probes both retired launchd jobs; an enabled consumer stays blocked until
+  /// the legacy poller and interim ingest job are confirmed absent.
+  async startUsageQueueConsumer() {
+    if (this.usageQueueConsumerStarted || this.demoFixtures) return;
+    this.usageQueueConsumerStarted = true;
+    this.usageQueueConsumerScheduledEnabled = null;
+    // Detect and surface a stale foreign job even before the operator enables
+    // the daemon consumer. The probe is read-only; queue access remains gated.
+    await this.refreshUsageQueueGuard();
+    if (!this.usageQueueConsumerStarted) return;
+    // A settings PUT can complete while launchctl is answering. Re-read after
+    // the await so startup cannot undo a newer operator cutover.
+    return this.rescheduleUsageQueueConsumer(this.store.getSettings(), { guardChecked: true });
+  }
+
+  async rescheduleUsageQueueConsumer(settings = this.store.getSettings(), { guardChecked = false } = {}) {
+    if (!this.usageQueueConsumerStarted) return;
+    const enabled = settings.usageQueueConsumerEnabled === true;
+    // Ordinary settings PUTs must not create extra destructive reads.
+    if (enabled === this.usageQueueConsumerScheduledEnabled) {
+      // A blocked/unknown enable can be retried after the operator unloads
+      // the foreign job without first toggling the stored kill switch off.
+      if (enabled && this.usageQueueGuard.status !== 'clear') {
+        const guard = await this.refreshUsageQueueGuard();
+        if (guard.status !== 'clear') return;
+        this.usageQueueConsumerScheduledEnabled = null;
+      } else {
+        return enabled
+          ? undefined
+          : (this.usageQueueConsumerPromise || Promise.resolve()).catch(() => {});
+      }
+    }
+    const generation = ++this.usageQueueConsumerGeneration;
+    if (this.usageQueueConsumerTimer != null) this.clearTimeout(this.usageQueueConsumerTimer);
+    this.usageQueueConsumerTimer = null;
+    if (enabled) {
+      const guard = guardChecked ? this.usageQueueGuard : await this.refreshUsageQueueGuard();
+      if (!this.usageQueueConsumerStarted || generation !== this.usageQueueConsumerGeneration) return;
+      if (guard.status !== 'clear') {
+        this.usageQueueConsumerScheduledEnabled = false;
+        return;
+      }
+      // A release helper must observe this arming's first pull, never a clean
+      // result retained from an earlier enable/disable cycle.
+      this.usageQueueLastPull = null;
+      this.logUsageQueueGuard('USAGE QUEUE DAEMON CONSUMER ARMED: retired launchd consumers confirmed absent');
+      this.usageQueueConsumerScheduledEnabled = true;
+      this.runScheduledUsageQueuePull(generation, { guardChecked: true });
+      return;
+    }
+    this.usageQueueConsumerScheduledEnabled = false;
+    // Disabling is an operator handoff boundary. Never abort a response that
+    // may already have drained the queue, but do not report the consumer OFF
+    // until that response has completed its allowlisted ingest either.
+    return enabled
+      ? undefined
+      : (this.usageQueueConsumerPromise || Promise.resolve()).catch(() => {});
+  }
+
+  async stopUsageQueueConsumer() {
+    this.usageQueueConsumerStarted = false;
+    this.usageQueueConsumerScheduledEnabled = false;
+    this.usageQueueConsumerGeneration += 1;
+    if (this.usageQueueConsumerTimer != null) this.clearTimeout(this.usageQueueConsumerTimer);
+    this.usageQueueConsumerTimer = null;
+    // A response may already have drained the queue. Let its allowlisted ingest
+    // finish before the Store closes; generation only prevents re-arming.
+    await (this.usageQueueConsumerPromise || Promise.resolve()).catch(() => {});
+  }
+
+  async refreshUsageQueueGuard() {
+    if (this.usageQueueGuardPromise) return this.usageQueueGuardPromise;
+    const check = (async () => {
+      const previousMessage = this.usageQueueGuard.message;
+      let result;
+      try {
+        result = await this.detectForeignUsageConsumers({ labels: RETIRED_USAGE_CONSUMER_LABELS });
+      } catch {
+        result = { checked: true, consumers: [], probe: 'unknown' };
+      }
+      const checkedAt = new Date(this.now()).toISOString();
+      let status = 'clear';
+      let message = null;
+      if (result.consumers?.length) {
+        status = 'blocked';
+        message = `USAGE QUEUE FOREIGN CONSUMER DETECTED: still loaded: ${result.consumers.join(', ')}; daemon consumer blocked`;
+      } else if (result.probe !== 'ok') {
+        status = 'unknown';
+        message = 'USAGE QUEUE FOREIGN-CONSUMER CHECK UNKNOWN: could not verify retired launchd consumers are absent; daemon consumer blocked';
+      }
+      this.usageQueueGuard = {
+        status,
+        checkedAt,
+        foreignConsumers: result.consumers || [],
+        message,
+      };
+      // Log on every newly detected conflict/unknown state, including startup,
+      // without repeating the same alarm on each five-minute guard recheck.
+      if (message && message !== previousMessage) this.logUsageQueueGuard(message);
+      return this.usageQueueGuard;
+    })();
+    this.usageQueueGuardPromise = check;
+    try {
+      return await check;
+    } finally {
+      if (this.usageQueueGuardPromise === check) this.usageQueueGuardPromise = null;
+    }
+  }
+
+  usageQueueStatus(settings = this.store.getSettings()) {
+    return {
+      configured: settings.usageQueueConsumerEnabled === true,
+      running: this.usageQueueConsumerScheduledEnabled === true,
+      inFlight: this.usageQueueConsumerPromise != null,
+      guard: { ...this.usageQueueGuard },
+      lastPull: this.usageQueueLastPull,
+    };
+  }
+
+  async runScheduledUsageQueuePull(generation, { guardChecked = false } = {}) {
+    // Re-read the persisted gate at the moment of every destructive pull. The
+    // API normally calls rescheduleUsageQueueConsumer immediately, but this
+    // guard also makes direct Store changes fail closed.
+    if (!this.store.getSettings().usageQueueConsumerEnabled) {
+      this.usageQueueConsumerScheduledEnabled = false;
+      return;
+    }
+    if (!guardChecked) {
+      const guard = await this.refreshUsageQueueGuard();
+      if (!this.usageQueueConsumerStarted
+        || generation !== this.usageQueueConsumerGeneration) return;
+      if (guard.status !== 'clear') {
+        this.usageQueueConsumerScheduledEnabled = false;
+        return;
+      }
+    }
+    void this.pullUsageQueue().catch(() => {
+      // pull() already converts operational failures to counted warnings. This
+      // fixed fallback protects the daemon without exposing credential context.
+      console.warn('[modeldeck] usage queue pull failed (warnings=1)');
+    }).finally(() => {
+      if (!this.usageQueueConsumerStarted
+        || generation !== this.usageQueueConsumerGeneration) return;
+      const settings = this.store.getSettings();
+      if (!settings.usageQueueConsumerEnabled) {
+        this.usageQueueConsumerScheduledEnabled = false;
+        return;
+      }
+      this.usageQueueConsumerTimer = this.setTimeout(() => {
+        this.usageQueueConsumerTimer = null;
+        if (!this.usageQueueConsumerStarted
+          || generation !== this.usageQueueConsumerGeneration) return;
+        void this.runScheduledUsageQueuePull(generation);
+      }, USAGE_QUEUE_CONSUMER_INTERVAL_MS);
+      this.usageQueueConsumerTimer?.unref?.();
+    });
+  }
+
+  pullUsageQueue() {
+    if (this.usageQueueConsumerPromise) return this.usageQueueConsumerPromise;
+    const promise = Promise.resolve().then(async () => {
+      const result = await this.usageQueueConsumer.pull();
+      this.usageQueueLastPull = {
+        at: new Date(this.now()).toISOString(),
+        records: Number(result?.records || 0),
+        inserted: Number(result?.inserted || 0),
+        warnings: usageQueueWarningCount(result),
+      };
+      return result;
+    });
+    this.usageQueueConsumerPromise = promise;
+    const clear = () => {
+      if (this.usageQueueConsumerPromise === promise) this.usageQueueConsumerPromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
+  // -------------------------------------------------------------------------
+  // Issue #388 — daemon-owned recurring warehouse ingest.
+
+  /// Preserve the retired launchd job's 15-minute cadence. Like the usage
+  /// queue consumer, each timeout is armed only after the preceding pass has
+  /// completed, so slow local-file scans or machine sleep cannot overlap or
+  /// create catch-up bursts.
+  startWarehouseIngest() {
+    if (this.warehouseIngestStarted || this.demoFixtures) return;
+    this.warehouseIngestStarted = true;
+    this.warehouseIngestScheduledEnabled = null;
+    return this.rescheduleWarehouseIngest(this.store.getSettings());
+  }
+
+  async rescheduleWarehouseIngest(settings = this.store.getSettings()) {
+    if (!this.warehouseIngestStarted) return;
+    const enabled = settings.usageAnalyticsEnabled === true;
+    // Unrelated settings writes must not create an extra warehouse pass.
+    if (enabled === this.warehouseIngestScheduledEnabled) {
+      return enabled
+        ? undefined
+        : (this.warehouseIngestPromise || Promise.resolve()).catch(() => {});
+    }
+    const generation = ++this.warehouseIngestGeneration;
+    if (this.warehouseIngestTimer != null) this.clearTimeout(this.warehouseIngestTimer);
+    this.warehouseIngestTimer = null;
+    if (enabled) {
+      this.warehouseIngestScheduledEnabled = true;
+      this.runScheduledWarehouseIngest(generation);
+      return;
+    }
+    this.warehouseIngestScheduledEnabled = false;
+    // Let a local-file/SQLite pass already in flight finish before settings
+    // reports the analytics machinery disabled; generation prevents re-arming.
+    await (this.warehouseIngestPromise || Promise.resolve()).catch(() => {});
+  }
+
+  async stopWarehouseIngest() {
+    this.warehouseIngestStarted = false;
+    this.warehouseIngestScheduledEnabled = false;
+    this.warehouseIngestGeneration += 1;
+    if (this.warehouseIngestTimer != null) this.clearTimeout(this.warehouseIngestTimer);
+    this.warehouseIngestTimer = null;
+    // The Store closes immediately after app.close(), so an active pass must
+    // finish its transactions first. The generation only prevents re-arming.
+    await (this.warehouseIngestPromise || Promise.resolve()).catch(() => {});
+  }
+
+  runScheduledWarehouseIngest(generation) {
+    // Re-read the persisted kill switch at every pass. The settings API also
+    // reschedules immediately, but a direct Store change must fail closed.
+    if (!this.store.getSettings().usageAnalyticsEnabled) {
+      this.warehouseIngestScheduledEnabled = false;
+      return;
+    }
+    void this.runWarehouseIngestPass().catch((error) => {
+      // Each configured job is isolated below. This fallback covers an
+      // unexpected scheduler-level failure without losing the recurring loop.
+      try {
+        this.logWarehouseIngest(`warehouse ingest pass failed: ${errorMessage(error)}`);
+      } catch { /* Logging cannot prevent the next tick. */ }
+    }).finally(() => {
+      if (!this.warehouseIngestStarted
+        || generation !== this.warehouseIngestGeneration) return;
+      if (!this.store.getSettings().usageAnalyticsEnabled) {
+        this.warehouseIngestScheduledEnabled = false;
+        return;
+      }
+      this.warehouseIngestTimer = this.setTimeout(() => {
+        this.warehouseIngestTimer = null;
+        if (!this.warehouseIngestStarted
+          || generation !== this.warehouseIngestGeneration) return;
+        this.runScheduledWarehouseIngest(generation);
+      }, WAREHOUSE_INGEST_INTERVAL_MS);
+      this.warehouseIngestTimer?.unref?.();
+    });
+  }
+
+  runWarehouseIngestPass() {
+    if (this.warehouseIngestPromise) return this.warehouseIngestPromise;
+    const promise = (async () => {
+      const startedAt = new Date(this.now()).toISOString();
+      const jobs = [
+        ['transcriptArchive', () => this.ingestTranscriptArchive({
+          store: this.store,
+          directory: this.claudeProfilesDir,
+          machine: this.warehouseIngestMachine,
+        })],
+        ['codexRollouts', () => this.ingestCodexRollouts({
+          store: this.store,
+          profilesRoot: this.codexProfilesDir,
+          machine: this.warehouseIngestMachine,
+        })],
+        ['usageEstimateRefit', () => this.refitUsageEstimates(this.store)],
+      ];
+      const outcomes = {};
+      for (const [name, run] of jobs) {
+        try {
+          const result = await run();
+          const warnings = name === 'transcriptArchive'
+            ? Number(result?.warnings || 0)
+            : name === 'codexRollouts'
+              ? Object.values(result?.warnings || {}).reduce((total, count) => total + Number(count || 0), 0)
+              : 0;
+          outcomes[name] = { ok: true, warnings };
+        } catch (error) {
+          outcomes[name] = { ok: false, warnings: 0 };
+          try {
+            this.logWarehouseIngest(`warehouse ingest ${name} failed: ${errorMessage(error)}`);
+          } catch { /* Logging cannot stop the remaining jobs or the next tick. */ }
+        }
+      }
+      this.warehouseIngestLastPass = {
+        startedAt,
+        at: new Date(this.now()).toISOString(),
+        jobs: outcomes,
+      };
+      return outcomes;
+    })();
+    this.warehouseIngestPromise = promise;
+    const clear = () => {
+      if (this.warehouseIngestPromise === promise) this.warehouseIngestPromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
+  warehouseIngestStatus(settings = this.store.getSettings()) {
+    return {
+      configured: settings.usageAnalyticsEnabled === true,
+      running: this.warehouseIngestScheduledEnabled === true,
+      inFlight: this.warehouseIngestPromise != null,
+      intervalSeconds: WAREHOUSE_INGEST_INTERVAL_MS / 1_000,
+      lastPass: this.warehouseIngestLastPass,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -3523,6 +3906,8 @@ export class ModelDeckService {
       activation: { claude: claudeActivation, codex: codexActivation },
       claudeSecureStorage,
       scheduler: this.refreshSchedulerStatus(),
+      usageQueue: this.usageQueueStatus(),
+      warehouseIngest: this.warehouseIngestStatus(),
       daemon: this.daemonRuntimeStatus(),
       sharedScope: this.sharedScope.status(),
     };

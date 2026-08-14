@@ -221,6 +221,12 @@ echo "==> repository guard OK"
 echo "    packaged commit: $GIT_COMMIT"
 echo "    required ref:    $RELEASE_REF"
 
+[[ -f "$REPO_ROOT/scripts/release-checks.mjs" ]] \
+  || fail "release analytics checks missing: $REPO_ROOT/scripts/release-checks.mjs"
+echo "==> release analytics checks"
+node "$REPO_ROOT/scripts/release-checks.mjs" \
+  || fail "release analytics checks failed"
+
 if [[ "$CHECK_ONLY" == 1 ]]; then
   echo "==> check-only complete; signing and build steps were not run"
   echo "    release assembly will require: $DAEMON_BINARY"

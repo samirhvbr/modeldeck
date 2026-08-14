@@ -1,6 +1,6 @@
 {
   "name": "modeldeck",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "private": true,
   "type": "module",
   "description": "Local project-aware AI account and usage control plane.",
@@ -11,17 +11,31 @@
     "dev": "node --watch src/server.mjs",
     "start": "node src/server.mjs",
     "test": "node --test",
+    "release:check": "node scripts/release-checks.mjs",
     "test:coverage": "node --test --experimental-test-coverage",
     "demo:seed": "node scripts/seed-demo.mjs",
+    "usage:ingest": "node scripts/ingest-usage.mjs",
+    "usage:estimate:refit": "node scripts/refit-usage-estimates.mjs",
+    "usage:ingest:codex": "node scripts/ingest-codex-rollouts.mjs",
+    "transcripts:ingest": "node scripts/ingest-transcripts.mjs",
     "migrate": "node scripts/migrate-db.mjs",
     "scan": "node bin/modeldeck.mjs scan ~/projects",
-    "status": "node bin/modeldeck.mjs status"
+    "status": "node bin/modeldeck.mjs status",
+    "dashboard:build": "node scripts/build-dashboard.mjs",
+    "dashboard:dev": "vite --config dashboard/vite.config.js"
   },
   "engines": {
     "node": ">=24"
   },
   "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.2",
     "esbuild": "^0.28.1",
-    "postject": "1.0.0-alpha.6"
+    "jsdom": "^30.0.1",
+    "postject": "1.0.0-alpha.6",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "recharts": "^3.2.1",
+    "vite": "^7.1.5",
+    "vite-plugin-singlefile": "^2.3.0"
   }
 }

@@ -43,6 +43,9 @@ async function startFixture(serviceOptions = {}) {
     // Deterministic: never let the fixture shell out to /bin/ps for the
     // issue #66 pre-flip running-session warning.
     listProviderProcesses: async () => [],
+    // The usage-queue guard is launchd-only production plumbing; API tests
+    // inject the confirmed-absent result and never inspect the user's domain.
+    detectForeignUsageConsumers: async () => ({ checked: true, consumers: [], probe: 'ok' }),
     ...serviceOptions,
   });
   const app = createApp({ store, service, host: '127.0.0.1', port: 0 });
@@ -451,12 +454,14 @@ test('settings API validates partial updates and drives worst-capacity threshold
   assert.deepEqual(result.body, {
     autoRefreshEnabled: true,
     autoRenewEnabled: true,
+    otelReceiverEnabled: false,
     autoRefreshIntervalSeconds: 300,
     autoRefreshIntervalCustomized: false,
     // Issue #187: pause-while-active is opt-in — live updates during an
     // active session are the default experience.
     pauseWhileActive: false,
     sharedUserScopeEnabled: false,
+    usageQueueConsumerEnabled: false,
     layout: 'two-column',
     defaultSort: 'next-reset',
     notificationThresholdPercent: 25,
@@ -465,6 +470,8 @@ test('settings API validates partial updates and drives worst-capacity threshold
     menuBarShowWhen: '',
     // Issue #242: deck chip labels — '' = dot only (default).
     deckHealthLabels: '',
+    // TRIPWIRE (#388): 0.4.6 defaults the dashboard ON for a new database.
+    usageAnalyticsEnabled: true,
   });
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ layout: 'single-column', notificationThresholdPercent: 30 }) });
   assert.equal(result.body.layout, 'single-column');

@@ -1,0 +1,529 @@
+/* Palette: the dataviz reference instance, validated with
+   scripts/validate_palette.js in BOTH modes (adjacent pairlist — this page
+   stacks and tiles, it never scatters). Light mode's aqua/yellow/magenta sit
+   below 3:1 on the surface, so the relief rule applies: every mark that wears
+   them also carries a visible direct label or a table row. */
+
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --surface-2: #f2f1ed;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --baseline: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --tooltip-bg: #ffffff;
+  --shadow: 0 1px 2px rgba(11, 11, 11, 0.06), 0 8px 24px rgba(11, 11, 11, 0.06);
+
+  --cat-1: #2a78d6;
+  --cat-2: #eb6834;
+  --cat-3: #1baf7a;
+  --cat-4: #eda100;
+  --cat-5: #e87ba4;
+  --cat-6: #008300;
+  --cat-7: #4a3aa7;
+  --cat-8: #e34948;
+  --neutral: #a8a69d;
+
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme='light'])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --surface-2: #242423;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --tooltip-bg: #242423;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.5);
+
+    --cat-1: #3987e5;
+    --cat-2: #d95926;
+    --cat-3: #199e70;
+    --cat-4: #c98500;
+    --cat-5: #d55181;
+    --cat-6: #008300;
+    --cat-7: #9085e9;
+    --cat-8: #e66767;
+    --neutral: #6f6d67;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-2: #242423;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --baseline: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --tooltip-bg: #242423;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.5);
+
+  --cat-1: #3987e5;
+  --cat-2: #d95926;
+  --cat-3: #199e70;
+  --cat-4: #c98500;
+  --cat-5: #d55181;
+  --cat-6: #008300;
+  --cat-7: #9085e9;
+  --cat-8: #e66767;
+  --neutral: #6f6d67;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text-primary);
+  font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page { max-width: 1180px; margin: 0 auto; padding: 24px 24px 64px; }
+
+/* ---- chrome ---- */
+
+.topbar {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  padding-bottom: 16px; margin-bottom: 20px; border-bottom: 1px solid var(--border);
+}
+.brand { font-size: 13px; font-weight: 600; letter-spacing: 0.02em; }
+/* The drill trail. It lives in the top bar rather than above the first card, so
+   the way back out of a level is in the same place at every level and never
+   below the fold. */
+.crumbs { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); }
+.crumbs button {
+  background: none; border: 0; padding: 0; font: inherit; color: var(--cat-1); cursor: pointer;
+}
+.crumbs button:hover { text-decoration: underline; }
+.spacer { margin-left: auto; }
+
+.filters { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
+.filter-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+
+.segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.segmented button {
+  background: transparent; border: 0; padding: 5px 11px; font: inherit; font-size: 12px;
+  color: var(--text-secondary); cursor: pointer; white-space: nowrap;
+}
+.segmented button + button { border-left: 1px solid var(--border); }
+.segmented button:hover { color: var(--text-primary); background: var(--surface-2); }
+.segmented button[aria-pressed='true'] { background: var(--surface-2); color: var(--text-primary); font-weight: 600; }
+.segmented.lens button[aria-pressed='true'] { background: var(--cat-1); color: #fff; }
+
+/* ---- hero ---- */
+
+.hero { display: flex; gap: 32px; flex-wrap: wrap; align-items: flex-start; margin-bottom: 8px; }
+.hero-main { min-width: 260px; }
+.hero-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.hero-figure { font-size: 52px; font-weight: 600; line-height: 1.05; letter-spacing: -0.02em; margin: 4px 0 2px; }
+.hero-unit { font-size: 15px; font-weight: 400; color: var(--text-secondary); margin-left: 8px; letter-spacing: 0; }
+.hero-sub { font-size: 13px; color: var(--text-secondary); }
+
+.verdict { display: inline-flex; align-items: center; gap: 7px; font-size: 14px; font-weight: 600; }
+.verdict .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+
+.stats { display: flex; gap: 28px; flex-wrap: wrap; }
+.stat { min-width: 118px; }
+.stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
+.stat-value { font-size: 22px; font-weight: 600; margin-top: 2px; }
+.stat-detail { font-size: 12px; color: var(--text-muted); }
+
+/* ---- cards ---- */
+
+.card {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 20px; margin-top: 20px;
+}
+.card-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.card-title { font-size: 13px; font-weight: 600; margin: 0; }
+.card-note { font-size: 12px; color: var(--text-muted); }
+
+/* Section-local narrowing (#410). The controls ride the card's own header, hard
+   right, one notch smaller than the page-level filters they layer on — the
+   header's scope is the louder of the two, and this one only ever narrows it. */
+.card-filters { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
+.card-filters .segmented button { padding: 4px 9px; font-size: 11px; }
+.card-filters select.pick { padding: 3px 7px; font-size: 11px; max-width: 220px; }
+
+.legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+.legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+
+/* ---- chart ---- */
+
+.chart-wrap { position: relative; user-select: none; }
+.chart-hint { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+
+.tip {
+  background: var(--tooltip-bg); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow); padding: 9px 11px; font-size: 12px; min-width: 168px;
+}
+.tip-head { color: var(--text-muted); margin-bottom: 5px; font-size: 11px; }
+.tip-row { display: flex; align-items: center; gap: 10px; justify-content: space-between; }
+.tip-row + .tip-row { margin-top: 3px; }
+.tip-name { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); }
+.tip-key { width: 10px; height: 2px; border-radius: 1px; flex: none; }
+.tip-value { font-variant-numeric: tabular-nums; color: var(--text-primary); font-weight: 600; }
+.tip-total { border-top: 1px solid var(--border); margin-top: 6px; padding-top: 5px; }
+
+/* ---- treemap ---- */
+
+.treemap { position: relative; width: 100%; height: 340px; }
+.block {
+  position: absolute; border: 0; padding: 8px 10px; text-align: left; cursor: pointer;
+  background: var(--surface); color: var(--text-primary); font: inherit; overflow: hidden;
+  display: flex; flex-direction: column; justify-content: flex-start; gap: 1px;
+}
+.block[aria-disabled='true'] { cursor: default; }
+.block:hover:not(:disabled) { filter: brightness(1.06); }
+.block:focus-visible { outline: 2px solid var(--cat-1); outline-offset: -2px; z-index: 2; }
+/* A block's lines never SHRINK — a flex column that squashes its children turns
+   a 12px name into a 1px sliver, which is the sheared-off label bug. Lines are
+   dropped by the density classes instead, and what is left is drawn full size. */
+.block-name {
+  display: flex; align-items: center; gap: 5px; flex: none;
+  font-size: 12px; font-weight: 600; line-height: 1.25; min-width: 0;
+}
+.block-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.block-name .pmarks, .block-name .badge { flex: none; }
+.block-value {
+  flex: none; font-size: 17px; font-weight: 600;
+  font-variant-numeric: tabular-nums; line-height: 1.15;
+}
+.block-sub {
+  flex: none; font-size: 11px; color: var(--text-secondary);
+  font-variant-numeric: tabular-nums; line-height: 1.2;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.block.compact .block-sub { display: none; }
+.block.compact .block-value { font-size: 13px; }
+.block.micro .block-value { display: none; }
+.block.micro { padding: 4px 6px; }
+.block.micro .block-name { font-size: 10px; }
+
+/* ---- table ---- */
+
+table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.data th {
+  text-align: left; font-weight: 400; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--text-muted); padding: 6px 10px 6px 0;
+  border-bottom: 1px solid var(--border); white-space: nowrap;
+}
+table.data td { padding: 7px 10px 7px 0; border-bottom: 1px solid var(--border); }
+table.data tr:last-child td { border-bottom: 0; }
+table.data .num { text-align: right; font-variant-numeric: tabular-nums; }
+table.data .muted { color: var(--text-muted); }
+table.data tbody tr.clickable { cursor: pointer; }
+table.data tbody tr.clickable:hover { background: var(--surface-2); }
+.cell-key { display: inline-flex; align-items: center; gap: 8px; }
+.cell-swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+
+/* ---- misc ---- */
+
+.why {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 15px; height: 15px; border-radius: 50%; border: 1px solid var(--border);
+  font-size: 10px; color: var(--text-muted); cursor: help; margin-left: 5px;
+  vertical-align: 1px; background: var(--surface); flex: none;
+}
+.why:focus-visible { outline: 2px solid var(--cat-1); }
+
+.footer {
+  margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--border);
+  font-size: 12px; color: var(--text-muted); line-height: 1.7;
+}
+.footer p { margin: 0 0 6px; }
+.footer a { color: var(--cat-1); }
+
+.meter { height: 4px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
+.meter > i { display: block; height: 100%; }
+
+.bars { display: flex; flex-direction: column; gap: 10px; }
+.bar-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: baseline; }
+.bar-row .track { grid-column: 1 / -1; }
+
+.loading { opacity: 0.45; transition: opacity 120ms linear; }
+.error { color: var(--critical); font-size: 13px; }
+.empty { color: var(--text-muted); font-size: 13px; padding: 24px 0; text-align: center; }
+
+.chip {
+  display: inline-block; font-size: 11px; padding: 2px 7px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-secondary); margin: 0 4px 4px 0;
+}
+
+/* The detail views' own filter bar. The project picker is a select rather than
+   a segmented control because the list is as long as the reader has projects. */
+.detailbar { margin-top: -4px; }
+select.pick {
+  background: var(--surface); color: var(--text-primary);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 8px; font: inherit; font-size: 12px; max-width: 260px;
+}
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+/* ---- provider marks (round 10, item 2) ----
+   The marks are currentColor glyphs, so a mark inherits whatever ink it sits
+   in. `.pmark-slot` is the only place a mark is given the provider's own hue —
+   used where the mark IS the provider identifier (tabs, table rows, legends).
+   Inside prose and block names it stays text ink so it reads as punctuation
+   rather than as a second data colour. */
+
+.pmark { flex: none; display: block; }
+.pmarks { display: inline-flex; align-items: center; gap: 3px; flex: none; }
+.pmark-slot { display: inline-flex; align-items: center; flex: none; }
+.ptag { display: inline-flex; align-items: center; gap: 6px; }
+
+.segmented button { display: inline-flex; align-items: center; gap: 6px; }
+.segmented.style button { padding: 5px 10px; }
+
+.legend-swatch.line { height: 3px; border-radius: 2px; }
+
+.block.more { border-style: dashed; }
+.block.more .block-name { color: var(--text-secondary); }
+
+/* ---- status badge ----
+   Reserved status ink, never a series hue, and never colour alone: every badge
+   carries a glyph and a word. */
+
+.badge {
+  display: inline-flex; align-items: center; gap: 4px; flex: none;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.02em;
+  padding: 1px 6px; border-radius: 999px; margin-left: 6px;
+  border: 1px solid currentcolor; white-space: nowrap;
+}
+.badge.red { color: var(--critical); }
+.badge.amber { color: var(--serious); }
+.block-name .badge { margin-left: 5px; }
+
+/* ---- movers strip (round 10, item 6) ----
+   One row under the headline. Renders nothing at all when empty — no
+   placeholder, no "nothing to report" line. */
+
+.movers {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-top: 14px; padding: 8px 12px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+}
+.movers-label {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted); margin-right: 2px;
+}
+.mover {
+  display: inline-flex; align-items: center; gap: 7px;
+  background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px;
+  padding: 3px 11px; font: inherit; font-size: 12px; color: var(--text-secondary);
+  cursor: pointer;
+}
+.mover:hover { color: var(--text-primary); border-color: var(--baseline); }
+.mover:focus-visible { outline: 2px solid var(--cat-1); outline-offset: 1px; }
+.mover-name { font-weight: 600; color: var(--text-primary); }
+.mover-x { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--serious); }
+.mover-vs { color: var(--text-muted); font-size: 11px; }
+
+/* ---- the folded tail, as a ranked list ---- */
+
+.bars.folded { gap: 12px; }
+.folded-row {
+  width: 100%; text-align: left; background: none; border: 0; padding: 2px 0;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.folded-row:disabled { cursor: default; }
+.folded-row:hover:not(:disabled) .folded-name { color: var(--text-primary); }
+.folded-name {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+  color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.folded-value { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 13px; }
+.folded-row .track {
+  height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden;
+}
+.folded-row .track > i { display: block; height: 100%; }
+.more-chip { color: var(--text-primary); font-weight: 600; }
+
+/* ---- the drill: caching card and session rows ---- */
+
+.card.compact { padding: 14px 20px; }
+.cache-row { display: flex; gap: 32px; flex-wrap: wrap; align-items: flex-start; }
+.cache-row .stat.grow { flex: 1 1 220px; min-width: 200px; }
+.cache-row .meter { margin-top: 6px; }
+
+/* A session row is a BLOCK with a name on it, not a table row: the name gets
+   the width and the figure and the bar hold their size, so nothing squashes
+   into a column too narrow to read. */
+.session-row {
+  width: 100%; text-align: left; background: none; border: 0; padding: 2px 0;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.session-name {
+  display: flex; align-items: center; gap: 6px; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.session-value { font-variant-numeric: tabular-nums; font-weight: 600; }
+.session-row .track {
+  height: 6px; background: var(--surface-2); border-radius: 3px; overflow: hidden;
+}
+.session-row .track > i { display: block; height: 100%; }
+
+.note {
+  border-left: 2px solid var(--border); padding: 8px 0 8px 12px;
+  line-height: 1.65; max-width: 76ch;
+}
+.note.red { border-left-color: var(--critical); }
+.note.amber { border-left-color: var(--serious); }
+
+/* ---- session anatomy ----
+   The deepest level. Three additions: the computed sentence, the event rail
+   under the timeline, and the last text block. Nothing here introduces a new
+   colour — the rail is ink and shape, the sentence is type. */
+
+.why-card { padding: 18px 20px; }
+.why-sentence {
+  margin: 0 0 14px; font-size: 18px; line-height: 1.45; font-weight: 600;
+  color: var(--text-primary); max-width: 68ch;
+}
+.why-head { display: flex; align-items: flex-start; gap: 8px; }
+.why-head .why { margin-top: 5px; }
+.why-stats { gap: 32px; }
+
+/* The rail sits directly under the plot, with exactly one column per bucket — so
+   a mark is above its own column by construction rather than by eye. The LABEL
+   OCCUPIES the plot's left inset rather than sitting beside it: its width is set
+   inline from DailyChart's PLOT_LEFT (see EventRail), and the row adds no gap,
+   so the track begins exactly where the plot's first column does. The label's
+   own breathing room is padding INSIDE that inset, which cannot move the track.
+   Shape carries the meaning (◆ a skill ran, ▲ a lane launched); colour none. */
+.rail-wrap { margin-top: 2px; display: flex; flex-direction: column; gap: 2px; }
+.rail { display: flex; align-items: center; gap: 0; }
+.rail-label {
+  flex: none; box-sizing: border-box; padding-right: 8px; text-align: right;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted);
+}
+.rail-track { flex: 1 1 auto; display: grid; align-items: center; min-width: 0; }
+.rail-cell {
+  display: flex; align-items: center; justify-content: center; gap: 1px;
+  height: 16px; font-size: 9px; color: var(--text-muted);
+  border-top: 1px solid var(--border);
+}
+.rail-cell.on { color: var(--text-primary); }
+.rail-count { font-variant-numeric: tabular-nums; font-size: 9px; color: var(--text-muted); }
+
+.detail-text {
+  font-size: 13px; color: var(--text-secondary); line-height: 1.7;
+  display: flex; flex-direction: column; gap: 6px; max-width: 92ch;
+}
+.detail-text strong { color: var(--text-primary); }
+.detail-path { color: var(--text-muted); font-size: 12px; }
+
+/* ==========================================================================
+   DRILL NAVIGATION (issue #408) — zoom in on the marks, zoom out from the
+   content area. The colour is the categorical blue in both themes; every
+   surface below is a theme variable, so light and dark are the same rules.
+   ========================================================================== */
+
+/* ---- the marks: a click zooms IN, and says so ----
+   Treemap blocks are position:absolute inside .treemap (see the treemap block
+   above) — giving them position:relative here knocks every square out of the
+   layout, which is exactly what the prototype did in the decider's hands. They
+   need the cursor only; absolute already anchors the ::after badge. The ROW
+   shapes are static, so those do need relative. TRIPWIRE drillnav-block-absolute
+   in test/dashboard-drill-nav.test.mjs holds this.
+
+   Non-drillable marks are excluded rather than restyled: they carry
+   aria-disabled (never the native attribute — #65/#113), and a native-disabled
+   Detail session row keeps its default cursor too. */
+.treemap .block:not([aria-disabled='true']):not(:disabled) { cursor: zoom-in; }
+.folded-row:not([aria-disabled='true']):not(:disabled),
+.session-row:not([aria-disabled='true']):not(:disabled),
+.mover:not([aria-disabled='true']):not(:disabled) { cursor: zoom-in; position: relative; }
+
+.treemap .block:not([aria-disabled='true']):not(:disabled)::after,
+.folded-row:not([aria-disabled='true']):not(:disabled)::after,
+.session-row:not([aria-disabled='true']):not(:disabled)::after,
+.mover:not([aria-disabled='true']):not(:disabled)::after {
+  content: ''; position: absolute; top: 6px; right: 6px; width: 22px; height: 22px;
+  border-radius: 50%; background-color: var(--cat-1);
+  /* Unquoted and fully percent-encoded: the bundle build's self-containment
+     guard rejects a QUOTED url(), data URI or not. */
+  background-image: url(data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2024%2024%27%20fill%3D%27none%27%20stroke%3D%27white%27%20stroke-width%3D%272.2%27%20stroke-linecap%3D%27round%27%3E%3Ccircle%20cx%3D%2710.5%27%20cy%3D%2710.5%27%20r%3D%276.5%27%2F%3E%3Cline%20x1%3D%2710.5%27%20y1%3D%277.5%27%20x2%3D%2710.5%27%20y2%3D%2713.5%27%2F%3E%3Cline%20x1%3D%277.5%27%20y1%3D%2710.5%27%20x2%3D%2713.5%27%20y2%3D%2710.5%27%2F%3E%3Cline%20x1%3D%2715.5%27%20y1%3D%2715.5%27%20x2%3D%2721%27%20y2%3D%2721%27%2F%3E%3C%2Fsvg%3E);
+  background-repeat: no-repeat; background-position: center; background-size: 14px 14px;
+  opacity: 0; transform: scale(0.7); transition: opacity 90ms ease, transform 90ms ease;
+  pointer-events: none; z-index: 3;
+}
+/* Focus-visible reveals it too, so a keyboard reader gets the same promise. */
+.treemap .block:not([aria-disabled='true']):not(:disabled):hover::after,
+.treemap .block:not([aria-disabled='true']):not(:disabled):focus-visible::after,
+.folded-row:not([aria-disabled='true']):not(:disabled):hover::after,
+.folded-row:not([aria-disabled='true']):not(:disabled):focus-visible::after,
+.session-row:not([aria-disabled='true']):not(:disabled):hover::after,
+.session-row:not([aria-disabled='true']):not(:disabled):focus-visible::after,
+.mover:not([aria-disabled='true']):not(:disabled):hover::after,
+.mover:not([aria-disabled='true']):not(:disabled):focus-visible::after {
+  opacity: 1; transform: scale(1);
+}
+/* Rows are short — the badge rides the right edge, vertically centred, in room
+   the row reserves for it rather than on top of its own text. */
+.folded-row::after, .session-row::after, .mover::after {
+  top: 50%; right: 0; margin-top: -10px; width: 20px; height: 20px;
+}
+.folded-row, .session-row { padding-right: 26px; }
+
+/* ---- the puck: pinned low in the CONTENT column, not the window ----
+   .page is 1180px wide with 24px of padding, so its content edge is 566px left
+   of centre; below that width the column is flush and so is the puck. */
+.zoomout-puck {
+  position: fixed; left: 50%; bottom: 28px; transform: translateX(-566px);
+  display: inline-flex; align-items: center; gap: 10px;
+  padding: 10px 18px 10px 14px; border-radius: 999px; cursor: zoom-out;
+  border: 1px solid var(--border); background: var(--cat-1); color: #fff;
+  font: inherit; box-shadow: 0 6px 22px rgba(0, 0, 0, 0.24); z-index: 40;
+}
+@media (max-width: 1260px) { .zoomout-puck { left: 24px; transform: none; } }
+.zoomout-puck:hover { filter: brightness(1.08); }
+.zoomout-puck:focus-visible { outline: 2px solid var(--text-primary); outline-offset: 3px; }
+.zoomout-puck-text { display: flex; flex-direction: column; align-items: flex-start; line-height: 1.2; }
+.zoomout-puck-lead { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.85; }
+.zoomout-puck-name {
+  font-size: 14px; font-weight: 600; max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ---- the pill: top of the content area, naming where a click lands ---- */
+.uppill-wrap { margin: 0 0 16px; }
+.uppill {
+  display: inline-flex; align-items: baseline; gap: 12px; width: auto;
+  padding: 12px 22px; border-radius: 999px; cursor: zoom-out; font: inherit;
+  border: 1px solid var(--border); background: var(--surface-2); color: var(--text-primary);
+}
+.uppill:hover { background: var(--cat-1); color: #fff; border-color: var(--cat-1); }
+.uppill:hover .uppill-hint { color: rgba(255, 255, 255, 0.85); }
+.uppill:focus-visible { outline: 2px solid var(--cat-1); outline-offset: 2px; }
+.uppill-arrow { font-size: 20px; font-weight: 700; line-height: 1; }
+.uppill-name { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+.uppill-hint { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
+
+/* The breadcrumb trail takes focus programmatically (App.jsx goUp) but is not a
+   tab stop; it should not draw a ring for a click that merely passed through. */
+.crumbs:focus { outline: none; }
+.crumbs:focus-visible { outline: 2px solid var(--cat-1); outline-offset: 3px; border-radius: 6px; }

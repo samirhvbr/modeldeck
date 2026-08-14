@@ -2,15 +2,21 @@ import http from 'node:http';
 import { isSea } from 'node:sea';
 import { fileURLToPath } from 'node:url';
 import packageMetadata from '../package.json' with { type: 'json' };
+import { DASHBOARD_APP_HTML } from './dashboard-app.mjs';
 import { Store } from './db.mjs';
 import { ModelDeckService } from './service.mjs';
+import { readLaneRuns, tagSessionsWithLaneRuns } from './lane-manifest.mjs';
 import { resolveMutationToken } from './token.mjs';
+import { parseOtlpLogs, parseOtlpMetrics } from './otel-ingest.mjs';
+import { usageEstimateReport } from './usage-estimate.mjs';
+import { activityBreakdownReport, attributionReport, costReport } from './usage-analytics.mjs';
 import { runProbeCli as runClaudeUsageProbe } from './adapters/claude-usage-probe.mjs';
 import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from './adapters/claude-statusline.mjs';
 import {
   HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
   CLIPROXY_AUTH_DIR, CLIPROXY_BIN, CLIPROXY_BASE_URL,
+  CLIPROXY_MANAGEMENT_KEY_PATH, LANE_MANIFEST_PATH,
 } from './paths.mjs';
 
 // esbuild replaces the build-only identifier with a string literal for SEA;
@@ -44,6 +50,24 @@ function json(res, status, payload, extraHeaders = {}) {
   res.end(body);
 }
 
+// Issue #343: the dashboard is the daemon's only non-JSON response. Same
+// loopback trust boundary as every route (Host gate ahead of the router);
+// the CSP additionally pins the page to inline assets + same-origin fetch —
+// external CDNs/resources are structurally impossible, not just avoided.
+function html(res, markup) {
+  const payload = Buffer.from(markup, 'utf8');
+  res.writeHead(200, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Content-Length': payload.length,
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:",
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+  });
+  res.end(payload);
+}
+
 async function body(req) {
   const chunks = [];
   let total = 0;
@@ -72,7 +96,24 @@ function hostAllowed(req, port) {
   return value === `127.0.0.1:${port}` || value === `localhost:${port}`;
 }
 
-export function createApp({ store, service, host = HOST, port = PORT, mutationToken } = {}) {
+function loopbackPeer(req) {
+  const address = req.socket?.remoteAddress;
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+function otlpJsonOnly(req) {
+  const contentType = String(req.headers['content-type'] || '').split(';', 1)[0].trim().toLowerCase();
+  if (contentType === 'application/json') return;
+  const error = new Error('OTLP receiver accepts JSON only; protobuf content types are not supported');
+  error.statusCode = 415;
+  throw error;
+}
+
+export function createApp({
+  store, service, host = HOST, port = PORT, mutationToken,
+  // Issue #347: read-only lane manifest used to tag sessions with an issue.
+  laneManifestPath = LANE_MANIFEST_PATH,
+} = {}) {
   const ownedStore = store || new Store(DB_PATH);
   const ownedService = service || new ModelDeckService(ownedStore, {
     projectsRoot: PROJECTS_ROOT,
@@ -87,6 +128,7 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
     cliproxyAuthDir: CLIPROXY_AUTH_DIR,
     cliproxyPath: CLIPROXY_BIN,
     cliproxyBaseUrl: CLIPROXY_BASE_URL,
+    cliproxyManagementKeyPath: CLIPROXY_MANAGEMENT_KEY_PATH,
     daemonGitCommit: GIT_COMMIT,
     // DEMO/DEV ONLY (issue #129): seeded fixture snapshots are authoritative —
     // provider refresh becomes a no-op and its scheduler never arms. Local
@@ -100,6 +142,35 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
       const actualPort = server.address()?.port || port;
       if (!hostAllowed(req, actualPort)) return json(res, 403, { error: 'unexpected host header' });
       const url = new URL(req.url, `http://${host}:${actualPort}`);
+      const otlpKind = req.method === 'POST' && url.pathname === '/otlp/v1/metrics'
+        ? 'metrics'
+        : req.method === 'POST' && url.pathname === '/otlp/v1/logs'
+          ? 'logs'
+          : null;
+      if (otlpKind) {
+        // Claude's exporter cannot participate in the UI session-token
+        // handshake. This is the only non-GET exception, and it stays absent
+        // by default plus confined to the daemon's loopback listener/Host
+        // check above.
+        if (!ownedStore.getSettings().otelReceiverEnabled) return json(res, 404, { error: 'not found' });
+        if (!loopbackPeer(req)) return json(res, 403, { error: 'OTLP receiver accepts loopback connections only' });
+        otlpJsonOnly(req);
+        const parsed = otlpKind === 'metrics'
+          ? parseOtlpMetrics(await body(req))
+          : parseOtlpLogs(await body(req));
+        ownedStore.ingestOtelQuarantine(parsed.quarantine);
+        if (otlpKind === 'metrics') {
+          ownedStore.ingestOtelMetrics(parsed.records);
+        } else {
+          ownedStore.ingestOtelEvents(parsed.records);
+        }
+        const rejectedKey = otlpKind === 'metrics' ? 'rejectedDataPoints' : 'rejectedLogRecords';
+        // Keep the response valid OTLP/JSON: int64 fields are JSON strings,
+        // and no ModelDeck-only fields are added for strict SDK decoders.
+        return json(res, 200, parsed.unknown > 0
+          ? { partialSuccess: { [rejectedKey]: String(parsed[rejectedKey]), errorMessage: `${parsed.unknown} unrecognized OTLP record(s) quarantined` } }
+          : {});
+      }
       if (req.method !== 'GET' && !mutationAllowed(req, host, actualPort, sessionToken)) return json(res, 403, { error: 'mutation token or origin rejected' });
 
       if (req.method === 'GET' && url.pathname === '/api/session') {
@@ -111,6 +182,160 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
         return json(res, 200, { ok: true, name: 'ModelDeck', version: VERSION, MDGitCommit: GIT_COMMIT, tokenSource, projectsRoot: ownedService.projectsRoot });
       }
       if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, await ownedService.state());
+      // Issue #359: every usage-analytics API route shares the dashboard's
+      // kill-switch boundary. Prefix gating keeps future /api/usage/* routes
+      // indistinguishable from routes that do not exist until explicitly enabled.
+      if (url.pathname.startsWith('/api/usage/') && !ownedStore.getSettings().usageAnalyticsEnabled) {
+        return json(res, 404, { error: 'not found' });
+      }
+      // Issue #343/#388: the usage-analytics dashboard, behind the
+      // usageAnalyticsEnabled kill switch. While the flag is off
+      // the route is indistinguishable from a route that never existed.
+      //
+      // Issue #385: the landing is the Overview — dashboard/ compiled to one
+      // self-contained page (src/dashboard-app.mjs). Issue #387 finished the
+      // port: the detail views live in that same bundle, /dashboard/legacy is
+      // gone, and ONE dashboard stack survives v1 (amendment decision 7).
+      if (req.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
+        if (!ownedStore.getSettings().usageAnalyticsEnabled) return json(res, 404, { error: 'not found' });
+        return html(res, DASHBOARD_APP_HTML);
+      }
+      // This endpoint may later supersede the Mac app's client-side BurnRateWindow sampling.
+      if (req.method === 'GET' && url.pathname === '/api/usage/history') {
+        return json(res, 200, ownedStore.usageHistory({
+          accountId: url.searchParams.get('accountId'),
+          scope: url.searchParams.get('scope'),
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          bucket: url.searchParams.has('bucket') ? url.searchParams.get('bucket') : undefined,
+        }));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/usage/summary') {
+        return json(res, 200, ownedStore.usageSummary({
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          groupBy: url.searchParams.get('groupBy'),
+          // Issue #344 burn-timeline filters; absent params stay null (unfiltered).
+          accountId: url.searchParams.get('accountId'),
+          model: url.searchParams.get('model'),
+          provider: url.searchParams.get('provider'),
+        }));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/usage/estimate') {
+        return json(res, 200, usageEstimateReport(ownedStore, {
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          accountId: url.searchParams.get('accountId'),
+        }));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/usage/attribution') {
+        return json(res, 200, attributionReport(ownedStore, {
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          scope: url.searchParams.get('scope') || undefined,
+        }));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/usage/activity-breakdown') {
+        return json(res, 200, activityBreakdownReport(ownedStore, {
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          provider: url.searchParams.get('provider'),
+          project: url.searchParams.get('project'),
+          laneRuns: readLaneRuns(laneManifestPath),
+        }));
+      }
+      // Issue #371: model × reasoning effort with a PROJECT filter. The
+      // warehouse grouping behind /api/usage/summary?groupBy=model_effort
+      // records no project, so this reads the session corpus — the same
+      // universe /api/usage/projects measures. Same validation style as the
+      // readers above: raw query strings straight to the reader, which owns
+      // every message, under the #359 prefix gate.
+      if (req.method === 'GET' && url.pathname === '/api/usage/model-effort') {
+        return json(res, 200, ownedStore.modelEffortBurn({
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          provider: url.searchParams.get('provider'),
+          project: url.searchParams.get('project'),
+        }));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/usage/cost') {
+        return json(res, 200, costReport(ownedStore, {
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          provider: url.searchParams.get('provider'),
+        }));
+      }
+      // Issue #347: the session/task explorer — a leaderboard across BOTH
+      // providers by default; ?sessionId= (+ ?profile=) switches to the detail
+      // read. Lane-issue tags are a heuristic enrichment layered on top of the
+      // warehouse read — the manifest is read fresh per request and a missing
+      // or unreadable manifest simply produces untagged rows.
+      //
+      // Sits under the issue #359 /api/usage/ prefix gate above, so while
+      // usageAnalyticsEnabled is off this route is byte-identical to a route
+      // that never existed — including its detail mode and its
+      // parameter-validation errors.
+      if (req.method === 'GET' && url.pathname === '/api/usage/sessions') {
+        const sessionId = url.searchParams.get('sessionId');
+        if (sessionId != null) {
+          const detail = ownedStore.usageSessionDetail({
+            sessionId,
+            profile: url.searchParams.get('profile'),
+            provider: url.searchParams.get('provider'),
+          });
+          const tagged = detail.session
+            ? tagSessionsWithLaneRuns([detail.session], readLaneRuns(laneManifestPath))[0]
+            : null;
+          return json(res, 200, { mode: 'detail', ...detail, session: tagged });
+        }
+        const leaderboard = ownedStore.usageSessions({
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          provider: url.searchParams.get('provider'),
+          accountId: url.searchParams.get('accountId'),
+          limit: url.searchParams.get('limit'),
+          // Issue #346: the project-burn drill-down narrows this same
+          // leaderboard to one project (or the 'unattributed' bucket).
+          project: url.searchParams.get('project'),
+        });
+        return json(res, 200, {
+          mode: 'leaderboard',
+          ...leaderboard,
+          sessions: tagSessionsWithLaneRuns(leaderboard.sessions, readLaneRuns(laneManifestPath)),
+        });
+      }
+      if (req.method === 'GET' && url.pathname === '/api/usage/session-anatomy') {
+        return json(res, 200, ownedStore.sessionAnatomy({
+          sessionId: url.searchParams.get('sessionId'),
+          profile: url.searchParams.get('profile'),
+          provider: url.searchParams.get('provider'),
+        }));
+      }
+      // Issue #346: burn by project (decision 10b). Same validation style as
+      // /api/usage/sessions — raw query strings straight to the reader, which
+      // owns every message — and under the same #359 prefix gate, so the route
+      // is byte-identical to a nonexistent one while the flag is off.
+      // ?project= adds that project's session drill-down, tagged like the
+      // leaderboard's own rows.
+      if (req.method === 'GET' && url.pathname === '/api/usage/projects') {
+        const burn = ownedStore.projectBurn({
+          since: url.searchParams.get('since'),
+          until: url.searchParams.get('until'),
+          provider: url.searchParams.get('provider'),
+          project: url.searchParams.get('project'),
+          limit: url.searchParams.get('limit'),
+          bucket: url.searchParams.get('bucket'),
+        });
+        return json(res, 200, burn.sessions
+          ? {
+            ...burn,
+            sessions: {
+              ...burn.sessions,
+              sessions: tagSessionsWithLaneRuns(burn.sessions.sessions, readLaneRuns(laneManifestPath)),
+            },
+          }
+          : burn);
+      }
       if (req.method === 'GET' && url.pathname === '/api/tools') {
         const refresh = url.searchParams.get('refresh') === '1';
         // Cache-busting refresh forces process spawns + a registry fetch, so it
@@ -136,17 +361,25 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
           // opt-in value. Genuinely started operations retain recovery intent:
           // disable failures keep the previous true bit and enable failures
           // keep the requested true bit. Other validated settings stay applied.
-          ownedStore.saveSettings({
+          const restored = ownedStore.saveSettings({
             sharedUserScopeEnabled: error.statusCode === 409
               ? previous.sharedUserScopeEnabled
               : settings.sharedUserScopeEnabled
                 ? true
                 : previous.sharedUserScopeEnabled,
+            // A failed combined update must never arm/disarm a destructive
+            // queue consumer later than the response implies. Roll this one
+            // handoff flag back even though ordinary validated fields remain.
+            usageQueueConsumerEnabled: previous.usageQueueConsumerEnabled,
           });
+          await ownedService.rescheduleUsageQueueConsumer?.(restored);
+          await ownedService.rescheduleWarehouseIngest?.(ownedStore.getSettings());
           throw error;
         }
         const current = ownedStore.getSettings();
         ownedService.rescheduleAutoRefresh(current);
+        await ownedService.rescheduleUsageQueueConsumer?.(current);
+        await ownedService.rescheduleWarehouseIngest?.(current);
         return json(res, 200, current);
       }
       if (req.method === 'POST' && url.pathname === '/api/shared-scope/enable') {
@@ -315,6 +548,10 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
         // Retention is daemon maintenance, not provider polling: start it even
         // when auto-refresh is disabled or the daemon serves demo fixtures.
         ownedService.startUsageSnapshotRetention?.();
+        ownedService.startUsageQueueConsumer?.();
+        void ownedService.startWarehouseIngest?.()?.catch((error) => {
+          console.error(`[modeldeck] warehouse ingest startup failed: ${error?.message || error}`);
+        });
         ownedService.startAutoRefresh();
         callback?.();
       });
@@ -323,6 +560,8 @@ export function createApp({ store, service, host = HOST, port = PORT, mutationTo
       ownedService.stopAutoRefresh();
       await Promise.all([
         ownedService.stopUsageSnapshotRetention?.() || Promise.resolve(),
+        ownedService.stopUsageQueueConsumer?.() || Promise.resolve(),
+        ownedService.stopWarehouseIngest?.() || Promise.resolve(),
         new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
       ]);
     },

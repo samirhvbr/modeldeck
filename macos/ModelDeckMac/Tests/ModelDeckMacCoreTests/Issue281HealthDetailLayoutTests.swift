@@ -103,7 +103,7 @@ struct HealthDetailStructureTests {
         #expect(p.section("Now")?.row("Pool") != nil)
         #expect(p.section("Now")?.row("Usable") != nil)
         #expect(p.section("Pace")?.row("Weekly pace") != nil)
-        #expect(p.section("Pace")?.row("Today's burn") != nil)
+        #expect(p.section("Pace")?.row("Current burn") != nil)
         // Each row's value carries one number-bearing clause, never two
         // separated by a sentence break.
         for section in p.sections {
@@ -161,7 +161,7 @@ struct HealthDetailStructureTests {
         let p = busyPresentation
         #expect(p.row("Pool")?.value.hasSuffix(" pts") == true)
         #expect(p.row("Weekly pace")?.value.hasSuffix(" pts/day") == true)
-        #expect(p.row("Today's burn")?.value.contains(" pts/day") == true)
+        #expect(p.row("Current burn")?.value.contains(" pts/day") == true)
     }
 }
 

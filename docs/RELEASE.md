@@ -15,6 +15,11 @@ scripts/release-dmg.sh --check-only
 scripts/release-dmg.sh
 ```
 
+For the coordinated 0.4.6 install and analytics cutover after the artifact is
+built, follow [`docs/0.4.6-GO-LIVE.md`](0.4.6-GO-LIVE.md). It is deliberately
+separate from artifact creation: launchd retirement and live settings remain
+release-day, Tim-gated operations.
+
 Run on a Mac provisioned with the signing identity and notary profile (see
 "One-time provisioning" below). After publishing, remove the dedicated
 worktree with `git worktree remove "$RELEASE_WORKTREE"` from the original
@@ -23,11 +28,11 @@ checkout.
 ```sh
 scripts/release-dmg.sh            # the real thing
 scripts/release-dmg.sh --dry-run  # preflight + plan, builds nothing
-scripts/release-dmg.sh --check-only # repository guard only; no credentials/build
+scripts/release-dmg.sh --check-only # repository guard + analytics release checks; no credentials/build
 ```
 
 Output: `dist/ModelDeck-<version>.dmg` (gitignored). The version comes
-from the `VERSION` file at the repo root — the release-tag authority
+from the `VERSION` file at the repo root (bump `package.json` version in the same commit — the daemon inlines ITS version from package.json, and release-checks fails if the two disagree) — the release-tag authority
 documented in `macos/ModelDeckMac/Sources/ModelDeckMacCore/AppVersion.swift`.
 Bump `VERSION` first; the script stamps it into the app bundle's
 `CFBundleShortVersionString` at build time (`CFBundleVersion` is the repo

@@ -1,0 +1,60 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "user.account_uuid", "value": { "stringValue": "account-uuid-placeholder" } },
+          { "key": "user.email", "value": { "stringValue": "placeholder@example.invalid" } },
+          { "key": "organization.id", "value": { "stringValue": "organization-placeholder" } },
+          { "key": "service.version", "value": { "stringValue": "placeholder-version" } }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": {
+            "attributes": [
+              { "key": "agent.name", "value": { "stringValue": "placeholder-agent" } }
+            ]
+          },
+          "metrics": [
+            {
+              "name": "claude_code.token.usage",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1786278896000000000",
+                    "asInt": "1234",
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-placeholder-model" } },
+                      { "key": "effort", "value": { "stringValue": "high" } },
+                      { "key": "speed", "value": { "stringValue": "fast" } },
+                      { "key": "query_source", "value": { "stringValue": "agent" } },
+                      { "key": "skill.name", "value": { "stringValue": "placeholder-skill" } },
+                      { "key": "session.id", "value": { "stringValue": "session-placeholder" } },
+                      { "key": "type", "value": { "stringValue": "input" } }
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "name": "claude_code.cost.usage",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "1786278896000000000",
+                    "asDouble": 0.0125,
+                    "attributes": [
+                      { "key": "model", "value": { "stringValue": "claude-placeholder-model" } },
+                      { "key": "session.id", "value": { "stringValue": "session-placeholder" } }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

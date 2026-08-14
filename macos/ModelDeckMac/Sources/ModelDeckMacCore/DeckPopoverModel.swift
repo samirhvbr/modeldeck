@@ -1624,6 +1624,15 @@ public final class DeckPopoverModel: ObservableObject {
     /// General → Accessibility.
     @Published public var showsHealthVerdictLabels = false
 
+    /// Issue #343: the usage-analytics dashboard URL, or nil while the
+    /// feature flag is off — nil means the gear menu renders no "Usage
+    /// Analytics…" item at all (flag off must leave nothing user-visible).
+    /// Mirrored from the daemon-confirmed `usageAnalyticsEnabled` setting
+    /// by the app's settings apply (plain assignment, same no-echo contract
+    /// as `menuBarPinnedSetting`); the URL itself is derived from the
+    /// daemon configuration via `UsageAnalytics.dashboardURL(base:)`.
+    @Published public var usageAnalyticsDashboardURL: URL?
+
     /// Fired when a card's context menu picks a new pin value ("" = unpin,
     /// account id, or a follow-active sentinel). The app wires it to
     /// `SettingsSyncModel.setMenuBarAccount`, whose confirmed document then

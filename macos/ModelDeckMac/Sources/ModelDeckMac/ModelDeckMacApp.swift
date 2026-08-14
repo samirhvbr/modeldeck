@@ -214,6 +214,12 @@ struct ModelDeckMacApp: App {
                 // toggle) — display-only; unknown stored values read as
                 // the dot-only default.
                 deckModel?.showsHealthVerdictLabels = settings.deckHealthLabelsMode.showsVerdictWord
+                // Issue #343: the flag-gated dashboard entry point — nil
+                // while the flag is off, so the gear menu renders no
+                // "Usage Analytics…" item at all.
+                deckModel?.usageAnalyticsDashboardURL = settings.usageAnalyticsEnabled
+                    ? UsageAnalytics.dashboardURL(base: configuration.baseURL)
+                    : nil
                 notifications?.thresholds = settings.usageThresholds
             }
             statusModel?.startAutoRefresh(interval: settings.effectiveAutoRefreshInterval)

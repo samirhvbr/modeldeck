@@ -261,7 +261,7 @@ struct Issue244PresentationTests {
             formatter.maximumFractionDigits = 0
             return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
         }
-        #expect(pace?.row("Today's burn")?.value == "~\(grouping(2800)) pts/day · 6.9× pace")
+        #expect(pace?.row("Current burn")?.value == "~\(grouping(2800)) pts/day · 6.9× pace")
         #expect(pace?.row("Weekly pace")?.value.hasSuffix(" pts/day") == true)
     }
 
@@ -276,7 +276,7 @@ struct Issue244PresentationTests {
         #expect(presentation.chipWord == "Yellow")
         #expect(presentation.verdict == .yellow)
         #expect(presentation.readout.hasPrefix("Your weekly average could sustain"))
-        #expect(presentation.readout.contains("today's burn (6.9× that pace)"))
+        #expect(presentation.readout.contains("the current burn (6.9× that pace)"))
         #expect(presentation.readout.contains("would run the pool dry in"))
         #expect(presentation.readout.hasSuffix("Yellow while this burst lasts."))
         // The steady-state sentence would have said "— green": it must be
@@ -288,18 +288,18 @@ struct Issue244PresentationTests {
     @Test func burstReadoutGrammarIsPinned() {
         #expect(AvailabilityHealthPresentation.burstReadout(
             multiple: 4.2, burstPointsPerDay: 2800, pacePerDay: 400, droughtHours: 26
-        ) == "Your weekly average could sustain about 4.2× — but today's burn "
+        ) == "Your weekly average could sustain about 4.2× — but the current burn "
             + "(7.0× that pace) would run the pool dry in 1.1 days. "
             + "Yellow while this burst lasts.")
         #expect(AvailabilityHealthPresentation.burstReadout(
             multiple: 8, burstPointsPerDay: 900, pacePerDay: 100, droughtHours: 5
-        ) == "Your weekly average could sustain over 8× — but today's burn "
+        ) == "Your weekly average could sustain over 8× — but the current burn "
             + "(9.0× that pace) would run the pool dry in 5 hr. "
             + "Yellow while this burst lasts.")
         // Fresh cycle: no trailing average yet, burn window still live.
         #expect(AvailabilityHealthPresentation.burstReadout(
             multiple: 8, burstPointsPerDay: 900, pacePerDay: 0, droughtHours: 5
-        ) == "No weekly usage measured yet, but today's burn would run "
+        ) == "No weekly usage measured yet, but the current burn would run "
             + "the pool dry in 5 hr. Yellow while this burst lasts.")
     }
 
@@ -320,7 +320,7 @@ struct Issue244PresentationTests {
         )
         // #260's cold-window line still owns the burn slot, and there is
         // no runway row to state a rate the window never measured.
-        #expect(presentation.row("Today's burn")?.value == "still measuring")
+        #expect(presentation.row("Current burn")?.value == "still measuring")
         #expect(presentation.row("Runway") == nil)
     }
 
@@ -337,7 +337,7 @@ struct Issue244PresentationTests {
         #expect(presentation.verdict == .yellow)
         #expect(presentation.readout.contains("your current pace — yellow"))
         #expect(presentation.readout.hasSuffix(
-            "Today's burn runs ahead of that pace and would dry the pool in 6 hr."
+            "The current burn runs ahead of that pace and would dry the pool in 6 hr."
         ))
         #expect(presentation.row("Runway") != nil)
     }
@@ -372,7 +372,7 @@ struct Issue244PresentationTests {
             ),
             now: fixedNow
         )
-        #expect(presentation.row("Today's burn") == nil)
+        #expect(presentation.row("Current burn") == nil)
         // At 1 pt/day the line is honest again.
         let onePoint = AvailabilityHealthPresentation.make(
             report: AvailabilityHealthEngine.report(
@@ -380,7 +380,7 @@ struct Issue244PresentationTests {
             ),
             now: fixedNow
         )
-        #expect(onePoint.row("Today's burn")?.value.hasPrefix("~1 pts/day") == true)
+        #expect(onePoint.row("Current burn")?.value.hasPrefix("~1 pts/day") == true)
     }
 
     @Test func activeButHarmlessBurnShowsTheRateOnly() {
@@ -390,7 +390,7 @@ struct Issue244PresentationTests {
             ),
             now: fixedNow
         )
-        #expect(presentation.row("Today's burn")?.value.hasPrefix("~500 pts/day") == true)
+        #expect(presentation.row("Current burn")?.value.hasPrefix("~500 pts/day") == true)
         #expect(presentation.row("Runway") == nil)
         // Steady-state readout untouched.
         #expect(presentation.readout.contains("your current pace"))

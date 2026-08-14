@@ -59,12 +59,20 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     /// of expired-idle Claude accounts. Default ON — the whole point is zero
     /// user effort; the honest cost disclosure lives on the toggle.
     public var autoRenewEnabled: Bool
+    /// Issue #342: local OTLP/HTTP collection. Default OFF and operator-owned;
+    /// the app can read the state but does not expose or write a toggle.
+    public var otelReceiverEnabled: Bool
     /// Issue #204: shared user scope (MCP registrations + user memory across
     /// Claude accounts). Default OFF — opt-in by direction. READ-ONLY here:
     /// the UI never PUTs this key; enabling/disabling runs through the
     /// mutation-guarded /api/shared-scope endpoints because enabling is a
     /// disclosed one-time merge, not a plain settings write.
     public var sharedUserScopeEnabled: Bool
+    /// Issue #343/#388: whether the daemon serves
+    /// the local analytics dashboard and the app shows its "Usage
+    /// Analytics…" menu item. 0.4.6 defaults ON; false remains the kill
+    /// switch (the daemon 404s the route and the menu item doesn't render).
+    public var usageAnalyticsEnabled: Bool
 
     /// Mirrors src/db.mjs DEFAULT_SETTINGS exactly.
     /// Issue #187 (Tim directive 2026-07-29): pauseWhileActive defaults OFF
@@ -82,7 +90,9 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         menuBarShowWhen: "",
         deckHealthLabels: "",
         autoRenewEnabled: true,
-        sharedUserScopeEnabled: false
+        otelReceiverEnabled: false,
+        sharedUserScopeEnabled: false,
+        usageAnalyticsEnabled: true
     )
 
     public init(
@@ -98,7 +108,9 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         menuBarShowWhen: String = "",
         deckHealthLabels: String = "",
         autoRenewEnabled: Bool = true,
-        sharedUserScopeEnabled: Bool = false
+        otelReceiverEnabled: Bool = false,
+        sharedUserScopeEnabled: Bool = false,
+        usageAnalyticsEnabled: Bool = true
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
@@ -112,7 +124,9 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         self.menuBarShowWhen = menuBarShowWhen
         self.deckHealthLabels = deckHealthLabels
         self.autoRenewEnabled = autoRenewEnabled
+        self.otelReceiverEnabled = otelReceiverEnabled
         self.sharedUserScopeEnabled = sharedUserScopeEnabled
+        self.usageAnalyticsEnabled = usageAnalyticsEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -141,9 +155,15 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
             ?? defaults.deckHealthLabels
         autoRenewEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoRenewEnabled)
             ?? defaults.autoRenewEnabled
+        otelReceiverEnabled = try container.decodeIfPresent(Bool.self, forKey: .otelReceiverEnabled)
+            ?? defaults.otelReceiverEnabled
         // Issue #204: absent on pre-#204 daemons → the opt-in default (off).
         sharedUserScopeEnabled = try container.decodeIfPresent(Bool.self, forKey: .sharedUserScopeEnabled)
             ?? defaults.sharedUserScopeEnabled
+        // A pre-#343 daemon omits this key and has no dashboard route, so it
+        // must still decode false even though 0.4.6's typed default is true.
+        usageAnalyticsEnabled = try container.decodeIfPresent(Bool.self, forKey: .usageAnalyticsEnabled)
+            ?? false
     }
 
     /// Typed view of `layout`; falls back to the locked two-column default.
@@ -255,6 +275,11 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     /// keys — SettingsSyncModel strips this field and retries when that
     /// happens (the #90/#123 tolerance path).
     public var autoRenewEnabled: Bool?
+    /// Issue #343: the usage-analytics feature flag. Pre-#343 daemons
+    /// reject unknown keys — SettingsSyncModel strips this field and
+    /// retries when that happens (the #90/#123/#176/#238/#242 tolerance
+    /// path).
+    public var usageAnalyticsEnabled: Bool?
 
     public init(
         autoRefreshEnabled: Bool? = nil,
@@ -268,7 +293,8 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         menuBarAccountId: String? = nil,
         menuBarShowWhen: String? = nil,
         deckHealthLabels: String? = nil,
-        autoRenewEnabled: Bool? = nil
+        autoRenewEnabled: Bool? = nil,
+        usageAnalyticsEnabled: Bool? = nil
     ) {
         self.autoRefreshEnabled = autoRefreshEnabled
         self.autoRefreshIntervalSeconds = autoRefreshIntervalSeconds
@@ -282,6 +308,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         self.menuBarShowWhen = menuBarShowWhen
         self.deckHealthLabels = deckHealthLabels
         self.autoRenewEnabled = autoRenewEnabled
+        self.usageAnalyticsEnabled = usageAnalyticsEnabled
     }
 
     /// Later fields win; used to coalesce patches queued behind an
@@ -299,7 +326,8 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             menuBarAccountId: other.menuBarAccountId ?? menuBarAccountId,
             menuBarShowWhen: other.menuBarShowWhen ?? menuBarShowWhen,
             deckHealthLabels: other.deckHealthLabels ?? deckHealthLabels,
-            autoRenewEnabled: other.autoRenewEnabled ?? autoRenewEnabled
+            autoRenewEnabled: other.autoRenewEnabled ?? autoRenewEnabled,
+            usageAnalyticsEnabled: other.usageAnalyticsEnabled ?? usageAnalyticsEnabled
         )
     }
 
@@ -317,12 +345,13 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         try container.encodeIfPresent(menuBarShowWhen, forKey: .menuBarShowWhen)
         try container.encodeIfPresent(deckHealthLabels, forKey: .deckHealthLabels)
         try container.encodeIfPresent(autoRenewEnabled, forKey: .autoRenewEnabled)
+        try container.encodeIfPresent(usageAnalyticsEnabled, forKey: .usageAnalyticsEnabled)
     }
 
     enum CodingKeys: String, CodingKey {
         case autoRefreshEnabled, autoRefreshIntervalSeconds, autoRefreshIntervalCustomized, pauseWhileActive
         case layout, defaultSort, notificationThresholdPercent, menuBarStyle, menuBarAccountId
-        case menuBarShowWhen, deckHealthLabels, autoRenewEnabled
+        case menuBarShowWhen, deckHealthLabels, autoRenewEnabled, usageAnalyticsEnabled
     }
 
     public var isEmpty: Bool {
@@ -331,5 +360,6 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             && layout == nil && defaultSort == nil && notificationThresholdPercent == nil
             && menuBarStyle == nil && menuBarAccountId == nil
             && menuBarShowWhen == nil && deckHealthLabels == nil && autoRenewEnabled == nil
+            && usageAnalyticsEnabled == nil
     }
 }

@@ -1,0 +1,7 @@
+{"timestamp":"2026-08-08T09:00:00.000Z","type":"session_meta","payload":{"session_id":"22222222-2222-4222-8222-222222222222","timestamp":"2026-08-08T09:00:00.000Z","cwd":"/placeholder/projects/archived-repo","originator":"codex-desktop-placeholder","source":"desktop-placeholder","cli_version":"2.0.0-placeholder","git":{"branch":"main-placeholder","repository_url":"https://example.invalid/placeholder/archived-repo.git","commit_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}
+{"timestamp":"2026-08-08T09:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"archived-turn","started_at":"2026-08-08T09:00:01.000Z"}}
+{"timestamp":"2026-08-08T09:00:01.100Z","type":"turn_context","payload":{"turn_id":"archived-turn"}}
+{"timestamp":"2026-08-08T09:00:01.200Z","type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-placeholder-archived","reasoning_effort":"medium"}}}
+this is deliberately malformed fixture json
+{"timestamp":"2026-08-08T09:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25,"cached_input_tokens":10,"cache_write_input_tokens":2,"output_tokens":7,"reasoning_output_tokens":3,"total_tokens":32}}}}
+{"timestamp":"2026-08-08T09:00:04.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"archived-turn","completed_at":"2026-08-08T09:00:04.000Z","time_to_first_token_ms":200}}

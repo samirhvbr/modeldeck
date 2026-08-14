@@ -1,0 +1,20 @@
+{
+  "snapshotDate": "2026-08-11",
+  "source": "BerriAI/litellm model_prices_and_context_window.json",
+  "models": {
+    "claude-fable-5": { "input": 0.00001, "output": 0.00005, "cacheRead": 0.000001, "cacheWrite": 0.0000125 },
+    "claude-opus-5": { "input": 0.000005, "output": 0.000025, "cacheRead": 0.0000005, "cacheWrite": 0.00000625 },
+    "claude-sonnet-5": { "input": 0.000003, "output": 0.000015, "cacheRead": 0.0000003, "cacheWrite": 0.00000375 },
+    "claude-opus-4-8": { "input": 0.000005, "output": 0.000025, "cacheRead": 0.0000005, "cacheWrite": 0.00000625 },
+    "claude-sonnet-4-6": { "input": 0.000003, "output": 0.000015, "cacheRead": 0.0000003, "cacheWrite": 0.00000375 },
+    "claude-haiku-4-5-20251001": { "input": 0.000001, "output": 0.000005, "cacheRead": 0.0000001, "cacheWrite": 0.00000125 },
+    "gpt-5.6-sol": { "input": 0.000005, "output": 0.00003, "cacheRead": 0.0000005, "cacheWrite": 0.00000625 },
+    "gpt-5.6-luna": { "input": 0.0000002, "output": 0.0000012, "cacheRead": 0.00000002, "cacheWrite": 0.00000025 },
+    "gpt-5.6": { "input": 0.000005, "output": 0.00003, "cacheRead": 0.0000005, "cacheWrite": 0.00000625 }
+  },
+  "aliases": {
+    "claude-3-5-haiku-20241022": "claude-haiku-4-5-20251001",
+    "codex-auto-review": "gpt-5.6-sol",
+    "sol": "gpt-5.6-sol"
+  }
+}

@@ -406,6 +406,28 @@ test('settings persist across Store instances and partial updates retain default
   }
 });
 
+// TRIPWIRE (#388): 0.4.6 defaults ON without rewriting an existing database's
+// stored kill-switch value when the process restarts.
+test('TRIPWIRE: usage analytics defaults on and preserves a stored off value', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-analytics-default-'));
+  const dbPath = path.join(root, 'modeldeck.sqlite');
+  let store = new Store(dbPath);
+  try {
+    assert.equal(store.getSettings().usageAnalyticsEnabled, true);
+    store.saveSettings({ usageAnalyticsEnabled: false });
+  } finally { store.close(); }
+
+  store = new Store(dbPath);
+  try {
+    assert.equal(store.getSettings().usageAnalyticsEnabled, false);
+    const stored = JSON.parse(store.db.prepare('SELECT value_json FROM settings WHERE id = 1').get().value_json);
+    assert.equal(stored.usageAnalyticsEnabled, false);
+  } finally {
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('settings reject inherited object names as unknown keys', () => {
   const store = new Store(':memory:');
   try {

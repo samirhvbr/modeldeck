@@ -1030,6 +1030,12 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
     /// The chip's no-data word.
     public static let noDataWord = "No data"
 
+    /// Row label for the short-window burn rate. "Current", not "Today's":
+    /// the rate is a rolling `BurnRateWindow.windowSpan` measure, and the
+    /// old label read as midnight-anchored — which it never was. Must fit
+    /// the popover's fixed 68 pt label column (DeckPopoverView).
+    public static let currentBurnLabel = "Current burn"
+
     public static func make(
         report: AvailabilityHealthReport,
         now: Date,
@@ -1086,7 +1092,7 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
             // sentence and the fact lines below never disagree.
             readout = Self.readout(
                 multiple: multiple, pacePerDay: report.pacePointsPerDay
-            ) + " Today's burn runs ahead of that pace and would dry the pool in \(hoursText(dry))."
+            ) + " The current burn runs ahead of that pace and would dry the pool in \(hoursText(dry))."
         } else {
             readout = Self.readout(
                 multiple: multiple, pacePerDay: report.pacePointsPerDay
@@ -1134,7 +1140,7 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
         // reading with no burst opinion in it, and an unexplained GREEN in
         // that gap is exactly what read as broken after v0.3.20 relaunched.
         if report.burstPointsPerDay == nil {
-            paceRows.append(HealthFactRow(label: "Today's burn", value: "still measuring"))
+            paceRows.append(HealthFactRow(label: currentBurnLabel, value: "still measuring"))
         }
         if let burn = report.burstPointsPerDay, burn.rounded() >= 1 {
             var value = "~\(points(burn)) pts/day"
@@ -1144,7 +1150,7 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
                 // "your weekly pace" — and that spelling no longer fits.
                 value += " · \(multiplierText(burn / report.pacePointsPerDay))× pace"
             }
-            paceRows.append(HealthFactRow(label: "Today's burn", value: value))
+            paceRows.append(HealthFactRow(label: currentBurnLabel, value: value))
         }
         if let bottomsOut = report.burstBottomsOutHours,
            let soonestReset = report.soonestResetHours {
@@ -1244,15 +1250,15 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
         guard pacePerDay > 0 else {
             // Fresh cycle, no trailing average yet — but the burn window
             // is live and its rate droughts. Still yellow, still named.
-            return "No weekly usage measured yet, but today's burn would run "
+            return "No weekly usage measured yet, but the current burn would run "
                 + "the pool dry in \(hoursText(droughtHours)). "
                 + "Yellow while this burst lasts."
         }
         let burnPhrase: String
         if let burst = burstPointsPerDay {
-            burnPhrase = "today's burn (\(multiplierText(burst / pacePerDay))× that pace)"
+            burnPhrase = "the current burn (\(multiplierText(burst / pacePerDay))× that pace)"
         } else {
-            burnPhrase = "today's burn"
+            burnPhrase = "the current burn"
         }
         let steady = multiple >= AvailabilityHealthEngine.maxMultiple
             ? "over \(Int(AvailabilityHealthEngine.maxMultiple))×"

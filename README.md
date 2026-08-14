@@ -155,9 +155,11 @@ flowchart LR
 - **The daemon** (`src/`) is API-only: it binds to `127.0.0.1`, rejects
   unexpected Host/Origin headers, and requires a per-server token plus a
   `SameSite=Strict` cookie for every mutation. State lives in an owner-only
-  SQLite database under `~/Library/Application Support/ModelDeck/`. The
-  legacy web dashboard has been retired; the native app is the sole
-  graphical interface.
+  SQLite database under `~/Library/Application Support/ModelDeck/`. The old
+  control-plane web UI is retired: the native app drives everything the
+  daemon does. Its one remaining page is the read-only usage dashboard at
+  `/dashboard`, served on the same loopback listener behind the
+  `usageAnalyticsEnabled` setting and opened from the app.
 - **Usage reads** go through each provider's own channel: Codex via the
   official `codex app-server` stdio protocol, Claude via Anthropic's native
   usage endpoint using only the credential already stored in that profile —
@@ -193,6 +195,18 @@ Or assemble a signed `.app` bundle (ad-hoc by default):
 macos/ModelDeckMac/Scripts/build_app.sh
 ```
 
+The usage dashboard (`/dashboard`, behind the `usageAnalyticsEnabled`
+setting) is a React app in `dashboard/`, compiled to ONE self-contained HTML
+file and inlined into `src/dashboard-app.mjs` — a committed build output the
+daemon serves and the single-file binary carries. Edit `dashboard/`, then:
+
+```bash
+npm run dashboard:build               # regenerate src/dashboard-app.mjs
+npm run dashboard:dev                 # Vite + HMR against a daemon on :3867
+```
+
+`npm test` fails if the committed artifact is older than the sources.
+
 Tests:
 
 ```bash
@@ -207,8 +221,9 @@ for how release DMGs are cut.
 
 ## Roadmap
 
-The legacy web dashboard is retired and
-the native app is the only interface. Release history lives in
+The native app is the interface for everything the daemon does; the
+read-only usage dashboard at `/dashboard` is the one browser page.
+Release history lives in
 [`CHANGELOG.md`](CHANGELOG.md), with the app design authority in
 [`design/mac-app-spec.md`](design/mac-app-spec.md). Project news lands at
 [modeldeck.ai](https://modeldeck.ai).

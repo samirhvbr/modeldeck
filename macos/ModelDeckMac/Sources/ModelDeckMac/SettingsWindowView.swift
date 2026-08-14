@@ -1428,6 +1428,22 @@ struct GeneralSettingsPane: View {
                     : "Automatic renewal is off — an idle account's expired sign-in stays paused until you renew it or use the account.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                // Issue #343 (usage-analytics decision 12): the dashboard
+                // kill switch. 0.4.6 defaults on; while off the daemon serves
+                // no dashboard route and the deck shows no menu item.
+                Toggle("Enable the usage analytics dashboard", isOn: binding(
+                    get: { $0.usageAnalyticsEnabled },
+                    set: { model, value in await model.setUsageAnalyticsEnabled(value) }
+                ))
+                .help("Serves a local usage-analytics page from the ModelDeck daemon and adds a Usage Analytics… item to the deck's gear menu. Local only — nothing leaves this Mac.")
+                // State-honest caption (the auto-renew precedent above):
+                // describe what is running, never what a disabled toggle
+                // would do.
+                Text(settingsSync.settings.usageAnalyticsEnabled
+                    ? "The dashboard is on — open it from the deck's gear menu → Usage Analytics…. Served only on this Mac."
+                    : "Usage analytics is off — no dashboard page is served and no menu item appears.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Popover") {
