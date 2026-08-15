@@ -58,6 +58,7 @@ function snapshot(store, accountId, scope, observedAt, usedPercent, resetsAt = n
 async function request(app, route, { host = `127.0.0.1:${PORT}` } = {}) {
   const req = Readable.from([]);
   Object.assign(req, {
+    socket: { remoteAddress: '127.0.0.1' },
     method: 'GET',
     url: route,
     headers: { host },

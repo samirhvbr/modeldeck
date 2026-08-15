@@ -35,6 +35,13 @@ struct DeckPopoverView: View {
     /// Issue #96: bundled background-service lifecycle. The popover hosts
     /// the calm one-screen first-run consent and its follow-on states.
     @ObservedObject var setupModel: DaemonSetupModel
+    /// Issue #421: the bundle-embedded CLIProxyAPI's lifecycle. Health shows
+    /// here as a live banner; healthy and dev-build states render nothing.
+    @ObservedObject var proxyModel: ManagedProxyModel
+    /// Issue #422: the first-launch surface — the adoption offer when a
+    /// proxy of the user's own answers, or the one consent screen when none
+    /// does. Asked once; `.hidden` (the steady state) renders nothing.
+    @ObservedObject var onboardingModel: ManagedProxyOnboardingModel
     /// Shared with the Settings pane; the SMAppService status read happens
     /// once in the model's load(), never in this struct's initializer (an
     /// XPC round-trip per App-body evaluation — the #68 re-render tax).
@@ -48,14 +55,15 @@ struct DeckPopoverView: View {
     var isFloating: Bool = false
     /// Issue #295: the footer's detach action; nil hides the control.
     var onDetach: (() -> Void)?
+    /// Issue #423: opens (or fronts) ModelDeck's own dashboard window. The
+    /// item itself stays gated on the #343 flag; only its destination moved
+    /// from the browser to the app window.
+    var onOpenDashboardWindow: (() -> Void)?
     /// Issue #45: Settings opens via the environment action wrapped in
     /// activation + fronting (see SettingsWindowFronting) instead of a bare
     /// SettingsLink, which with the accessory activation policy opened the
     /// window behind the frontmost app or failed to raise an existing one.
     @Environment(\.openSettings) private var openSettings
-    /// Issue #343: the flag-gated "Usage Analytics…" gear-menu item opens
-    /// the daemon-served dashboard in the default browser.
-    @Environment(\.openURL) private var openURL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -72,6 +80,13 @@ struct DeckPopoverView: View {
             menuBarSourceLine
             stagedUpdateBanner
             connectionBanner
+            // Issue #422: the first-launch card owns the surface while it is
+            // up — one question, one screen, never a wizard.
+            if onboardingModel.phase.needsPopoverCard {
+                ManagedProxyOnboardingCard(model: onboardingModel)
+            }
+            proxyBanner
+            memberBlackoutBanner
             installProgressLine
             content
             Divider()
@@ -166,12 +181,15 @@ struct DeckPopoverView: View {
                 }
                 // Issue #343: rendered ONLY while the usage-analytics flag
                 // is on (the model publishes a URL only then) — flag off
-                // must leave nothing user-visible. Opens the daemon-served
-                // local dashboard in the default browser; the explicit
-                // accessibility label names that side effect for VoiceOver.
-                if let dashboardURL = deckModel.usageAnalyticsDashboardURL {
+                // must leave nothing user-visible. Issue #423 retargeted the
+                // destination: the same daemon-served page now opens in
+                // ModelDeck's own window (one window; re-invoking fronts it)
+                // instead of the browser. The explicit accessibility label
+                // names that side effect for VoiceOver.
+                if deckModel.usageAnalyticsDashboardURL != nil,
+                   let onOpenDashboardWindow {
                     Button(UsageAnalytics.menuItemTitle) {
-                        openURL(dashboardURL)
+                        onOpenDashboardWindow()
                     }
                     .accessibilityLabel(UsageAnalytics.menuItemAccessibilityLabel)
                 }
@@ -486,6 +504,75 @@ struct DeckPopoverView: View {
             return stagedPromptModel.state != .hidden
         }
         return false
+    }
+
+    /// Issue #421: the managed proxy's health. Live self-clearing state, so
+    /// it belongs in the header info space WITHOUT a dismiss affordance
+    /// (same exemption as "Daemon unreachable") — and like that line, a
+    /// healthy proxy says nothing at all. A dev build without the embedded
+    /// binary is silent too: it has nothing to offer and nothing to fix.
+    @ViewBuilder
+    private var proxyBanner: some View {
+        switch proxyModel.phase {
+        case .idle, .unavailable, .starting, .running:
+            EmptyView()
+        case .externalInstanceDetected:
+            // The #400 refusal. Stated, never acted on: slice D (#422) owns
+            // adoption, and ModelDeck never stops a process the user started.
+            // Issue #422: under a recorded coexist choice this is the
+            // user's own decision, so the hover states WHY managed-only
+            // features are off — never a bare "unavailable".
+            Label("External proxy detected — not managed by ModelDeck", systemImage: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help(onboardingModel.choice == .coexist
+                      ? ManagedProxyOnboardingCopy.coexistUnavailableReason
+                      : ManagedProxyModel.externalInstanceMessage)
+        case .restarting(let attempt):
+            Label("Restarting the proxy… (attempt \(attempt))", systemImage: "arrow.clockwise")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .stopped:
+            HStack(spacing: 6) {
+                Label("Proxy stopped", systemImage: "pause.circle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Start") { Task { await proxyModel.startManaging() } }
+                    .buttonStyle(.link)
+                    .font(.caption)
+            }
+        case .failed(let message):
+            HStack(spacing: 6) {
+                Label("Proxy stopped working", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .help(message)
+                Button("Try Again") { Task { await proxyModel.retry() } }
+                    .buttonStyle(.link)
+                    .font(.caption)
+            }
+        }
+    }
+
+    /// Issue #395: live, self-clearing evidence from the existing routed-
+    /// request stream. It stays in the deck's always-visible header space and
+    /// is deliberately not dismissible: a member serving only failures must
+    /// not become silent again. Slice H (#396) owns the eventual repair flow;
+    /// this slice states the remedy without inventing a second login action.
+    @ViewBuilder
+    private var memberBlackoutBanner: some View {
+        if let alerts = statusModel.deckState?.memberBlackout?.alerts {
+            ForEach(alerts) { alert in
+                let httpStatus = alert.statusCode.map { " (HTTP \($0))" } ?? ""
+                let message = "\(alert.statusLine)\(httpStatus). \(alert.remedy)"
+                Label(message, systemImage: "exclamationmark.octagon.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .help(message)
+                    .accessibilityLabel("Pool alert. \(message)")
+            }
+        }
     }
 
     @ViewBuilder

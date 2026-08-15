@@ -161,6 +161,38 @@ struct DaemonClientTests {
         }
     }
 
+    @Test func managedProxyReportUsesMutationTokenAndExplicitNulls() async throws {
+        let transport = StubTransport(stubs: [
+            .init(status: 200, body: #"{"token":"proxy-report-token"}"#),
+            .init(status: 200, body: #"{"appReport":{"accepted":true}}"#),
+        ])
+        let client = DaemonClient(configuration: DaemonConfiguration(), transport: transport)
+        try await client.reportManagedProxy(ManagedProxyAppReport(
+            managed: false,
+            phase: ManagedProxyReportPhase.stopped,
+            pid: nil,
+            restartCount: nil,
+            appVersion: nil,
+            reportedAt: "2026-08-14T20:45:57.123Z"
+        ))
+
+        #expect(transport.requests.count == 2)
+        let post = transport.requests[1]
+        #expect(post.httpMethod == "POST")
+        #expect(post.url?.path == "/api/managed-proxy/report")
+        #expect(post.value(forHTTPHeaderField: "x-modeldeck-token") == "proxy-report-token")
+        #expect(post.value(forHTTPHeaderField: "Cookie") == "modeldeck_session=proxy-report-token")
+        let body = try #require(
+            JSONSerialization.jsonObject(with: post.httpBody ?? Data()) as? [String: Any]
+        )
+        #expect(body["managed"] as? Bool == false)
+        #expect(body["phase"] as? String == ManagedProxyReportPhase.stopped)
+        #expect(body["pid"] is NSNull)
+        #expect(body["restartCount"] is NSNull)
+        #expect(body["appVersion"] is NSNull)
+        #expect(body["reportedAt"] as? String == "2026-08-14T20:45:57.123Z")
+    }
+
     // MARK: Issue #7 — settings, tools, account edit/remove
 
     private let settingsJSON = #"""

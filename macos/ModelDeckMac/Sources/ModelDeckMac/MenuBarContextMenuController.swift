@@ -69,6 +69,8 @@ final class MenuBarContextMenuController: NSObject {
             menuItem.target = self
             menuItem.isEnabled = item.isEnabled
             switch item.action {
+            case .about:
+                menuItem.action = #selector(showAbout)
             case .checkForAppUpdates:
                 menuItem.action = #selector(checkForAppUpdates)
             case .quit:
@@ -93,6 +95,15 @@ final class MenuBarContextMenuController: NSObject {
             let dialog = await appUpdateModel.explicitCheck()
             AppUpdateDialogPanel.present(dialog: dialog, installModel: installModel)
         }
+    }
+
+    /// Issue #425 — the standard About panel; AppKit renders the bundled
+    /// Credits.rtf (third-party notices) in its credits area automatically.
+    /// As an LSUIElement app ModelDeck is never the active app when the
+    /// menu opens, so activate first or the panel appears behind others.
+    @objc private func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
     }
 
     @objc private func quit() {

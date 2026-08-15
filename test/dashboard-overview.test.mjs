@@ -42,7 +42,7 @@ function fixture(t) {
 }
 
 async function request(app, route, { host = `127.0.0.1:${PORT}` } = {}) {
-  const req = Object.assign(Readable.from([]), { method: 'GET', url: route, headers: { host } });
+  const req = Object.assign(Readable.from([]), { socket: { remoteAddress: '127.0.0.1' }, method: 'GET', url: route, headers: { host } });
   let status;
   let headers;
   let payload;

@@ -8,6 +8,7 @@ import { RANGES, DEFAULT_RANGE } from './api.js';
 import { loadModel } from './model.js';
 import { PRICE_SNAPSHOT_DATE, PRICE_SOURCE } from './prices.js';
 import { UpPill, ZoomOutPuck, parentOf } from './DrillNav.jsx';
+import { clearArrivalFragment, currentArrival, reportRoute } from './route.js';
 
 /*
  * PROVIDER COLOUR — the assignment lives in Overview.jsx (one place); the tabs
@@ -64,6 +65,25 @@ const HOME = { level: 'overview', selection: null };
 // page the reader arrived from) is not a drill level and must not be read as one.
 const ROUTE_MARK = 'modeldeckDrill';
 
+function MemberBlackoutAlerts({ status }) {
+  const alerts = Array.isArray(status?.alerts) ? status.alerts : [];
+  if (!alerts.length) return null;
+  return (
+    <div className="member-blackout-alerts" aria-label="Proxy pool alerts">
+      {alerts.map((alert) => (
+        <div className="member-blackout-alert" role="alert" key={alert.accountId}>
+          <span className="member-blackout-badge">Pool alert</span>
+          <span>
+            <strong>{alert.label}</strong>: {alert.consecutiveFailures} routed requests failed in a row
+            {alert.statusCode ? ` (HTTP ${alert.statusCode})` : ''}.{' '}
+            {alert.remedy || 'Sign in again to restore proxy routing.'}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** System / Light / Dark, remembered (charter decision 12). */
 function useTheme() {
   const [theme, setTheme] = usePersisted(THEME_KEY, 'system', THEME_VALUES);
@@ -109,18 +129,28 @@ function useTheme() {
  * match is not a level to return to: it lands on the overview, and the entry is
  * rewritten so a second press of the same button does not repeat the trip.
  */
-function useRoute({ rangeKey, scope }) {
-  const [route, setRoute] = useState(HOME);
+function useRoute({ rangeKey, scope, initial = HOME }) {
+  // Stamped from the first render: a route is only meaningful under the range
+  // and scope it was made under (#393), and an arriving one is no exception.
+  const [route, setRoute] = useState(() => ({ ...initial, rangeKey, scope }));
   // A ref, not a dependency: the listener is registered once, and re-registering
   // it on every filter change would drop a pop that arrived mid-swap.
   const filters = useRef({ rangeKey, scope });
   filters.current = { rangeKey, scope };
+  // The arriving position is a mount-time fact; a ref keeps the seeding effect
+  // a genuine once-only without pretending `initial` is not read inside it.
+  const seedRoute = useRef(initial);
 
   const stamp = useCallback((next) => ({ ...next, ...filters.current }), []);
 
   useEffect(() => {
-    const seed = { ...HOME, ...filters.current };
+    // The deep link (#424) seeds the FIRST history entry, so the back button
+    // out of an arrival behaves exactly like the back button out of a drill
+    // the reader opened himself — one navigation system, one history.
+    const seed = { ...seedRoute.current, ...filters.current };
     try { window.history.replaceState({ [ROUTE_MARK]: true, route: seed }, ''); } catch { /* opaque origin */ }
+    // The instruction has been carried out; it is not the reader's position.
+    clearArrivalFragment();
     const onPop = (event) => {
       const stored = event.state && event.state[ROUTE_MARK] ? event.state.route : null;
       const current = filters.current;
@@ -194,14 +224,29 @@ function Crumbs({ route, go, trailRef }) {
 }
 
 export default function App() {
-  const [rangeKey, setRangeKey] = useState(DEFAULT_RANGE);
-  const [scope, setScope] = useState('claude');
+  /*
+   * DEEP-LINK ARRIVAL (#424). The app window opens this page with a route on
+   * the URL fragment; route.js parses it. Read once, before any state exists,
+   * because it decides the INITIAL value of three of them.
+   *
+   * FILTER CARRY-THROUGH (#371), the arrival case. Range and provider scope
+   * are App state, so a route that names them has to seed that state — land
+   * on a drill with the wrong range and its keys name nothing, which is the
+   * exact stale-route failure #393 already guards on the back button. Seeded
+   * here, they are simply the filters the reader arrives holding, and every
+   * later navigation preserves them the way it always did.
+   */
+  const arrival = useRef(null);
+  if (!arrival.current) arrival.current = currentArrival();
+  const start = arrival.current;
+  const [rangeKey, setRangeKey] = useState(start.rangeKey);
+  const [scope, setScope] = useState(start.scope);
   const [lens, setLens] = useState('subs');
   const [theme, setTheme] = useTheme();
   const [model, setModel] = useState(null);
   const [error, setError] = useState(null);
   const [pending, setPending] = useState(true);
-  const [route, go] = useRoute({ rangeKey, scope });
+  const [route, go] = useRoute({ rangeKey, scope, initial: start.route });
   const first = useRef(true);
   const here = useRef(route);
   // The return controls (issue #408). One level up, named — presentation over
@@ -226,6 +271,21 @@ export default function App() {
     if (active && active !== document.body) return;
     if (trail.current) trail.current.focus();
   }, [route]);
+  // A DEEP-LINK arrival below the landing has the same problem a return click
+  // has (#363): nothing was clicked, so focus is wherever the host window left
+  // it — for the app window, on the window chrome. Park it on the crumb trail,
+  // the one navigation landmark present at every level, which is also where a
+  // keyboard reader needs to be to walk back OUT of where he was just sent.
+  const landed = useRef(start.deepLinked);
+  useEffect(() => {
+    if (!landed.current) return;
+    landed.current = false;
+    if (trail.current) trail.current.focus();
+  }, []);
+  // Tell the host window where the reader is, so a relaunch reopens here
+  // (#402(c)). One-way and advisory — a browser tab has no host and this is a
+  // no-op there. It reports the position, never asks for one.
+  useEffect(() => { reportRoute(route); }, [route]);
   // Committed in an effect (declared before the range/scope effect, so it runs
   // first within a commit): a render-time write could leak a discarded render's
   // route into the history replace below.
@@ -322,6 +382,8 @@ export default function App() {
         <span className="filter-label">Theme</span>
         <Segmented options={THEMES} value={theme} onChange={setTheme} label="Theme" />
       </div>
+
+      <MemberBlackoutAlerts status={model?.memberBlackout} />
 
       {error ? <div className="card error">Could not load usage: {error}</div> : null}
 

@@ -41,6 +41,17 @@ import {
 } from './adapters/codex.mjs';
 import { evaluateWorstCapacity } from './capacity.mjs';
 import {
+  decideProxyReloginAvailability,
+  isSettledProxyReloginPhase,
+  PROXY_CREDENTIAL_HEALTH_TTL_MS,
+  PROXY_RELOGIN_SESSION_TTL_MS,
+  proxyCredentialHealthFromAuthFiles,
+  ProxyReloginDriver,
+  ProxyReloginError,
+  proxyReloginFailureText,
+  proxyReloginNextPhase,
+} from './proxy-relogin.mjs';
+import {
   USAGE_SNAPSHOT_PRUNE_BATCH_SIZE,
   USAGE_SNAPSHOT_RETENTION_DAYS,
 } from './db.mjs';
@@ -76,6 +87,13 @@ const ACTIVE_SESSION_REFRESH_CAP_MS = 30 * 60_000;
 const DAY_MS = 24 * 60 * 60_000;
 export const USAGE_SNAPSHOT_PRUNE_INTERVAL_MS = DAY_MS;
 export const WAREHOUSE_INGEST_INTERVAL_MS = 15 * 60_000;
+
+// Three consecutive routed failures suppress isolated provider/network blips
+// while exposing a deterministic expired credential on its third attempted
+// request. This is request-count based, so sparse and busy members get the
+// same evidence bar without adding a clock or polling loop.
+export const MEMBER_BLACKOUT_FAILURE_THRESHOLD = 3;
+const MEMBER_BLACKOUT_REMEDY = 'Sign in again to restore proxy routing.';
 
 const CLAUDE_RENEWAL_TIMEOUT_MS = 60_000;
 const CLAUDE_RENEWAL_BACKOFF_MS = 30 * 60_000;
@@ -443,6 +461,48 @@ function managedCodexProfile(profileRef, profilesDir) {
   return managedProfile(profileRef, profilesDir, 'Codex');
 }
 
+function isIso8601Timestamp(value) {
+  if (typeof value !== 'string') return false;
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-](\d{2}):(\d{2}))$/);
+  if (!match) return false;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, zone, zoneHourText, zoneMinuteText] = match;
+  const [year, month, day, hour, minute, second] = [yearText, monthText, dayText, hourText, minuteText, secondText].map(Number);
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1]
+      || hour > 23 || minute > 59 || second > 59) return false;
+  if (zone !== 'Z') {
+    const zoneHour = Number(zoneHourText);
+    const zoneMinute = Number(zoneMinuteText);
+    if (zoneHour > 14 || zoneMinute > 59 || (zoneHour === 14 && zoneMinute !== 0)) return false;
+  }
+  return Number.isFinite(Date.parse(value));
+}
+
+function managedProxyAppReport(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) {
+    throw new Error('managed proxy report must be an object');
+  }
+  const { managed, phase, pid, restartCount, appVersion, reportedAt } = input;
+  if (typeof managed !== 'boolean') throw new Error('managed must be a boolean');
+  if (typeof phase !== 'string' || phase.trim() === '') throw new Error('phase must be a non-empty string');
+  if (pid !== null && (!Number.isSafeInteger(pid) || pid <= 0)) {
+    throw new Error('pid must be a positive integer or null');
+  }
+  if (restartCount !== null && (!Number.isSafeInteger(restartCount) || restartCount < 0)) {
+    throw new Error('restartCount must be a non-negative integer or null');
+  }
+  if (appVersion !== null && (typeof appVersion !== 'string' || appVersion.trim() === '')) {
+    throw new Error('appVersion must be a non-empty string or null');
+  }
+  if (!isIso8601Timestamp(reportedAt)) {
+    throw new Error('reportedAt must be an ISO-8601 timestamp');
+  }
+  // Issue #432: discard fields a newer app adds rather than echoing facts
+  // this daemon version does not understand.
+  return { managed, phase, pid, restartCount, appVersion, reportedAt };
+}
+
 export class ModelDeckService {
   constructor(store, options = {}) {
     this.store = store;
@@ -475,6 +535,34 @@ export class ModelDeckService {
     // packaged daemon never relies on a particular interactive shell PATH.
     this.cliproxyPath = options.cliproxyPath || options.cliproxyBin || 'cliproxyapi';
     this.cliproxyBaseUrl = options.cliproxyBaseUrl || DEFAULT_CLIPROXY_BASE_URL;
+    // Issue #421: the proxy's shared state dir, for the observed-facts block
+    // in /api/state. Same no-homedir-default rule as cliproxyAuthDir — only
+    // the production server wires the real path, so a fixture can never
+    // report on a developer's live proxy install. Null = nothing observed.
+    this.cliproxyConfigDir = options.cliproxyConfigDir || null;
+    this.cliproxyPathExists = options.cliproxyPathExists || ((target) => fs.existsSync(target));
+    // Issue #396: the in-app repair for an expired pool credential. Same
+    // no-homedir-default rule — a fixture never receives a live key path, and
+    // without one the repair reports itself unavailable WITH the reason
+    // rather than failing at the first 401.
+    this.cliproxyManagementKeyPath = options.cliproxyManagementKeyPath ?? null;
+    this.proxyReloginDriver = options.proxyReloginDriver || new ProxyReloginDriver({
+      baseUrl: this.cliproxyBaseUrl,
+      managementKeyPath: this.cliproxyManagementKeyPath,
+      fetcher: options.proxyReloginFetch || globalThis.fetch,
+      readFile: options.proxyReloginReadFile || fs.promises.readFile,
+      requestTimeoutMs: options.proxyReloginRequestTimeoutMs,
+    });
+    // One in-flight sign-in per account; the proxy's own waiter expires after
+    // five minutes, so a session outliving that is reported as expired.
+    this.proxyReloginSessions = new Map();
+    // CodeRabbit (PR #435): the session record lands only after the driver's
+    // start round trip, so the already-in-progress guard cannot span the
+    // await on its own — the in-flight start is registered synchronously,
+    // same discipline as proxyJoinPromises.
+    this.proxyReloginStarts = new Map();
+    this.proxyReloginNow = options.proxyReloginNow || (() => Date.now());
+    this.proxyCredentialHealthCache = null;
     // A plain service fixture never receives a live management-key path. The
     // production server wires src/paths.mjs explicitly; tests wire only temp
     // key files and loopback stubs. Credential material is read inside pull().
@@ -605,6 +693,9 @@ export class ModelDeckService {
     };
     this.usageQueueGuardPromise = null;
     this.usageQueueLastPull = null;
+    // Issue #432: app-owned process state is memory-only. A daemon restart
+    // honestly forgets it until the app reports another lifecycle transition.
+    this.managedProxyAppReport = null;
     this.ingestTranscriptArchive = options.ingestTranscriptArchive || ingestTranscriptArchive;
     this.ingestCodexRollouts = options.ingestCodexRollouts || ingestCodexRollouts;
     this.refitUsageEstimates = options.refitUsageEstimates || refitUsageEstimates;
@@ -3398,6 +3489,202 @@ export class ModelDeckService {
     return Number.isInteger(record?.weight) && record.weight >= 0 ? record : null;
   }
 
+  // Issue #396 — CREDENTIAL HEALTH, the proxy's own verdict on its pool.
+  //
+  // The daemon has never had an expiry signal for pool members: it reads the
+  // auth files for identity and weight only, and a token's VALUE is never
+  // parsed. The honest source is CLIProxyAPI itself, which marks a credential
+  // whose refresh was rejected upstream `status: error / unavailable: true`
+  // and clears it back to active on a successful sign-in. That flip is what
+  // makes "the member is broken" and "the member recovered" both observable.
+  //
+  // Cheap by construction: one cached loopback GET, never per account. On any
+  // failure — no key, proxy down, unknown shape — the answer is null, meaning
+  // UNKNOWN, and every downstream key is omitted so the UI renders nothing.
+  async proxyCredentialHealth({ force = false } = {}) {
+    if (!this.cliproxyManagementKeyPath) return null;
+    const now = this.proxyReloginNow();
+    const cached = this.proxyCredentialHealthCache;
+    if (!force && cached && now - cached.at < PROXY_CREDENTIAL_HEALTH_TTL_MS) {
+      return cached.pending ? cached.pending : cached.value;
+    }
+    const pending = (async () => {
+      try {
+        return proxyCredentialHealthFromAuthFiles(await this.proxyReloginDriver.authFiles());
+      } catch {
+        return null;
+      }
+    })();
+    // Concurrent /api/state reads share one probe rather than each dialing.
+    this.proxyCredentialHealthCache = { at: now, value: null, pending };
+    const value = await pending;
+    if (this.proxyCredentialHealthCache?.pending === pending) {
+      this.proxyCredentialHealthCache = { at: this.proxyReloginNow(), value, pending: null };
+    }
+    return value;
+  }
+
+  /// Join an account to its health record using the SAME identity keys the
+  /// pool reader uses, so membership and health can never disagree about who
+  /// they are describing.
+  proxyCredentialFor(account, health) {
+    if (!health) return null;
+    const identity = this.proxyPoolIdentityFor(account);
+    if (!identity) return null;
+    const records = identity.provider === 'claude'
+      ? health.byClaudeEmail
+      : health.byCodexAccountId;
+    return records.get(identity.value) || null;
+  }
+
+  /// The live session for this account, or null. Expiry is evaluated here so
+  /// a session the proxy has already abandoned (its waiter stops at five
+  /// minutes) can never read as still pending.
+  activeProxyReloginSession(accountId) {
+    const session = this.proxyReloginSessions.get(accountId);
+    if (!session || isSettledProxyReloginPhase(session.phase)) return null;
+    if (this.proxyReloginNow() - session.startedAt >= PROXY_RELOGIN_SESSION_TTL_MS) {
+      session.phase = proxyReloginNextPhase(session.phase, 'expired');
+      session.detail = proxyReloginFailureText('expired');
+      return null;
+    }
+    return session;
+  }
+
+  proxyReloginPayload(session) {
+    return {
+      accountId: session.accountId,
+      provider: session.provider,
+      phase: session.phase,
+      // The authorize URL is returned ONCE, by start(). It is never logged,
+      // never stored, and never repeated on a poll.
+      ...(session.detail ? { detail: session.detail } : {}),
+    };
+  }
+
+  proxyReloginAvailabilityFor(account, managementKeyPresent) {
+    return decideProxyReloginAvailability({
+      provider: account.provider,
+      baseUrl: this.cliproxyBaseUrl,
+      managementKeyPresent,
+    });
+  }
+
+  /// Ask the PROXY to start its own OAuth for this account's provider and
+  /// hand back the authorize URL for the app to open. ModelDeck performs no
+  /// login, holds no credential, and writes no auth file (#398): the proxy
+  /// binds the provider's callback port itself (`is_webui=1`), completes the
+  /// exchange, and saves its own file.
+  async startProxyRelogin(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    const availability = this.proxyReloginAvailabilityFor(
+      account,
+      await this.proxyReloginDriver.managementKeyPresent(),
+    );
+    if (!availability.available) throw serviceError(availability.reason, 409);
+    if (this.activeProxyReloginSession(accountId) || this.proxyReloginStarts.has(accountId)) {
+      throw serviceError('a proxy sign-in is already in progress for this account', 409);
+    }
+    let started;
+    const inFlight = this.proxyReloginDriver.start(account.provider);
+    this.proxyReloginStarts.set(accountId, inFlight);
+    try {
+      started = await inFlight;
+    } catch (error) {
+      const reason = error instanceof ProxyReloginError ? error.reason : null;
+      throw serviceError(
+        proxyReloginFailureText(reason, { status: error?.status ?? null }),
+        reason === 'unsupported-provider' ? 400 : 502,
+      );
+    } finally {
+      if (this.proxyReloginStarts.get(accountId) === inFlight) {
+        this.proxyReloginStarts.delete(accountId);
+      }
+    }
+    const session = {
+      accountId: account.id,
+      provider: account.provider,
+      state: started.state,
+      startedAt: this.proxyReloginNow(),
+      phase: proxyReloginNextPhase(proxyReloginNextPhase('idle', 'start'), 'started'),
+      detail: null,
+    };
+    this.proxyReloginSessions.set(account.id, session);
+    return { ...this.proxyReloginPayload(session), url: started.url };
+  }
+
+  /// Poll the proxy for the outcome of the sign-in it is running. Every
+  /// answer is a phase the UI already has copy for; nothing is inferred.
+  async proxyReloginState(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    const session = this.proxyReloginSessions.get(accountId);
+    if (!session) {
+      const availability = this.proxyReloginAvailabilityFor(
+        account,
+        await this.proxyReloginDriver.managementKeyPresent(),
+      );
+      return {
+        accountId: account.id,
+        provider: account.provider,
+        phase: 'idle',
+        available: availability.available,
+        ...(availability.reason ? { reason: availability.reason } : {}),
+      };
+    }
+    // Re-reading through activeProxyReloginSession applies the expiry rule.
+    if (!this.activeProxyReloginSession(accountId)) return this.proxyReloginPayload(session);
+
+    let status;
+    try {
+      status = await this.proxyReloginDriver.status(session.state);
+    } catch (error) {
+      session.phase = proxyReloginNextPhase(session.phase, 'transport-error');
+      session.detail = proxyReloginFailureText(
+        error instanceof ProxyReloginError ? error.reason : null,
+        { status: error?.status ?? null },
+      );
+      return this.proxyReloginPayload(session);
+    }
+    if (status.status === 'ok') {
+      session.phase = proxyReloginNextPhase(session.phase, 'poll-ok');
+      session.detail = null;
+      // The recovery signal, immediately: re-read the proxy's own health so
+      // the restored member is visible on the very next state read rather
+      // than after the cache expires.
+      await this.proxyCredentialHealth({ force: true });
+    } else if (status.status === 'error') {
+      session.phase = proxyReloginNextPhase(session.phase, 'poll-error');
+      // The proxy's own reason, verbatim and length-capped — it names the
+      // real failure ("unknown or expired state", a failed code exchange)
+      // far better than any sentence ModelDeck could guess.
+      session.detail = status.error
+        ? `CLIProxyAPI could not finish the sign-in: ${status.error}`
+        : proxyReloginFailureText(null);
+    } else {
+      session.phase = proxyReloginNextPhase(session.phase, 'poll-wait');
+    }
+    return this.proxyReloginPayload(session);
+  }
+
+  /// Stop the sign-in. Honest by construction: this asks the PROXY to drop
+  /// its own pending session, so unlike the pool-join wait there is nothing
+  /// still running server-side afterwards. A proxy that refuses is not an
+  /// error the user can act on — its session expires on its own either way.
+  async cancelProxyRelogin(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    const session = this.activeProxyReloginSession(accountId);
+    if (!session) throw serviceError(proxyReloginFailureText('no-session'), 409);
+    let cancelledUpstream = false;
+    try { cancelledUpstream = await this.proxyReloginDriver.cancel(session.state); }
+    catch { cancelledUpstream = false; }
+    session.phase = proxyReloginNextPhase(session.phase, 'cancel');
+    session.detail = null;
+    return { ...this.proxyReloginPayload(session), cancelledUpstream };
+  }
+
   async joinProxyPool(accountId) {
     const account = this.store.getAccount(accountId);
     if (!account) throw serviceError('account not found', 404);
@@ -3706,7 +3993,15 @@ export class ModelDeckService {
   }
 
   async accountsWithAuthState(accounts = this.store.listAccounts()) {
-    const proxyWeights = await this.readProxyWeights();
+    // Issue #396: health and repair-availability are resolved ONCE per state
+    // read, never per account. Both answer "unknown" (null / false) without a
+    // management key, which is exactly the state a fixture — and a fresh
+    // managed install awaiting #431 — is in.
+    const [proxyWeights, proxyHealth, proxyManagementKeyPresent] = await Promise.all([
+      this.readProxyWeights(),
+      this.proxyCredentialHealth(),
+      this.proxyReloginDriver.managementKeyPresent(),
+    ]);
     return Promise.all(accounts.map(async (account) => {
       // Issue #89: surface the per-account refresh failure refreshAll used
       // to drop, so the deck and Settings can render honest staleness.
@@ -3777,6 +4072,16 @@ export class ModelDeckService {
       const codexAccountId = account.provider === 'codex'
         ? this.codexAccountIdentifiers.get(account.id)
         : null;
+      // Issue #396, additive and gated on a real pool existing here (the
+      // #149/#174 discipline): the proxy's verdict on this member's
+      // credential, and whether the in-app repair can run — with the reason
+      // when it cannot, so "unavailable" is never silent.
+      const proxyCredentialRecord = proxyPool === 'member'
+        ? this.proxyCredentialFor(account, proxyHealth)
+        : null;
+      const proxyRelogin = proxyPool
+        ? this.proxyReloginAvailabilityFor(account, proxyManagementKeyPresent)
+        : null;
       return {
         ...account,
         authState,
@@ -3792,6 +4097,16 @@ export class ModelDeckService {
         // `excluded-models` — its weight then routes only OTHER models.
         ...(proxyRouting?.fableExcluded ? { proxyFableExcluded: true } : {}),
         ...(codexAccountId ? { codexAccountId } : {}),
+        ...(proxyCredentialRecord ? { proxyCredential: proxyCredentialRecord.health } : {}),
+        ...(proxyCredentialRecord?.detail ? { proxyCredentialDetail: proxyCredentialRecord.detail } : {}),
+        ...(proxyRelogin
+          ? {
+            proxyRelogin: {
+              available: proxyRelogin.available,
+              ...(proxyRelogin.reason ? { reason: proxyRelogin.reason } : {}),
+            },
+          }
+          : {}),
       };
     }));
   }
@@ -3890,6 +4205,85 @@ export class ModelDeckService {
     return { execPath: this.daemonExecPath, binaryPresent, sea: this.daemonSea, MDGitCommit: this.daemonGitCommit };
   }
 
+  // Issue #421/#432 — the managed-proxy block. Base fields remain facts the
+  // daemon observes directly about the shared ~/.config/cliproxyapi state
+  // dir (#398). App-owned process facts appear only after an explicit report:
+  // never inferred, never persisted, and never assigned daemon-side freshness.
+  // Presence checks only — auth contents stay CLIProxyAPI's business. Cheap:
+  // two existsSync per state read, no network, no timer, no polling.
+  managedProxyStatus() {
+    const configDir = this.cliproxyConfigDir;
+    if (!configDir) {
+      return {
+        baseUrl: this.cliproxyBaseUrl,
+        configDir: null,
+        configPresent: null,
+        authDirPresent: null,
+        lastQueueContactAt: this.usageQueueLastPull?.at ?? null,
+        ...(this.managedProxyAppReport ? { appReport: this.managedProxyAppReport } : {}),
+      };
+    }
+    const exists = (target) => {
+      try {
+        return Boolean(this.cliproxyPathExists(target));
+      } catch {
+        return false;
+      }
+    };
+    return {
+      baseUrl: this.cliproxyBaseUrl,
+      configDir,
+      configPresent: exists(path.join(configDir, 'config.yaml')),
+      authDirPresent: exists(path.join(configDir, 'auth')),
+      lastQueueContactAt: this.usageQueueLastPull?.at ?? null,
+      ...(this.managedProxyAppReport ? { appReport: this.managedProxyAppReport } : {}),
+    };
+  }
+
+  reportManagedProxy(input) {
+    const report = managedProxyAppReport(input);
+    this.managedProxyAppReport = {
+      ...report,
+      receivedAt: new Date(this.now()).toISOString(),
+    };
+    return this.managedProxyAppReport;
+  }
+
+  // Issue #395: the queue consumer already persists per-request member,
+  // outcome, status, and time facts. Derive the live alert from that archive
+  // so daemon restarts and out-of-order archive replays cannot reset or inflate
+  // a streak. An explicitly absent/zero-weight or disabled member is benched,
+  // so a historical failure tail must not alarm for it. CodeRabbit (PR #434):
+  // membership must be CONFIRMED, not merely un-contradicted — when proxy
+  // state is unknowable (no parseable auth files) `proxyPool` is omitted and
+  // the account is benched; the alert's recorded scope is pool members only.
+  memberBlackoutStatus(accounts) {
+    const alerts = [];
+    for (const account of accounts) {
+      if (!account.enabled || account.proxyPool !== 'member' || account.proxyWeight === 0) continue;
+      const selector = account.provider === 'claude'
+        ? { accountId: account.id }
+        : account.provider === 'codex' && account.codexAccountId
+          ? { provider: 'codex', source: account.codexAccountId }
+          : null;
+      if (!selector) continue;
+      const streak = this.store.requestFailureStreak(selector);
+      if (streak.consecutiveFailures < MEMBER_BLACKOUT_FAILURE_THRESHOLD) continue;
+      alerts.push({
+        accountId: account.id,
+        provider: account.provider,
+        label: account.label,
+        ...streak,
+        remedy: MEMBER_BLACKOUT_REMEDY,
+      });
+    }
+    alerts.sort((left, right) => (
+      right.consecutiveFailures - left.consecutiveFailures
+      || left.label.localeCompare(right.label)
+    ));
+    return { threshold: MEMBER_BLACKOUT_FAILURE_THRESHOLD, alerts };
+  }
+
   async state() {
     const value = this.store.state();
     const [accounts, claudeActivation, codexActivation] = await Promise.all([
@@ -3909,6 +4303,8 @@ export class ModelDeckService {
       usageQueue: this.usageQueueStatus(),
       warehouseIngest: this.warehouseIngestStatus(),
       daemon: this.daemonRuntimeStatus(),
+      managedProxy: this.managedProxyStatus(),
+      memberBlackout: this.memberBlackoutStatus(accounts),
       sharedScope: this.sharedScope.status(),
     };
   }

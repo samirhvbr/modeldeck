@@ -72,6 +72,7 @@ function fixture(t, overrides = {}) {
 async function request(app, route, { authenticated = true, method = 'POST' } = {}) {
   const req = Readable.from([]);
   Object.assign(req, {
+    socket: { remoteAddress: '127.0.0.1' },
     method,
     url: route,
     headers: {
@@ -189,4 +190,78 @@ test('join and routing conflicts propagate as honest 409 JSON responses', async 
   result = await request(data.app, `/api/accounts/${data.claude.id}/proxy-routing/wire`);
   assert.equal(result.status, 409);
   assert.deepEqual(result.body, { error: routingMessage });
+});
+
+// --- Issue #396: the in-app credential repair routes -------------------------
+
+function reloginFixture(t, overrides = {}) {
+  return fixture(t, {
+    async startProxyRelogin(accountId) {
+      return {
+        accountId,
+        provider: 'claude',
+        phase: 'awaiting-browser',
+        url: 'https://provider.invalid/authorize',
+      };
+    },
+    async proxyReloginState(accountId) {
+      return { accountId, provider: 'claude', phase: 'awaiting-browser' };
+    },
+    async cancelProxyRelogin(accountId) {
+      return { accountId, provider: 'claude', phase: 'cancelled', cancelledUpstream: true };
+    },
+    ...overrides,
+  });
+}
+
+test('the relogin start POST is token-gated and hands back the proxy authorize URL', async (t) => {
+  const data = reloginFixture(t);
+  const route = `/api/accounts/${data.claude.id}/proxy-relogin`;
+
+  const rejected = await request(data.app, route, { authenticated: false });
+  assert.equal(rejected.status, 403);
+
+  const started = await request(data.app, route);
+  assert.equal(started.status, 200);
+  assert.deepEqual(started.body, {
+    accountId: data.claude.id,
+    provider: 'claude',
+    phase: 'awaiting-browser',
+    url: 'https://provider.invalid/authorize',
+  });
+});
+
+test('the relogin poll answers on GET, like every other daemon read', async (t) => {
+  // Reading the phase of a flow the user already started is not a mutation.
+  const data = reloginFixture(t);
+  const result = await request(data.app, `/api/accounts/${data.claude.id}/proxy-relogin`, {
+    method: 'GET',
+    authenticated: false,
+  });
+  assert.equal(result.status, 200);
+  assert.equal(result.body.phase, 'awaiting-browser');
+});
+
+test('relogin cancel is token-gated and reports whether the proxy dropped its session', async (t) => {
+  const data = reloginFixture(t);
+  const route = `/api/accounts/${data.claude.id}/proxy-relogin/cancel`;
+  assert.equal((await request(data.app, route, { authenticated: false })).status, 403);
+  const cancelled = await request(data.app, route);
+  assert.equal(cancelled.status, 200);
+  assert.equal(cancelled.body.phase, 'cancelled');
+  assert.equal(cancelled.body.cancelledUpstream, true);
+});
+
+test('relogin routes 404 an unknown account and propagate the service refusal verbatim', async (t) => {
+  const message = 'This CLIProxyAPI install has no management key yet, so ModelDeck cannot ask it to start a sign-in.';
+  const data = reloginFixture(t, {
+    async startProxyRelogin() { throw statusError(message, 409); },
+  });
+  const missing = await request(data.app, '/api/accounts/missing/proxy-relogin');
+  assert.equal(missing.status, 404);
+  assert.deepEqual(missing.body, { error: 'account not found' });
+
+  const refused = await request(data.app, `/api/accounts/${data.claude.id}/proxy-relogin`);
+  assert.equal(refused.status, 409);
+  assert.deepEqual(refused.body, { error: message });
 });

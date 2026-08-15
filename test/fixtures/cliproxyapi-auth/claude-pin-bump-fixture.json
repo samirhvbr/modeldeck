@@ -1,0 +1,9 @@
+{
+  "type": "claude",
+  "email": "pin-bump-claude@example.invalid",
+  "weight": 7,
+  "excluded-models": [
+    "claude-fable-fixture"
+  ],
+  "access_token": "modeldeck-pin-bump-claude-placeholder-not-a-credential"
+}

@@ -6,6 +6,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const releaseScript = new URL('../scripts/release-dmg.sh', import.meta.url);
+const cliProxyPin = new URL('../scripts/cliproxyapi-pin.json', import.meta.url);
+const cliProxyPinHelper = new URL('../scripts/cliproxyapi-pin.mjs', import.meta.url);
 
 function git(cwd, ...args) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -28,6 +30,8 @@ function releaseRepository(t) {
   fs.mkdirSync(path.join(root, 'scripts'), { recursive: true });
   fs.mkdirSync(path.join(root, 'dist'));
   fs.copyFileSync(releaseScript, path.join(root, 'scripts', 'release-dmg.sh'));
+  fs.copyFileSync(cliProxyPin, path.join(root, 'scripts', 'cliproxyapi-pin.json'));
+  fs.copyFileSync(cliProxyPinHelper, path.join(root, 'scripts', 'cliproxyapi-pin.mjs'));
   fs.writeFileSync(path.join(root, 'scripts', 'release-checks.mjs'), '#!/usr/bin/env node\n');
   fs.writeFileSync(path.join(root, 'VERSION'), '0.0.0\n');
   fs.writeFileSync(path.join(root, 'tracked.txt'), 'clean\n');
@@ -56,15 +60,59 @@ test('release guard accepts a clean origin/main checkout and ignores dist change
   assert.equal(result.status, 0, result.stderr);
 });
 
-test('release path runs the existing analytics click and boundary tests', () => {
+test('release path runs analytics checks and requires CLIProxyAPI compatibility evidence', () => {
   const script = fs.readFileSync(releaseScript, 'utf8');
   const checks = fs.readFileSync(new URL('../scripts/release-checks.mjs', import.meta.url), 'utf8');
   assert.match(script, /node "\$REPO_ROOT\/scripts\/release-checks\.mjs"/);
-  assert.match(script, /release analytics checks missing/);
+  assert.match(script, /release checks missing/);
   assert.match(checks, /test\/dashboard-overview-clicktest\.test\.mjs/);
   assert.match(checks, /test\/usage-estimate\.test\.mjs/);
   assert.match(checks, /prototype chart round-trip click-test/);
   assert.match(checks, /#374 fit-floor boundary test/);
+  assert.match(checks, /verifyCLIProxyCompatibilityEvidence/);
+  assert.match(checks, /npm run test:cliproxyapi-pin/);
+
+  // PR #428 review: source-text matching alone can be satisfied by a
+  // remediation message. Also execute a piece of it: the npm script the gate
+  // names must exist and point at the compat suite.
+  const packageJson = JSON.parse(
+    fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+  );
+  assert.match(
+    packageJson.scripts['test:cliproxyapi-pin'] ?? '',
+    /cliproxyapi-pin-compat\.test\.mjs/,
+    'package.json must define the pin-compat suite script the gate names',
+  );
+});
+
+test('the compatibility gate rejects missing and mismatched evidence when executed', async (t) => {
+  const { verifyCLIProxyCompatibilityEvidence } = await import('../scripts/cliproxyapi-compat.mjs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-release-gate-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const binaryPath = path.join(root, 'cliproxyapi');
+  const evidencePath = path.join(root, 'compatibility.json');
+  fs.writeFileSync(binaryPath, 'gate fixture binary', { mode: 0o755 });
+  const pin = { tag: 'v9.9.9', commit: 'c'.repeat(40) };
+
+  assert.throws(
+    () => verifyCLIProxyCompatibilityEvidence({ binaryPath, evidencePath, pin }),
+    /evidence is missing or invalid/,
+  );
+
+  fs.writeFileSync(evidencePath, JSON.stringify({
+    schemaVersion: 1,
+    pin,
+    binarySha256: '0'.repeat(64),
+    passedAt: '2026-08-14T00:00:00.000Z',
+    tripwires: {
+      'pin-bump-queue-shape': true, 'pin-bump-mgmt-api': true, 'pin-bump-auth-format': true,
+    },
+    capture: {},
+  }));
+  assert.throws(
+    () => verifyCLIProxyCompatibilityEvidence({ binaryPath, evidencePath, pin }),
+    /does not match the binary being released/,
+  );
 });
 
 test('release guard refuses tracked changes and --allow-dirty warns loudly', (t) => {

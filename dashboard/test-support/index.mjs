@@ -44,10 +44,12 @@ export async function loadModule(relativePath) {
  * pixels. So every element reports the given size, and the ResizeObserver
  * reports it immediately rather than never.
  */
-export function installDom({ width = 1040, height = 340 } = {}) {
+export function installDom({ width = 1040, height = 340, hash = '' } = {}) {
   const dom = new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>', {
     pretendToBeVisual: true,
-    url: 'http://127.0.0.1:3867/dashboard',
+    // `hash` is the app window's deep link (#424): the route rides the
+    // fragment, so an arrival test is just this page opened at a URL.
+    url: 'http://127.0.0.1:3867/dashboard' + hash,
   });
   const { window } = dom;
   for (const name of [
@@ -87,14 +89,16 @@ export function installDom({ width = 1040, height = 340 } = {}) {
  * covers the compile step itself: a minified bundle that throws on load renders
  * an empty page in a browser and passes every source-level test.
  */
-export function bootPage(html, app, { width = 1040, height = 340, host = '127.0.0.1:3867' } = {}) {
+export function bootPage(
+  html, app, { width = 1040, height = 340, host = '127.0.0.1:3867', hash = '' } = {},
+) {
   const dom = new JSDOM(html, {
     // jsdom does not execute <script type="module">, so the page's own script is
     // evaluated below instead — after parsing, which is exactly when a module
     // script runs in a browser. The bytes themselves are never edited.
     runScripts: 'outside-only',
     pretendToBeVisual: true,
-    url: 'http://' + host + '/dashboard',
+    url: 'http://' + host + '/dashboard' + hash,
     beforeParse(window) {
       Object.defineProperty(window.HTMLElement.prototype, 'clientWidth', { get: () => width, configurable: true });
       Object.defineProperty(window.HTMLElement.prototype, 'clientHeight', { get: () => height, configurable: true });
@@ -158,6 +162,7 @@ function requestThrough(app, host) {
       method: 'GET',
       url: String(url),
       headers: { host },
+      socket: { remoteAddress: '127.0.0.1' },
     });
     let status = 500;
     let payload = null;

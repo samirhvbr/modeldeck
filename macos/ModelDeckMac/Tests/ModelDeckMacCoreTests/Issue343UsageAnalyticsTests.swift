@@ -59,12 +59,15 @@ struct UsageAnalyticsMenuTests {
         #expect(UsageAnalytics.dashboardURL(base: base).absoluteString == "http://127.0.0.1:3867/dashboard")
     }
 
-    @Test func menuItemNamesTheBrowserSideEffectForVoiceOver() {
+    @Test func menuItemNamesTheWindowSideEffectForVoiceOver() {
         // Deck-row accessibility class of bugs (mandatory UI lens): the
         // VoiceOver label is an explicit contract, distinct from the title,
-        // and names where the click lands (the web browser).
+        // and names where the click lands. Issue #423 moved that
+        // destination from the web browser to ModelDeck's own window, so
+        // the label must no longer promise a browser.
         #expect(UsageAnalytics.menuItemTitle == "Usage Analytics…")
-        #expect(UsageAnalytics.menuItemAccessibilityLabel.localizedCaseInsensitiveContains("browser"))
+        #expect(UsageAnalytics.menuItemAccessibilityLabel.localizedCaseInsensitiveContains("window"))
+        #expect(!UsageAnalytics.menuItemAccessibilityLabel.localizedCaseInsensitiveContains("browser"))
         #expect(UsageAnalytics.menuItemAccessibilityLabel != UsageAnalytics.menuItemTitle)
     }
 

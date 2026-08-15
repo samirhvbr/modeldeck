@@ -584,7 +584,7 @@ const ROUTE_PORT = 43337;
 
 async function routeRequest(app, route, { host = `127.0.0.1:${ROUTE_PORT}` } = {}) {
   const req = Readable.from([]);
-  Object.assign(req, { method: 'GET', url: route, headers: { host } });
+  Object.assign(req, { socket: { remoteAddress: '127.0.0.1' }, method: 'GET', url: route, headers: { host } });
   let status;
   let headers;
   let payload;

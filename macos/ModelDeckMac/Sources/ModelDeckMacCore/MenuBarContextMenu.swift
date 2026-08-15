@@ -6,6 +6,7 @@ import Foundation
 /// controller in the app target stays thin and this is unit-testable.
 public enum MenuBarContextMenu {
     public enum Action: Equatable, Sendable {
+        case about
         case checkForAppUpdates
         case quit
     }
@@ -22,12 +23,16 @@ public enum MenuBarContextMenu {
         }
     }
 
-    /// The fixed menu: Check for App Updates… (issue #59 scope addition —
-    /// reachable without digging into the gear menu; disabled while a check
-    /// is already in flight) above Quit ModelDeck. Wording matches the gear
-    /// menu exactly — same shared AppUpdateModel behind both.
+    /// The fixed menu: About ModelDeck (issue #425 — the standard About
+    /// panel carries the bundled third-party credits, and a menu-bar-agent
+    /// app with no app menu needs an explicit entry point to it), then
+    /// Check for App Updates… (issue #59 scope addition — reachable without
+    /// digging into the gear menu; disabled while a check is already in
+    /// flight) above Quit ModelDeck. Update wording matches the gear menu
+    /// exactly — same shared AppUpdateModel behind both.
     public static func items(isCheckingForUpdates: Bool) -> [Item] {
         [
+            Item(title: "About ModelDeck", action: .about),
             Item(
                 title: "Check for App Updates…",
                 action: .checkForAppUpdates,

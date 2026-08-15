@@ -72,7 +72,7 @@ function fixture(t) {
 
 async function get(app, route) {
   const req = Readable.from([]);
-  Object.assign(req, { method: 'GET', url: route, headers: { host: '127.0.0.1:43484' } });
+  Object.assign(req, { socket: { remoteAddress: '127.0.0.1' }, method: 'GET', url: route, headers: { host: '127.0.0.1:43484' } });
   let status;
   let payload;
   const res = { writeHead(value) { status = value; }, end(value) { payload = String(value); } };

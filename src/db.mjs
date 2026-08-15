@@ -647,6 +647,11 @@ export class Store {
         ON request_usage(observed_at);
       CREATE INDEX IF NOT EXISTS request_usage_account_observed
         ON request_usage(account_id, observed_at);
+      CREATE INDEX IF NOT EXISTS request_usage_account_outcome_observed
+        ON request_usage(account_id, failed, observed_at DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS request_usage_source_outcome_observed
+        ON request_usage(provider, source_raw COLLATE NOCASE, failed, observed_at DESC, id DESC)
+        WHERE account_id IS NULL;
       CREATE INDEX IF NOT EXISTS request_usage_model
         ON request_usage(model);
       CREATE INDEX IF NOT EXISTS request_usage_reasoning_effort
@@ -1382,6 +1387,70 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /// Read the chronologically trailing failure streak for one routed member.
+  /// Queue batches can arrive late or be replayed, so this is derived from the
+  /// durable request archive instead of trusting ingest order or process memory.
+  /// parseUsageRecord canonicalizes observed_at to UTC ISO, so indexed text
+  /// ordering is chronological here.
+  requestFailureStreak({ accountId = null, provider = null, source = null } = {}) {
+    let selector;
+    let selectorParameters;
+    if (typeof accountId === 'string' && accountId.trim()) {
+      selector = 'account_id = ?';
+      selectorParameters = [accountId.trim()];
+    } else {
+      if (!['claude', 'codex'].includes(provider)) {
+        throw new Error('request failure streak provider must be claude or codex');
+      }
+      if (typeof source !== 'string' || !source.trim()) {
+        throw new Error('request failure streak source is required');
+      }
+      selector = 'account_id IS NULL AND provider = ? AND source_raw = ? COLLATE NOCASE';
+      selectorParameters = [provider, source.trim()];
+    }
+
+    const latestSuccess = this.db.prepare(`
+      SELECT observed_at, id
+      FROM request_usage
+      WHERE ${selector} AND failed = 0
+      ORDER BY observed_at DESC, id DESC
+      LIMIT 1
+    `).get(...selectorParameters);
+    const afterSuccess = latestSuccess
+      ? `AND (
+          observed_at > ?
+          OR (observed_at = ? AND id > ?)
+        )`
+      : '';
+    const afterSuccessParameters = latestSuccess
+      ? [latestSuccess.observed_at, latestSuccess.observed_at, latestSuccess.id]
+      : [];
+    const row = this.db.prepare(`
+      WITH failures AS (
+        SELECT id, observed_at, status_code
+        FROM request_usage
+        WHERE ${selector} AND failed = 1 ${afterSuccess}
+      )
+      SELECT
+        COUNT(*) AS consecutive_failures,
+        MIN(observed_at) AS first_failure_at,
+        MAX(observed_at) AS last_failure_at,
+        (
+          SELECT status_code
+          FROM failures
+          ORDER BY observed_at DESC, id DESC
+          LIMIT 1
+        ) AS latest_status_code
+      FROM failures
+    `).get(...selectorParameters, ...afterSuccessParameters);
+    return {
+      consecutiveFailures: Number(row.consecutive_failures || 0),
+      firstFailureAt: row.first_failure_at || null,
+      lastFailureAt: row.last_failure_at || null,
+      statusCode: row.latest_status_code == null ? null : Number(row.latest_status_code),
+    };
   }
 
   /// Upsert one streamed Codex rollout summary. Active rollout files grow in

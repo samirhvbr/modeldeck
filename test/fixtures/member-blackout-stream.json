@@ -1,0 +1,50 @@
+{
+  "failureBatches": [
+    [
+      {
+        "timestamp": "2026-08-14T12:00:00.000Z",
+        "source": "blackout-member@example.invalid",
+        "provider": "claude",
+        "model": "claude-placeholder-model",
+        "request_id": "blackout-request-placeholder-1",
+        "endpoint": "/v1/messages",
+        "failed": true,
+        "status_code": 401
+      },
+      {
+        "timestamp": "2026-08-14T12:01:00.000Z",
+        "source": "blackout-member@example.invalid",
+        "provider": "claude",
+        "model": "claude-placeholder-model",
+        "request_id": "blackout-request-placeholder-2",
+        "endpoint": "/v1/messages",
+        "failed": true,
+        "status_code": 401
+      }
+    ],
+    [
+      {
+        "timestamp": "2026-08-14T12:02:00.000Z",
+        "source": "blackout-member@example.invalid",
+        "provider": "claude",
+        "model": "claude-placeholder-model",
+        "request_id": "blackout-request-placeholder-3",
+        "endpoint": "/v1/messages",
+        "failed": true,
+        "status_code": 401
+      }
+    ]
+  ],
+  "recoveryBatch": [
+    {
+      "timestamp": "2026-08-14T12:03:00.000Z",
+      "source": "blackout-member@example.invalid",
+      "provider": "claude",
+      "model": "claude-placeholder-model",
+      "request_id": "blackout-request-placeholder-recovery",
+      "endpoint": "/v1/messages",
+      "failed": false,
+      "status_code": 200
+    }
+  ]
+}

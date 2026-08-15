@@ -590,6 +590,7 @@ export async function loadModel({ rangeKey, scope }) {
 
   return {
     rangeKey, resolution, scope, since, until, buckets, baseline,
+    memberBlackout: state.memberBlackout || { threshold: null, alerts: [] },
     projects: list,
     corpusByBucket,
     pool: {

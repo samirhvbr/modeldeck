@@ -201,7 +201,7 @@ function seed(store, root) {
   return { claude, codex };
 }
 
-function fixture(t) {
+function fixture(t, { memberBlackout = null } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-overview-click-'));
   const store = new Store(path.join(root, 'modeldeck.sqlite'));
   store.saveSettings({ usageAnalyticsEnabled: true });
@@ -210,7 +210,12 @@ function fixture(t) {
     projectsRoot: root,
     startAutoRefresh() {},
     stopAutoRefresh() {},
-    async state() { return store.state(); },
+    async state() {
+      return {
+        ...store.state(),
+        ...(memberBlackout ? { memberBlackout } : {}),
+      };
+    },
   };
   const app = createApp({
     store,
@@ -235,8 +240,8 @@ function fixture(t) {
  * each holding a mounted React tree (with its ResizeObserver and its timers) is a
  * leak that grows with every test added here.
  */
-async function landing(t) {
-  const data = fixture(t);
+async function landing(t, options = {}) {
+  const data = fixture(t, options);
   const dom = installDom({ width: 1040, height: 340 });
   installFetch(data.app, { host: `127.0.0.1:${PORT}` });
   const harness = await loadModule('test-support/mount.jsx');
@@ -369,6 +374,34 @@ test('the landing leads with availability in subscriptions, then the chart, then
   // Combined is a legitimate scope, and both projects tile it.
   await clickLabel('Combined', () => names().includes('beta'), 'the Codex project to join the map');
   assert.deepEqual(names().sort(), ['alpha', 'beta']);
+});
+
+test('a routed-member blackout is loud on the Overview without opening a detail view', async (t) => {
+  await landing(t, {
+    memberBlackout: {
+      threshold: 3,
+      alerts: [{
+        accountId: 'placeholder-blackout-account',
+        provider: 'claude',
+        label: 'Blackout Placeholder',
+        consecutiveFailures: 3,
+        statusCode: 401,
+        remedy: 'Sign in again to restore proxy routing.',
+      }],
+    },
+  });
+
+  const alert = document.querySelector('.member-blackout-alert');
+  assert.ok(alert, 'the Overview renders the pool alert in its page chrome');
+  assert.equal(alert.getAttribute('role'), 'alert');
+  assert.match(alert.textContent, /Pool alert/);
+  assert.match(alert.textContent, /Blackout Placeholder: 3 routed requests failed in a row \(HTTP 401\)/);
+  assert.match(alert.textContent, /Sign in again to restore proxy routing/);
+  assert.equal(document.querySelector('.crumbs [aria-current="page"]').textContent, 'Overview');
+  assert.ok(
+    alert.compareDocumentPosition(document.querySelector('.hero')) & 4,
+    'the alert precedes the Overview content instead of hiding in a detail view',
+  );
 });
 
 test('the COST lens re-denominates the page and shows the model table with its API-rate caveat', async (t) => {

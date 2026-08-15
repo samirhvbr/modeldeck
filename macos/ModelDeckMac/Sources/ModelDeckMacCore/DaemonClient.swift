@@ -154,6 +154,21 @@ public struct DaemonClient: Sendable {
         try await get("/api/session")
     }
 
+    /// `POST /api/managed-proxy/report` — app-owned lifecycle facts for the
+    /// daemon's additive in-memory state (#432). Uses the ordinary mutation
+    /// token header + cookie; the lifecycle calls this from its serialized
+    /// fire-and-forget dispatcher.
+    public func reportManagedProxy(_ report: ManagedProxyAppReport) async throws {
+        struct Ack: Decodable {}
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "managed-proxy", "report"]
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(report)
+        let _: Ack = try await send(request)
+    }
+
     /// `POST /api/accounts/:id/activate` — switch the account's provider to
     /// it for new sessions only. Acquires a fresh session token per call so a
     /// daemon restart (which rotates ephemeral tokens) never strands us with
@@ -319,6 +334,46 @@ public struct DaemonClient: Sendable {
         // hold for up to 60s — 30 timed the client out while the daemon was
         // still legitimately queued. 60s lock hold + the write + margin.
         request.timeoutInterval = 120
+        return try await send(request)
+    }
+
+    // MARK: - In-app credential repair (issue #396)
+
+    /// `POST /api/accounts/:id/proxy-relogin` — ask the daemon to have
+    /// CLIProxyAPI start ITS OWN OAuth for this account's provider. Returns
+    /// immediately with the provider's authorize URL for the app to open; the
+    /// proxy owns the callback and writes its own auth file (#398).
+    public func startProxyRelogin(accountID: String) async throws -> ProxyReloginState {
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", accountID, "proxy-relogin"]
+        )
+        // One loopback management round trip, with room for a proxy that is
+        // busy rather than absent.
+        request.timeoutInterval = 30
+        return try await send(request)
+    }
+
+    /// `GET /api/accounts/:id/proxy-relogin` — the proxy's own verdict on the
+    /// sign-in in progress. Polled while the user is in the browser.
+    public func proxyReloginState(accountID: String) async throws -> ProxyReloginState {
+        var request = try await authorizedRequest(
+            method: "GET",
+            pathComponents: ["api", "accounts", accountID, "proxy-relogin"]
+        )
+        request.timeoutInterval = 30
+        return try await send(request)
+    }
+
+    /// `POST /api/accounts/:id/proxy-relogin/cancel` — asks the PROXY to drop
+    /// its pending session. Unlike the pool-join wait, nothing keeps running
+    /// server-side afterwards.
+    public func cancelProxyRelogin(accountID: String) async throws -> ProxyReloginState {
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", accountID, "proxy-relogin", "cancel"]
+        )
+        request.timeoutInterval = 30
         return try await send(request)
     }
 
@@ -535,5 +590,7 @@ private struct DaemonErrorBody: Decodable {
 }
 
 extension DaemonClient: AccountActivating {}
+
+extension DaemonClient: ManagedProxyReporting {}
 
 extension DaemonClient: WorstCapacityProviding {}

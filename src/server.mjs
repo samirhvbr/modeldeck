@@ -15,7 +15,7 @@ import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from 
 import {
   HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
-  CLIPROXY_AUTH_DIR, CLIPROXY_BIN, CLIPROXY_BASE_URL,
+  CLIPROXY_AUTH_DIR, CLIPROXY_BIN, CLIPROXY_BASE_URL, CLIPROXY_CONFIG_DIR,
   CLIPROXY_MANAGEMENT_KEY_PATH, LANE_MANIFEST_PATH,
 } from './paths.mjs';
 
@@ -126,6 +126,7 @@ export function createApp({
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
     cliproxyAuthDir: CLIPROXY_AUTH_DIR,
+    cliproxyConfigDir: CLIPROXY_CONFIG_DIR,
     cliproxyPath: CLIPROXY_BIN,
     cliproxyBaseUrl: CLIPROXY_BASE_URL,
     cliproxyManagementKeyPath: CLIPROXY_MANAGEMENT_KEY_PATH,
@@ -140,6 +141,10 @@ export function createApp({
   const server = http.createServer(async (req, res) => {
     try {
       const actualPort = server.address()?.port || port;
+      // Loopback-only is the supported deployment: the peer address is
+      // kernel-provided, so this holds even if MODELDECK_HOST binds wider
+      // and the (client-controlled) Host header is spoofed. Issue #436.
+      if (!loopbackPeer(req)) return json(res, 403, { error: 'loopback connections only' });
       if (!hostAllowed(req, actualPort)) return json(res, 403, { error: 'unexpected host header' });
       const url = new URL(req.url, `http://${host}:${actualPort}`);
       const otlpKind = req.method === 'POST' && url.pathname === '/otlp/v1/metrics'
@@ -150,10 +155,8 @@ export function createApp({
       if (otlpKind) {
         // Claude's exporter cannot participate in the UI session-token
         // handshake. This is the only non-GET exception, and it stays absent
-        // by default plus confined to the daemon's loopback listener/Host
-        // check above.
+        // by default plus confined by the global loopback peer check above.
         if (!ownedStore.getSettings().otelReceiverEnabled) return json(res, 404, { error: 'not found' });
-        if (!loopbackPeer(req)) return json(res, 403, { error: 'OTLP receiver accepts loopback connections only' });
         otlpJsonOnly(req);
         const parsed = otlpKind === 'metrics'
           ? parseOtlpMetrics(await body(req))
@@ -182,6 +185,12 @@ export function createApp({
         return json(res, 200, { ok: true, name: 'ModelDeck', version: VERSION, MDGitCommit: GIT_COMMIT, tokenSource, projectsRoot: ownedService.projectsRoot });
       }
       if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, await ownedService.state());
+      // Issue #432: the app owns the proxy process, so it reports lifecycle
+      // facts through the same token-gated mutation boundary as every other
+      // app write. The service keeps only the last report in memory.
+      if (req.method === 'POST' && url.pathname === '/api/managed-proxy/report') {
+        return json(res, 200, { appReport: ownedService.reportManagedProxy(await body(req)) });
+      }
       // Issue #359: every usage-analytics API route shares the dashboard's
       // kill-switch boundary. Prefix gating keeps future /api/usage/* routes
       // indistinguishable from routes that do not exist until explicitly enabled.
@@ -454,6 +463,24 @@ export function createApp({
         const account = ownedStore.getAccount(decodeURIComponent(proxyPoolJoinMatch[1]));
         if (!account) return json(res, 404, { error: 'account not found' });
         return json(res, 200, await ownedService.joinProxyPool(account.id));
+      }
+      // Issue #396: in-app repair for an expired pool credential. ModelDeck
+      // asks the PROXY to run the proxy's own OAuth (#398 — the proxy stays
+      // the sole auth-file writer); start hands back the authorize URL for
+      // the app to open, and the poll reports the proxy's own verdict.
+      const proxyReloginMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/proxy-relogin$/);
+      if (proxyReloginMatch && (req.method === 'GET' || req.method === 'POST')) {
+        const account = ownedStore.getAccount(decodeURIComponent(proxyReloginMatch[1]));
+        if (!account) return json(res, 404, { error: 'account not found' });
+        return json(res, 200, req.method === 'POST'
+          ? await ownedService.startProxyRelogin(account.id)
+          : await ownedService.proxyReloginState(account.id));
+      }
+      const proxyReloginCancelMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/proxy-relogin\/cancel$/);
+      if (req.method === 'POST' && proxyReloginCancelMatch) {
+        const account = ownedStore.getAccount(decodeURIComponent(proxyReloginCancelMatch[1]));
+        if (!account) return json(res, 404, { error: 'account not found' });
+        return json(res, 200, await ownedService.cancelProxyRelogin(account.id));
       }
       // Session routing is deliberately separate from pool membership: any
       // combination is legal. Claude-only until Codex provider routing can be

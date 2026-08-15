@@ -62,13 +62,23 @@ export const CLIPROXY_MANAGEMENT_KEY_PATH = path.resolve(
   process.env.MODELDECK_CLIPROXY_MANAGEMENT_KEY_PATH
     || path.join(os.homedir(), '.config', 'cliproxyapi', '.mgmt-key'),
 );
+// CLIProxyAPI state directory. Issue #421: the Mac app's managed proxy runs
+// against this EXACT path — the same one an external instance uses — so
+// adopting an existing install needs no credential migration (#398). The
+// daemon only reports what it can observe here; the app owns the process.
+export const CLIPROXY_CONFIG_DIR = path.resolve(
+  process.env.MODELDECK_CLIPROXY_CONFIG_DIR || path.join(os.homedir(), '.config', 'cliproxyapi'),
+);
 // CLIProxyAPI auth-file directory (an external tool's state, read-only):
 // each account file carries the routing `weight` an external rebalance job
 // maintains from live quota. The daemon only ever READS the non-secret
 // weight/identity fields to enrich /api/state; a missing directory means the
 // proxy simply isn't installed and nothing renders.
+// The default derives from CLIPROXY_CONFIG_DIR (PR #430 review): overriding
+// only the config dir must move the auth dir with it, or the daemon reports
+// on one install while reading auth metadata from another.
 export const CLIPROXY_AUTH_DIR = path.resolve(
-  process.env.MODELDECK_CLIPROXY_AUTH_DIR || path.join(os.homedir(), '.config', 'cliproxyapi', 'auth'),
+  process.env.MODELDECK_CLIPROXY_AUTH_DIR || path.join(CLIPROXY_CONFIG_DIR, 'auth'),
 );
 // Rebuildable request-usage archive owned by CLIProxyAPI's puller. The
 // backfill CLI reads it without modifying or deleting source files. Keep the

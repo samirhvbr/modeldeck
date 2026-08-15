@@ -63,6 +63,10 @@ PACKAGE_DIR="$REPO_ROOT/macos/ModelDeckMac"
 DIST_DIR="$REPO_ROOT/dist"
 DAEMON_BINARY="$DIST_DIR/daemon/modeldeckd"
 DAEMON_MANIFEST="$DIST_DIR/daemon/manifest.json"
+CLIPROXY_BINARY="$DIST_DIR/cliproxyapi/cliproxyapi"
+CLIPROXY_MANIFEST="$DIST_DIR/cliproxyapi/manifest.json"
+CLIPROXY_PIN="$REPO_ROOT/scripts/cliproxyapi-pin.json"
+CLIPROXY_PIN_HELPER="$REPO_ROOT/scripts/cliproxyapi-pin.mjs"
 # Issue #96: SMAppService agent definition registered by the app on first run.
 AGENT_PLIST="$PACKAGE_DIR/Support/ai.hermes.modeldeck.plist"
 
@@ -222,14 +226,25 @@ echo "    packaged commit: $GIT_COMMIT"
 echo "    required ref:    $RELEASE_REF"
 
 [[ -f "$REPO_ROOT/scripts/release-checks.mjs" ]] \
-  || fail "release analytics checks missing: $REPO_ROOT/scripts/release-checks.mjs"
-echo "==> release analytics checks"
+  || fail "release checks missing: $REPO_ROOT/scripts/release-checks.mjs"
+echo "==> release checks"
 node "$REPO_ROOT/scripts/release-checks.mjs" \
-  || fail "release analytics checks failed"
+  || fail "release checks failed"
+
+[[ -f "$CLIPROXY_PIN" ]] || fail "CLIProxyAPI pin missing: $CLIPROXY_PIN"
+[[ -f "$CLIPROXY_PIN_HELPER" ]] || fail "CLIProxyAPI pin validator missing: $CLIPROXY_PIN_HELPER"
+CLIPROXY_PIN_VALUES="$(node "$CLIPROXY_PIN_HELPER" values "$CLIPROXY_PIN")" \
+  || fail "CLIProxyAPI pin validation failed"
+IFS=$'\t' read -r CLIPROXY_REPOSITORY CLIPROXY_TAG CLIPROXY_COMMIT \
+  CLIPROXY_GO_VERSION CLIPROXY_GO_SHA256 CLIPROXY_BUNDLE_PATH <<< "$CLIPROXY_PIN_VALUES"
+[[ -n "$CLIPROXY_REPOSITORY" && -n "$CLIPROXY_TAG" && -n "$CLIPROXY_COMMIT" \
+   && -n "$CLIPROXY_GO_VERSION" && -n "$CLIPROXY_GO_SHA256" && -n "$CLIPROXY_BUNDLE_PATH" ]] \
+  || fail "CLIProxyAPI pin validator returned incomplete values"
 
 if [[ "$CHECK_ONLY" == 1 ]]; then
   echo "==> check-only complete; signing and build steps were not run"
   echo "    release assembly will require: $DAEMON_BINARY"
+  echo "    release assembly will require: $CLIPROXY_BINARY ($CLIPROXY_TAG at $CLIPROXY_COMMIT)"
   exit 0
 fi
 
@@ -237,6 +252,12 @@ fi
   || fail "daemon binary missing or not executable: $DAEMON_BINARY (run scripts/build-daemon-binary.sh first)"
 [[ -f "$DAEMON_MANIFEST" ]] \
   || fail "daemon manifest missing: $DAEMON_MANIFEST (run scripts/build-daemon-binary.sh first; the app's drift check needs it)"
+[[ -x "$CLIPROXY_BINARY" ]] \
+  || fail "CLIProxyAPI binary missing or not executable: $CLIPROXY_BINARY (run scripts/build-cliproxyapi.sh --fetch-go first)"
+[[ -f "$CLIPROXY_MANIFEST" ]] \
+  || fail "CLIProxyAPI manifest missing: $CLIPROXY_MANIFEST (run scripts/build-cliproxyapi.sh --fetch-go first)"
+node "$CLIPROXY_PIN_HELPER" verify-artifact "$CLIPROXY_BINARY" "$CLIPROXY_MANIFEST" "$CLIPROXY_PIN" \
+  || fail "CLIProxyAPI artifact does not match the current pin; rebuild it before release"
 [[ -f "$AGENT_PLIST" ]] \
   || fail "SMAppService agent plist missing: $AGENT_PLIST"
 
@@ -259,6 +280,8 @@ APP="$DIST_DIR/ModelDeck.app"
 DMG="$DIST_DIR/ModelDeck-$VERSION.dmg"
 STAGING="$DIST_DIR/.dmg-staging"
 NOTARY_ZIP="$DIST_DIR/.ModelDeck-notary-submit.zip"
+CLIPROXY_APP_BINARY="$(node "$CLIPROXY_PIN_HELPER" bundle-path "$APP" "$CLIPROXY_PIN")" \
+  || fail "could not resolve the pinned CLIProxyAPI bundle path"
 
 echo "==> release-dmg.sh"
 echo "    version:        $VERSION (build $BUILD_NUMBER)"
@@ -307,8 +330,8 @@ echo "==> preflight OK (identity present, notary profile accepted, Sparkle key +
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "==> dry run: would perform:"
   echo "    1. swift build -c release (package: $PACKAGE_DIR)"
-  echo "    2. assemble $APP, stage $DAEMON_BINARY in Contents/Resources/daemon/, stamp CFBundleShortVersionString=$VERSION CFBundleVersion=$BUILD_NUMBER"
-  echo "    3. codesign the nested modeldeckd binary, then the app, with --options runtime --timestamp and the identity above"
+  echo "    2. assemble $APP, stage $DAEMON_BINARY in Contents/Resources/daemon/ and pinned CLIProxyAPI at $CLIPROXY_BUNDLE_PATH, stamp CFBundleShortVersionString=$VERSION CFBundleVersion=$BUILD_NUMBER"
+  echo "    3. codesign nested CLIProxyAPI (no entitlements) + modeldeckd, then the app, with --options runtime --timestamp and the identity above"
   echo "    4. notarize the app (zip -> notarytool submit --wait), staple the app"
   echo "    5. hdiutil create $DMG (app + /Applications symlink + installer background/layout from design/dmg)"
   echo "    6. codesign the DMG, notarize (submit --wait), staple the DMG"
@@ -348,7 +371,8 @@ APP_ICON="$REPO_ROOT/design/icon/ModelDeck.icns"
 
 echo "==> assembling $APP"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/daemon"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/daemon" \
+  "$(dirname "$CLIPROXY_APP_BINARY")"
 cp "$BIN" "$APP/Contents/MacOS/ModelDeckMac"
 cp "$PACKAGE_DIR/Support/Info.plist" "$APP/Contents/Info.plist"
 # App icon (issue #82); Info.plist's CFBundleIconFile names "ModelDeck".
@@ -379,6 +403,26 @@ chmod 755 "$APP/Contents/Resources/daemon/modeldeckd"
 # Issue #96: the manifest travels with the binary — the app compares its
 # MDGitCommit against the registered-version marker to re-register on drift.
 cp "$DAEMON_MANIFEST" "$APP/Contents/Resources/daemon/manifest.json"
+# The app-relative destination is owned by cliproxyapi-pin.json. Slice C's
+# lifecycle code consumes that same authority instead of duplicating a path.
+cp "$CLIPROXY_BINARY" "$CLIPROXY_APP_BINARY"
+chmod 755 "$CLIPROXY_APP_BINARY"
+# Issue #421: the pin travels with the binary, exactly as the daemon manifest
+# does. The app resolves the proxy's location from THIS file's bundlePath —
+# one authority for the path, never a second copy hardcoded in Swift. Its own
+# resource name is the only fixed point (CLIProxyBundlePin.bundleResourceName).
+cp "$CLIPROXY_PIN" "$APP/Contents/Resources/cliproxyapi-pin.json"
+# Issue #425: third-party notices ride the shipped bundle — AppKit's standard
+# About panel renders a resource named Credits.rtf automatically, which is
+# the MIT-notice channel for the binary distribution (repo NOTICES covers
+# the source channel; release-checks gates both files' presence).
+cp "$PACKAGE_DIR/Resources/Credits.rtf" "$APP/Contents/Resources/Credits.rtf"
+# The complete notices (incl. Sparkle's vendored component licenses, whose
+# BSD terms require the full text with binary distributions) ride the bundle
+# too; Credits.rtf points readers at this file.
+cp "$REPO_ROOT/NOTICES" "$APP/Contents/Resources/NOTICES"
+[[ -s "$APP/Contents/Resources/Credits.rtf" && -s "$APP/Contents/Resources/NOTICES" ]] \
+  || fail "third-party notices failed to stage into the bundle"
 # SMAppService agent definition; BundleProgram points at the daemon above.
 mkdir -p "$APP/Contents/Library/LaunchAgents"
 cp "$AGENT_PLIST" "$APP/Contents/Library/LaunchAgents/ai.hermes.modeldeck.plist"
@@ -501,6 +545,16 @@ echo "==> codesign embedded modeldeckd (hardened runtime, timestamp)"
 codesign --force --options runtime --timestamp \
   --entitlements "$REPO_ROOT/scripts/daemon-entitlements.plist" --sign "$IDENTITY" \
   "$APP/Contents/Resources/daemon/modeldeckd"
+# #403 binding: deliberately NO --entitlements flag. Any entitlement addition
+# requires a demonstrated hardened-runtime launch failure and a recorded reason.
+echo "==> codesign embedded CLIProxyAPI (hardened runtime, timestamp, no entitlements)"
+codesign --force --options runtime --timestamp --sign "$IDENTITY" \
+  "$CLIPROXY_APP_BINARY"
+CLIPROXY_ENTITLEMENTS="$(codesign -d --entitlements :- "$CLIPROXY_APP_BINARY" 2>/dev/null || true)"
+if grep -q '<key>' <<< "$CLIPROXY_ENTITLEMENTS"; then
+  fail "embedded CLIProxyAPI unexpectedly carries entitlements; #403 requires none until a launch failure and recorded reason prove one necessary"
+fi
+codesign --verify --strict --verbose=2 "$CLIPROXY_APP_BINARY"
 # Issue #121: re-sign Sparkle's nested executables with OUR Developer ID
 # (hardened runtime — notarization requires every nested Mach-O to carry
 # it). Sparkle's documented non-sandboxed order: Autoupdate, Updater.app,

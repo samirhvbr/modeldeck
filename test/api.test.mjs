@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { Store } from '../src/db.mjs';
 import {
   CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT,
@@ -154,6 +155,34 @@ test('rejects missing mutation token, cross-origin mutations, and hostile Host h
   assert.equal(response.status, 403);
 
   assert.equal(await requestWithHost(fixture, 'attacker.example'), 403);
+});
+
+// Tripwire for issue #436: every route refuses non-loopback peers, so a
+// spoofed "Host: localhost:<port>" from a remote client can never reach the
+// GET surface (or /api/session's token handout) on a non-loopback bind.
+test('rejects non-loopback peers on GET routes despite a spoofed local Host header', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+  const port = fixture.app.server.address().port;
+  for (const route of ['/api/state', '/api/session']) {
+    const req = Object.assign(Readable.from([]), {
+      method: 'GET',
+      url: route,
+      headers: { host: `localhost:${port}` },
+      socket: { remoteAddress: '192.0.2.10' },
+    });
+    let status;
+    let payload = '';
+    const finished = new Promise((resolve) => {
+      req.res = {
+        writeHead(nextStatus) { status = nextStatus; },
+        end(chunk = '') { payload += chunk; resolve(); },
+      };
+    });
+    await Promise.all([fixture.app.server.listeners('request')[0](req, req.res), finished]);
+    assert.equal(status, 403, route);
+    assert.deepEqual(JSON.parse(payload), { error: 'loopback connections only' });
+  }
 });
 
 test('Claude renewal endpoint returns decided outcomes, 404 unknown, and 409 concurrent', async (t) => {

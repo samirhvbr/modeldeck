@@ -118,6 +118,20 @@ body {
 .filters { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 20px; }
 .filter-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); }
 
+.member-blackout-alerts { display: grid; gap: 6px; margin-bottom: 20px; }
+.member-blackout-alert {
+  display: flex; align-items: baseline; gap: 9px;
+  border: 1px solid var(--critical); border-radius: 7px;
+  background: var(--surface); color: var(--text-primary);
+  padding: 8px 10px; font-size: 12px;
+}
+.member-blackout-badge {
+  flex: none; font-size: 10px; font-weight: 700;
+  letter-spacing: 0.06em; text-transform: uppercase;
+  border-radius: 3px; padding: 1px 5px;
+  background: var(--critical); color: #fff;
+}
+
 .segmented { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
 .segmented button {
   background: transparent; border: 0; padding: 5px 11px; font: inherit; font-size: 12px;

@@ -174,6 +174,7 @@ function verifyApi(data) {
 async function verifyApiRequest(app, route, { method = 'POST', authenticated = true } = {}) {
   const req = Readable.from([]);
   Object.assign(req, {
+    socket: { remoteAddress: '127.0.0.1' },
     method,
     url: route,
     headers: {

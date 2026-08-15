@@ -102,6 +102,20 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
     /// Issue #279: whether the profile authenticates via an `apiKeyHelper`
     /// (the #263 Keychain-pointer route). Claude only, same skew contract.
     public var helperRouted: Bool?
+    /// Issue #396: CLIProxyAPI's OWN verdict on this pool member's
+    /// credential — "ok" / "error" / "disabled". Emitted only for members,
+    /// and only when the proxy's management API could actually be asked; a
+    /// machine with no management key leaves it absent, which means UNKNOWN
+    /// and renders nothing. "error" is the expired-credential state the
+    /// 2026-08-12 field incident produced.
+    public var proxyCredential: String?
+    /// The proxy's own short reason for a non-ok credential ("unauthorized").
+    public var proxyCredentialDetail: String?
+    /// Issue #396: whether the in-app repair can run for this account, and
+    /// the plain reason when it cannot (no management key — #431 — a
+    /// non-local proxy address, or an unsupported provider). Emitted only
+    /// where a pool exists at all.
+    public var proxyRelogin: ProxyReloginCapability?
 
     public init(
         id: String,
@@ -124,7 +138,10 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         proxyPool: String? = nil,
         proxyRouted: Bool? = nil,
         cliproxyRouted: Bool? = nil,
-        helperRouted: Bool? = nil
+        helperRouted: Bool? = nil,
+        proxyCredential: String? = nil,
+        proxyCredentialDetail: String? = nil,
+        proxyRelogin: ProxyReloginCapability? = nil
     ) {
         self.id = id
         self.provider = provider
@@ -147,6 +164,9 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.proxyRouted = proxyRouted
         self.cliproxyRouted = cliproxyRouted
         self.helperRouted = helperRouted
+        self.proxyCredential = proxyCredential
+        self.proxyCredentialDetail = proxyCredentialDetail
+        self.proxyRelogin = proxyRelogin
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -155,6 +175,7 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         case signinReason, claudeStatusline, renew
         case proxyWeight, proxyFableExcluded
         case proxyPool, proxyRouted, cliproxyRouted, helperRouted
+        case proxyCredential, proxyCredentialDetail, proxyRelogin
     }
 
     /// Custom decode, byte-compatible with the synthesized one for every
@@ -185,6 +206,11 @@ public struct DeckAccount: Codable, Equatable, Sendable, Identifiable {
         self.proxyRouted = (try? container.decodeIfPresent(Bool.self, forKey: .proxyRouted)) ?? nil
         self.cliproxyRouted = (try? container.decodeIfPresent(Bool.self, forKey: .cliproxyRouted)) ?? nil
         self.helperRouted = (try? container.decodeIfPresent(Bool.self, forKey: .helperRouted)) ?? nil
+        // Issue #396, same shape-tolerant contract: an older daemon omits
+        // these entirely and no repair affordance renders anywhere.
+        self.proxyCredential = (try? container.decodeIfPresent(String.self, forKey: .proxyCredential)) ?? nil
+        self.proxyCredentialDetail = (try? container.decodeIfPresent(String.self, forKey: .proxyCredentialDetail)) ?? nil
+        self.proxyRelogin = (try? container.decodeIfPresent(ProxyReloginCapability.self, forKey: .proxyRelogin)) ?? nil
     }
 
     /// Per-account health chip (issue #32): each roster row reads its OWN
@@ -751,6 +777,59 @@ public struct DeckDaemonRuntime: Codable, Equatable, Sendable {
     }
 }
 
+/// Issue #395: one enabled proxy-pool member whose chronologically latest
+/// routed requests have all failed. This carries only display-safe account and
+/// request outcome facts; credential material never enters `/api/state`.
+public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
+    public var accountId: String
+    public var provider: String
+    public var label: String
+    public var consecutiveFailures: Int
+    public var firstFailureAt: String?
+    public var lastFailureAt: String?
+    public var statusCode: Int?
+    public var remedy: String
+
+    public var id: String { accountId }
+
+    public init(
+        accountId: String,
+        provider: String,
+        label: String,
+        consecutiveFailures: Int,
+        firstFailureAt: String? = nil,
+        lastFailureAt: String? = nil,
+        statusCode: Int? = nil,
+        remedy: String = "Sign in again to restore proxy routing."
+    ) {
+        self.accountId = accountId
+        self.provider = provider
+        self.label = label
+        self.consecutiveFailures = consecutiveFailures
+        self.firstFailureAt = firstFailureAt
+        self.lastFailureAt = lastFailureAt
+        self.statusCode = statusCode
+        self.remedy = remedy
+    }
+
+    public var statusLine: String {
+        let request = consecutiveFailures == 1 ? "request" : "requests"
+        return "\(label): \(consecutiveFailures) routed \(request) failed in a row"
+    }
+}
+
+/// `/api/state.memberBlackout`. Optional on `DeckState` for daemon-version
+/// skew; an older daemon is silent rather than failing the entire state read.
+public struct MemberBlackoutStatus: Codable, Equatable, Sendable {
+    public var threshold: Int
+    public var alerts: [MemberBlackoutAlert]
+
+    public init(threshold: Int, alerts: [MemberBlackoutAlert] = []) {
+        self.threshold = threshold
+        self.alerts = alerts
+    }
+}
+
 /// `GET /api/state` — only the slices Phase 3 needs. The daemon also returns
 /// `projects` and `launches`; they are ignored here and picked up in Phase 4+.
 public struct DeckState: Codable, Equatable, Sendable {
@@ -770,6 +849,10 @@ public struct DeckState: Codable, Equatable, Sendable {
     /// contract as `activation` — absent or unexpectedly shaped reads as
     /// nil (and a nil block never triggers the missing-binary repair).
     public var daemon: DeckDaemonRuntime?
+    /// Issue #395: current routed-request blackout alerts. Optional and
+    /// shape-tolerant so older daemons render no alert without breaking the
+    /// account deck.
+    public var memberBlackout: MemberBlackoutStatus?
     /// Issue #204: the shared-user-scope feature state (`sharedScope:
     /// {enabled, lastOutcome}`). The WHOLE object is optional for
     /// daemon-version skew — the #174 claudeStatusline / #196 renew
@@ -782,6 +865,7 @@ public struct DeckState: Codable, Equatable, Sendable {
         activation: DeckActivation? = nil,
         scheduler: DeckScheduler? = nil,
         daemon: DeckDaemonRuntime? = nil,
+        memberBlackout: MemberBlackoutStatus? = nil,
         sharedScope: SharedScopeStatus? = nil
     ) {
         self.accounts = accounts
@@ -789,11 +873,12 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.activation = activation
         self.scheduler = scheduler
         self.daemon = daemon
+        self.memberBlackout = memberBlackout
         self.sharedScope = sharedScope
     }
 
     private enum CodingKeys: String, CodingKey {
-        case accounts, usage, activation, scheduler, daemon, sharedScope
+        case accounts, usage, activation, scheduler, daemon, memberBlackout, sharedScope
     }
 
     public init(from decoder: Decoder) throws {
@@ -803,6 +888,7 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.activation = try? container.decodeIfPresent(DeckActivation.self, forKey: .activation)
         self.scheduler = try? container.decodeIfPresent(DeckScheduler.self, forKey: .scheduler)
         self.daemon = try? container.decodeIfPresent(DeckDaemonRuntime.self, forKey: .daemon)
+        self.memberBlackout = try? container.decodeIfPresent(MemberBlackoutStatus.self, forKey: .memberBlackout)
         self.sharedScope = try? container.decodeIfPresent(SharedScopeStatus.self, forKey: .sharedScope)
     }
 
@@ -926,6 +1012,93 @@ public struct ProxyPoolJoin: Codable, Equatable, Sendable {
             provider: (try? container.decodeIfPresent(String.self, forKey: .provider)) ?? nil,
             proxyPool: (try? container.decodeIfPresent(String.self, forKey: .proxyPool)) ?? nil,
             alreadyMember: (try? container.decodeIfPresent(Bool.self, forKey: .alreadyMember)) ?? nil
+        )
+    }
+}
+
+/// Issue #396: whether the in-app credential repair can run, and WHY NOT
+/// when it cannot. The reason is never dropped — an unavailable action that
+/// says nothing is the exact failure the field incident produced.
+public struct ProxyReloginCapability: Codable, Equatable, Sendable {
+    public var available: Bool
+    public var reason: String?
+
+    public init(available: Bool = false, reason: String? = nil) {
+        self.available = available
+        self.reason = reason
+    }
+
+    private enum CodingKeys: String, CodingKey { case available, reason }
+
+    public init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self.init()
+            return
+        }
+        self.init(
+            available: (try? container.decodeIfPresent(Bool.self, forKey: .available)) as? Bool ?? false,
+            reason: (try? container.decodeIfPresent(String.self, forKey: .reason)) ?? nil
+        )
+    }
+}
+
+/// `POST|GET /api/accounts/:id/proxy-relogin` — the phase of the sign-in
+/// CLIProxyAPI is running for this account. `url` arrives ONCE, from the
+/// POST that starts the flow: it is the provider's own authorize page, which
+/// the app opens in a browser. The poll never repeats it.
+///
+/// Phases: `idle`, `starting`, `awaiting-browser`, `succeeded`, `failed`,
+/// `cancelled`. `detail` carries the honest failure sentence — often
+/// CLIProxyAPI's own words — and is absent on success.
+public struct ProxyReloginState: Codable, Equatable, Sendable {
+    public var accountId: String?
+    public var provider: String?
+    public var phase: String?
+    public var detail: String?
+    public var url: String?
+    /// Present only on the idle answer, mirroring the account's capability.
+    public var available: Bool?
+    public var reason: String?
+    public var cancelledUpstream: Bool?
+
+    public init(
+        accountId: String? = nil,
+        provider: String? = nil,
+        phase: String? = nil,
+        detail: String? = nil,
+        url: String? = nil,
+        available: Bool? = nil,
+        reason: String? = nil,
+        cancelledUpstream: Bool? = nil
+    ) {
+        self.accountId = accountId
+        self.provider = provider
+        self.phase = phase
+        self.detail = detail
+        self.url = url
+        self.available = available
+        self.reason = reason
+        self.cancelledUpstream = cancelledUpstream
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case accountId, provider, phase, detail, url, available, reason, cancelledUpstream
+    }
+
+    public init(from decoder: Decoder) throws {
+        guard let container = try? decoder.container(keyedBy: CodingKeys.self) else {
+            self.init()
+            return
+        }
+        self.init(
+            accountId: (try? container.decodeIfPresent(String.self, forKey: .accountId)) ?? nil,
+            provider: (try? container.decodeIfPresent(String.self, forKey: .provider)) ?? nil,
+            phase: (try? container.decodeIfPresent(String.self, forKey: .phase)) ?? nil,
+            detail: (try? container.decodeIfPresent(String.self, forKey: .detail)) ?? nil,
+            url: (try? container.decodeIfPresent(String.self, forKey: .url)) ?? nil,
+            available: (try? container.decodeIfPresent(Bool.self, forKey: .available)) ?? nil,
+            reason: (try? container.decodeIfPresent(String.self, forKey: .reason)) ?? nil,
+            cancelledUpstream: (try? container.decodeIfPresent(Bool.self, forKey: .cancelledUpstream)) ?? nil
         )
     }
 }

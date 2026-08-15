@@ -22,6 +22,8 @@ struct SettingsWindowView: View {
     @ObservedObject var renewModel: AccountRenewModel
     /// Issue #279: per-account proxy pool membership + session routing.
     @ObservedObject var proxyPoolModel: ProxyPoolModel
+    /// Issue #396: the in-app fix for an expired pool credential.
+    @ObservedObject var proxyReloginModel: ProxyReloginModel
     /// Issue #280: the seeded pill's on-demand Verify.
     @ObservedObject var identityVerifyModel: IdentityVerifyModel
     @ObservedObject var updateModel: ToolUpdateModel
@@ -34,6 +36,11 @@ struct SettingsWindowView: View {
     @ObservedObject var appUpdateInstallModel: AppUpdateInstallModel
     /// Issue #96: bundled background-service status + legacy takeover.
     @ObservedObject var daemonSetupModel: DaemonSetupModel
+    /// Issue #422: the recorded first-launch choice — revisitable here, and
+    /// only here. The launch flow never asks twice.
+    @ObservedObject var proxyOnboardingModel: ManagedProxyOnboardingModel
+    /// False in dev builds with no bundled proxy: the section stays hidden.
+    let managedProxyAvailable: Bool
     /// Shared launch-at-login state; the SMAppService status read lives in
     /// the model's load(), not in any view-struct initializer.
     @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
@@ -54,6 +61,7 @@ struct SettingsWindowView: View {
                 signInModel: signInModel,
                 renewModel: renewModel,
                 proxyPoolModel: proxyPoolModel,
+                proxyReloginModel: proxyReloginModel,
                 identityVerifyModel: identityVerifyModel
             )
             .tabItem { Label("Accounts", systemImage: "person.2") }
@@ -69,6 +77,8 @@ struct SettingsWindowView: View {
                 appUpdateAutoChecker: appUpdateAutoChecker,
                 appUpdateInstallModel: appUpdateInstallModel,
                 daemonSetupModel: daemonSetupModel,
+                proxyOnboardingModel: proxyOnboardingModel,
+                managedProxyAvailable: managedProxyAvailable,
                 launchAtLoginModel: launchAtLoginModel,
                 sharedScopeModel: sharedScopeModel
             )
@@ -105,6 +115,9 @@ struct AccountsSettingsPane: View {
     /// Issue #279: the quiet per-row proxy line (pool membership + session
     /// routing). Renders nothing at all on a machine without the proxy.
     @ObservedObject var proxyPoolModel: ProxyPoolModel
+    /// Issue #396: the in-app fix for an expired pool credential — the
+    /// remedy that used to require a hand-run terminal login.
+    @ObservedObject var proxyReloginModel: ProxyReloginModel
     /// Issue #280: Verify beside the seeded pill.
     @ObservedObject var identityVerifyModel: IdentityVerifyModel
 
@@ -261,6 +274,8 @@ struct AccountsSettingsPane: View {
             Task { await proxyPoolModel.setRouting(account: confirmation.account, enabled: true) }
         case .unroute:
             Task { await proxyPoolModel.setRouting(account: confirmation.account, enabled: false) }
+        case .fixSignIn:
+            proxyReloginModel.begin(account: confirmation.account)
         }
     }
 
@@ -319,6 +334,12 @@ struct AccountsSettingsPane: View {
             onProxyUnroute: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .unroute) },
             onProxyCancelJoin: { proxyPoolModel.cancelJoinWait(accountID: account.id) },
             onDismissProxyOutcome: { proxyPoolModel.dismissOutcome(accountID: account.id) },
+            // Issue #396: the in-app repair. Nil on a machine without the
+            // proxy or on a daemon that does not report it — same discipline.
+            relogin: proxyReloginModel.presentation(for: account),
+            onProxyFixSignIn: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .fixSignIn) },
+            onProxyCancelRelogin: { proxyReloginModel.cancel(accountID: account.id) },
+            onDismissReloginOutcome: { proxyReloginModel.dismissOutcome(accountID: account.id) },
             // Issue #280: nil unless the account is seeded (or an attempt
             // is still unanswered) — the button lives and dies with the pill.
             verify: identityVerifyModel.presentation(for: account),
@@ -368,7 +389,7 @@ struct AccountsSettingsPane: View {
 /// three actions, and the plain sentence Core wrote for it. A value type so
 /// the dialog can never drift out of sync with the row it came from.
 struct ProxyPoolConfirmation: Identifiable {
-    enum Action { case join, route, unroute }
+    enum Action { case join, route, unroute, fixSignIn }
 
     let account: DeckAccount
     let action: Action
@@ -380,6 +401,7 @@ struct ProxyPoolConfirmation: Identifiable {
         case .join: return "Add \(account.label) to the proxy pool?"
         case .route: return "Route \(account.label) sessions through the proxy?"
         case .unroute: return "Stop routing \(account.label) sessions?"
+        case .fixSignIn: return "Fix the proxy sign-in for \(account.label)?"
         }
     }
 
@@ -388,6 +410,7 @@ struct ProxyPoolConfirmation: Identifiable {
         case .join: return "Add to Pool"
         case .route: return "Route Sessions"
         case .unroute: return "Stop Routing"
+        case .fixSignIn: return "Open Sign-in"
         }
     }
 
@@ -398,6 +421,7 @@ struct ProxyPoolConfirmation: Identifiable {
         case .join: return ProxyPool.joinConfirmation(label: account.label)
         case .route: return ProxyPool.routeConfirmation(label: account.label)
         case .unroute: return ProxyPool.unrouteConfirmation(label: account.label)
+        case .fixSignIn: return ProxyRelogin.confirmation(label: account.label)
         }
     }
 }
@@ -617,6 +641,12 @@ struct AccountRosterRow: View {
     var onProxyUnroute: (() -> Void)?
     var onProxyCancelJoin: (() -> Void)?
     var onDismissProxyOutcome: (() -> Void)?
+    /// Issue #396: this row's in-app credential repair. Nil renders NOTHING
+    /// — the same discipline as `proxy` above.
+    var relogin: ProxyReloginRowPresentation?
+    var onProxyFixSignIn: (() -> Void)?
+    var onProxyCancelRelogin: (() -> Void)?
+    var onDismissReloginOutcome: (() -> Void)?
     /// Issue #280: the seeded pill's Verify affordance. Nil renders nothing.
     var verify: IdentityVerifyPresentation?
     var onVerifyIdentity: (() -> Void)?
@@ -727,6 +757,10 @@ struct AccountRosterRow: View {
             // in the same muted voice. The DECK stays calm — this surface
             // is Settings → Accounts, where managing an account is the job.
             proxyLine
+            // Issue #396: the repair line, directly under the pool line it
+            // is about. It appears only when there is something to say — a
+            // broken credential, a flow in progress, or its outcome.
+            reloginLine
         }
         .padding(.vertical, 3)
         .contentShape(Rectangle())
@@ -835,6 +869,26 @@ struct AccountRosterRow: View {
                 .disabled(isBusy)
                 .help("New sessions for this account stop going through the local proxy. "
                     + "Running sessions are never touched.")
+        }
+        // Issue #396: the repair stays reachable even for a member the proxy
+        // still believes in — the row only PROMOTES it to a visible button
+        // when the credential is actually broken. A user who knows a sign-in
+        // is stale should never have to break it first to fix it.
+        if let relogin, let onProxyFixSignIn {
+            switch relogin.display {
+            case .action:
+                Divider()
+                Button(ProxyRelogin.menuTitle, action: onProxyFixSignIn)
+                    .disabled(isBusy)
+                    .help(ProxyRelogin.confirmation(label: account.label))
+            case .unavailable(let reason):
+                Divider()
+                Button(ProxyRelogin.menuTitle) {}
+                    .disabled(true)
+                    .help(reason)
+            default:
+                EmptyView()
+            }
         }
         Button("Remove…", role: .destructive, action: onRemove)
             .disabled(isBusy)
@@ -952,6 +1006,103 @@ struct AccountRosterRow: View {
             }
             .padding(.top, 1)
         }
+    }
+
+    /// Issue #396: the in-app fix for an expired pool credential. Minimal by
+    /// design — a broken credential says so and offers ONE button, and every
+    /// calmer state (a healthy member, a repair that is merely available)
+    /// keeps the affordance in the ⋯ menu instead of adding a second control
+    /// to a quiet row.
+    @ViewBuilder
+    private var reloginLine: some View {
+        if let relogin, reloginLineIsVisible(relogin) {
+            HStack(spacing: 6) {
+                Image(systemName: "key.slash")
+                    .font(.system(size: 8.5))
+                    .foregroundStyle(.tertiary)
+                if let credentialText = relogin.credentialText {
+                    Text(credentialText)
+                        .font(.system(size: 10))
+                        .foregroundStyle(ProxyRelogin.credentialIsBroken(account) ? .orange : .secondary)
+                        .lineLimit(1)
+                        .help(reloginCredentialHelp(relogin, base: credentialText))
+                }
+                switch relogin.display {
+                case .running(let text, let canCancel):
+                    ProgressView().controlSize(.small)
+                    Text(text)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                    if canCancel, let onProxyCancelRelogin {
+                        Button("Stop", action: onProxyCancelRelogin)
+                            .controlSize(.small)
+                            .help(ProxyRelogin.cancelTooltip)
+                            .accessibilityLabel("Stop the proxy sign-in for \(account.label)")
+                    }
+                case .note(let text):
+                    reloginOutcome(text, isFailure: false)
+                case .error(let text):
+                    reloginOutcome(text, isFailure: true)
+                case .action(let prominent):
+                    if prominent, let onProxyFixSignIn {
+                        Button(ProxyRelogin.actionTitle, action: onProxyFixSignIn)
+                            .controlSize(.small)
+                            .disabled(isBusy)
+                            .help(ProxyRelogin.confirmation(label: account.label))
+                            .accessibilityLabel("Fix the proxy sign-in for \(account.label)")
+                    }
+                case .unavailable, .quiet:
+                    EmptyView()
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 1)
+        }
+    }
+
+    /// CodeRabbit (PR #435): an unavailable repair otherwise explains itself
+    /// only in the disabled ⋯ menu item — the credential line's tooltip also
+    /// carries the reason, so the broken row explains itself in place.
+    private func reloginCredentialHelp(
+        _ relogin: ProxyReloginRowPresentation,
+        base: String
+    ) -> String {
+        guard case .unavailable(let reason) = relogin.display else { return base }
+        return base + "\n" + reason
+    }
+
+    /// The line earns its space only when it carries news: a non-ok
+    /// credential, a flow in progress, or an outcome to read.
+    private func reloginLineIsVisible(_ relogin: ProxyReloginRowPresentation) -> Bool {
+        switch relogin.display {
+        case .running, .note, .error: return true
+        case .action(let prominent): return prominent || relogin.credentialText != nil
+        case .unavailable, .quiet: return relogin.credentialText != nil
+        }
+    }
+
+    /// A settled repair outcome — held until dismissed, like every other
+    /// click answer in this row (#199).
+    @ViewBuilder
+    private func reloginOutcome(_ text: String, isFailure: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: isFailure ? "exclamationmark.triangle" : "checkmark.circle")
+                .font(.system(size: 9, weight: .semibold))
+            Text(text)
+                .font(.system(size: 10))
+                .lineLimit(2)
+                .help(text)
+            if let onDismissReloginOutcome {
+                Button(action: onDismissReloginOutcome) {
+                    Image(systemName: "xmark").font(.system(size: 8))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel("Dismiss proxy sign-in result for \(account.label)")
+            }
+        }
+        .font(.system(size: 10))
+        .foregroundStyle(isFailure ? Color.orange : Color.secondary)
     }
 
     /// A settled join/routing outcome — the daemon's sentence verbatim, held
@@ -1326,6 +1477,10 @@ struct GeneralSettingsPane: View {
     /// Issue #96: bundled background-service status + the only home of the
     /// legacy-LaunchAgent takeover action.
     @ObservedObject var daemonSetupModel: DaemonSetupModel
+    /// Issue #422: the managed-proxy choice, its upgrade path from a
+    /// decline, and the "stop managing" rollback with its restore steps.
+    @ObservedObject var proxyOnboardingModel: ManagedProxyOnboardingModel
+    let managedProxyAvailable: Bool
     /// Shared with the popover gear menu — one status read at load(), one
     /// published value behind both toggles.
     @ObservedObject var launchAtLoginModel: LaunchAtLoginModel
@@ -1784,6 +1939,14 @@ struct GeneralSettingsPane: View {
             // LaunchAgent install exists this section is the ONLY place the
             // takeover can be triggered (explicit, confirmed action).
             BackgroundServiceSection(model: daemonSetupModel)
+
+            // Issue #422: the first-launch choice, revisitable — the ONLY
+            // place it can be changed after launch, and the only home of the
+            // rollback that prints the user's own launchd restore steps.
+            ManagedProxySection(
+                model: proxyOnboardingModel,
+                available: managedProxyAvailable
+            )
 
             Section {
                 Toggle("Launch at login", isOn: Binding(

@@ -43,5 +43,26 @@
 	<string>https://github.com/timharris707/modeldeck/releases/latest/download/appcast.xml</string>
 	<key>SUEnableAutomaticChecks</key>
 	<false/>
+	<!-- Issue #423 (#402(a)) — the app window's WKWebView loads the daemon's
+	     own dashboard over plain HTTP on loopback. The exception is scoped to
+	     127.0.0.1 and NOTHING else: NSAllowsArbitraryLoads (and any blanket
+	     local-networking switch) would relax ATS for every host the app can
+	     reach, which this app must never do. NSIncludesSubdomains is absent
+	     on purpose — a bare IP literal has none. Current macOS already
+	     exempts loopback from ATS, so this is the belt to that suspenders:
+	     it pins the posture for OS versions and configurations where ATS
+	     does apply, and keeps the answer from ever becoming a blanket one.
+	     Tripwire: test/mac-app-window-ats.test.mjs. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>127.0.0.1</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
 </dict>
 </plist>

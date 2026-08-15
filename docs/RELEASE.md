@@ -10,10 +10,23 @@ RELEASE_WORKTREE="$(mktemp -d)/modeldeck-release"
 git worktree add --detach "$RELEASE_WORKTREE" origin/main
 cd "$RELEASE_WORKTREE"
 npm install
+npm test
 scripts/build-daemon-binary.sh
+scripts/build-cliproxyapi.sh --fetch-go --handshake-port 18317
+npm run test:cliproxyapi-pin
 scripts/release-dmg.sh --check-only
 scripts/release-dmg.sh
+
+xcrun stapler validate dist/ModelDeck.app
+xcrun stapler validate "dist/ModelDeck-$(tr -d '\n' < VERSION).dmg"
+scripts/build-cliproxyapi.sh --handshake-only \
+  dist/ModelDeck.app/Contents/Resources/cliproxyapi/cliproxyapi \
+  --handshake-port 18318
 ```
+
+The proxy build only ever uses the checksum-verified official Go toolchain
+from the pin (`--allow-unpinned-go` is a dev-only escape hatch and never
+feeds a release artifact).
 
 For the coordinated 0.4.6 install and analytics cutover after the artifact is
 built, follow [`docs/0.4.6-GO-LIVE.md`](0.4.6-GO-LIVE.md). It is deliberately
@@ -28,7 +41,7 @@ checkout.
 ```sh
 scripts/release-dmg.sh            # the real thing
 scripts/release-dmg.sh --dry-run  # preflight + plan, builds nothing
-scripts/release-dmg.sh --check-only # repository guard + analytics release checks; no credentials/build
+scripts/release-dmg.sh --check-only # repository guard + release checks; no credentials/build
 ```
 
 Output: `dist/ModelDeck-<version>.dmg` (gitignored). The version comes
@@ -44,20 +57,121 @@ The repository guard fetches `origin`, rejects tracked changes outside
 `--allow-dirty` and `--ref <ref>` print prominent warning banners and should
 only be used when the release decision explicitly calls for them.
 
+## Bundled CLIProxyAPI
+
+[`scripts/cliproxyapi-pin.json`](../scripts/cliproxyapi-pin.json) is the one
+authority for the stock upstream repository, release tag, full commit SHA,
+pinned Go version and official-toolchain checksum, and the in-app path
+`Contents/Resources/cliproxyapi/cliproxyapi`. The build fetches that exact
+source commit and tag—never an upstream release binary—then refuses a
+floating tag, a tag/SHA mismatch, a different checked-out HEAD, or any dirty
+fetched source. The current target is darwin/arm64; universal packaging needs
+a follow-up rather than being inferred by this script.
+
+`scripts/build-cliproxyapi.sh --fetch-go --handshake-port <unused-port>` uses
+the pinned official Go archive when Go is absent, verifies its recorded
+SHA-256, builds with fixed source-derived version metadata, and signs with the
+same `MD_SIGN_IDENTITY` used by `release-dmg.sh`. It then launches the signed
+binary with isolated placeholder-only config and verifies `/healthz` plus an
+authenticated `/v0/management/config` response. `--handshake-only <binary>`
+reruns that live check without rebuilding. Port 8317 is rejected so the check
+cannot collide with the normal CLIProxyAPI service by accident. The generated
+`dist/cliproxyapi/manifest.json` binds the signed artifact's SHA-256 and build
+inputs back to the current pin; `release-dmg.sh` refuses a stale or changed
+artifact.
+
+After `release-dmg.sh` completes, exercise the exact binary that was staged,
+re-signed, and carried through notarization:
+
+```sh
+scripts/build-cliproxyapi.sh --handshake-only \
+  dist/ModelDeck.app/Contents/Resources/cliproxyapi/cliproxyapi \
+  --handshake-port 18318
+```
+
+A pin bump rides an app release; changing the embedded binary outside that
+flow would invalidate the outer signature and notarization ticket. For a bump:
+
+1. Resolve the selected upstream release tag to its full 40-character commit,
+   review its changelog/security impact, and update only the pin file (including
+   Go version/checksum if upstream changed them).
+2. Run `npm test`, build the pinned binary with the live handshake above, then
+   run the pin-bump compatibility suite with one command:
+
+   ```sh
+   npm run test:cliproxyapi-pin
+   ```
+
+   The suite discovers `MD_CLIPROXYAPI_BINARY` when set, otherwise
+   `dist/cliproxyapi/cliproxyapi`. It starts only its own placeholder-configured
+   instance on port 18319 (override with `MD_CLIPROXYAPI_TEST_PORT`; ports 8317
+   and 3867 are refused), destructively reads only that instance's empty usage
+   queue, and writes a safe live-capture receipt to
+   `dist/cliproxyapi/compatibility.json`. `release-checks.mjs` binds that receipt
+   to the current pin and exact binary SHA-256; a fixture-only pass, skipped
+   live test, stale pin, or rebuilt binary cannot ship. The CVE expedite path
+   uses the same command and gate while accelerating the app release; it does
+   not create an out-of-band binary swap.
+3. Run `release-dmg.sh` normally so the embedded binary rides the existing
+   inner-sign → app-notarize/staple → DMG-notarize/staple flow.
+
+### Upstream watch + CVE-only expedite (issue #425)
+
+Every release includes one checklist step: check the pin against upstream
+(`gh release list -R router-for-me/CLIProxyAPI` or the releases page),
+decide bump-or-hold, and record the decision — tag reviewed, verdict, one
+line of reasoning — on the release's tracking issue. "Checked v7.2.130 →
+hold, no security-relevant changes" is a complete record; the point is that
+every release either moved the pin deliberately or kept it deliberately,
+never by omission.
+
+Outside the release cadence there is exactly one reason to bump the pin: a
+security fix in the bundled binary — a published CVE or an upstream security
+advisory ("CVE-only" is this path's recorded shorthand for security-only;
+an advisory without a CVE number qualifies, a feature or bugfix release
+never does). An
+expedited bump is a normal app release in every respect — pin-file edit,
+`npm run test:cliproxyapi-pin`, full `release-dmg.sh` flow — compressed in
+calendar time, not in gates. The compatibility suite is the bar; urgency
+does not waive it, and there is no out-of-band binary-swap path (an
+unsigned swap would invalidate the notarization ticket anyway). Feature
+releases upstream wait for the next ModelDeck release.
+
+### Third-party notices (NOTICES + Credits.rtf)
+
+The bundled components' MIT notices ship through two channels that must
+both exist: the repo-root `NOTICES` file (covers the public source mirror)
+and `macos/ModelDeckMac/Resources/Credits.rtf`, which `release-dmg.sh`
+stages into the app bundle where the standard About panel renders it
+(About ModelDeck in the menu-bar icon's context menu). The full NOTICES
+file is staged into the bundle too (`Contents/Resources/NOTICES`) so the
+vendored components' complete texts travel with the binary. `release-checks.mjs`
+fails if either file is missing, empty, or lacking its required component
+markers. A pin bump that changes upstream's
+copyright/license text must update both files in the same commit.
+
+CLIProxyAPI starts with **no entitlements**: its codesign commands deliberately
+have no `--entitlements` argument. An entitlement may be added only after a
+hardened-runtime launch failure demonstrates the need and the reason is
+recorded beside the signing step. The Node/V8 daemon entitlements are not a
+precedent for this Go binary.
+
 ## What the script does
 
 1. Requires `dist/daemon/modeldeckd`, produced first with
    `scripts/build-daemon-binary.sh`. That build bundles the dependency-free
    Node daemon, embeds it in a Node >=24 single executable application,
    ad-hoc signs it, writes `dist/daemon/manifest.json`, and smoke-checks
-   `GET /api/health`.
+   `GET /api/health`. It also requires the signed pinned-source CLIProxyAPI at
+   `dist/cliproxyapi/cliproxyapi`, produced by the command above.
 2. Runs `swift build -c release` in `macos/ModelDeckMac`.
 3. Assembles `dist/ModelDeck.app` (bundle id `app.modeldeck.mac`,
    `LSUIElement` menu-bar app, macOS 14+), stages the daemon at
-   `Contents/Resources/daemon/modeldeckd`, and stamps the version.
-4. Re-signs the embedded daemon and then the app with the Developer ID
-   identity — hardened runtime
-   (`--options runtime`) and secure timestamp, as notarization requires.
+   `Contents/Resources/daemon/modeldeckd`, stages CLIProxyAPI at its pinned
+   bundle path, and stamps the version.
+4. Re-signs both embedded executables and then the app with the Developer ID
+   identity—hardened runtime (`--options runtime`) and secure timestamp, as
+   notarization requires. CLIProxyAPI is signed with no entitlements.
 5. Zips the app, submits to Apple with
    `xcrun notarytool submit --keychain-profile <profile> --wait`
    (typically 1–5 minutes), then staples the ticket to the app.

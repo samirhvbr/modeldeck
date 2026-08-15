@@ -963,6 +963,7 @@ test('a settings PUT conflict restores the prior shared-scope opt-in value', asy
     usageQueueConsumerEnabled: true,
   }))]);
   Object.assign(request, {
+    socket: { remoteAddress: '127.0.0.1' },
     method: 'PUT',
     url: '/api/settings',
     headers: {

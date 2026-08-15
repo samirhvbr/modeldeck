@@ -17,6 +17,10 @@ struct ModelDeckMacApp: App {
     /// one shared state machine so a join's wait and its outcome belong to
     /// the account, not to whichever view happens to be on screen.
     @StateObject private var proxyPoolModel: ProxyPoolModel
+    /// Issue #396: the in-app fix for an expired pool credential — the
+    /// daemon asks CLIProxyAPI to run its OWN sign-in and this model tracks
+    /// it, so the recovery never needs a hand-run terminal login again.
+    @StateObject private var proxyReloginModel: ProxyReloginModel
     /// Issue #280: the seeded pill's on-demand identity check.
     @StateObject private var identityVerifyModel: IdentityVerifyModel
     /// Issue #204: shared user scope (tools & memory across Claude
@@ -39,6 +43,13 @@ struct ModelDeckMacApp: App {
     /// Issue #96: bundled-daemon lifecycle — first-run consent, SMAppService
     /// registration, Keychain token, drift re-register, legacy takeover.
     @StateObject private var daemonSetupModel: DaemonSetupModel
+    /// Issue #421: lifecycle of the bundle-embedded CLIProxyAPI. Dev builds
+    /// without the pinned binary resolve to an unavailable state that offers
+    /// nothing; a proxy the user already runs is never touched.
+    @StateObject private var managedProxyModel: ManagedProxyModel
+    /// Issue #422: the first-launch flow — adoption offer, consent screen,
+    /// remembered choice, and the "stop managing" rollback.
+    @StateObject private var proxyOnboardingModel: ManagedProxyOnboardingModel
     /// Launch-at-login state shared by the popover gear menu and the General
     /// settings pane. The SMAppService.status XPC read happens once in the
     /// model's load() (fired from a view .task) — NEVER in a view-struct
@@ -54,6 +65,11 @@ struct ModelDeckMacApp: App {
     /// Issue #295: the floating deck's NSWindow lifecycle (open/front/
     /// close, frame autosave, close-button detection).
     private let floatingDeckController: FloatingDeckWindowController
+    /// Issue #423: the app window's ONE-window lifecycle. It owns the window
+    /// model (live loopback dashboard vs the honest daemon-down empty
+    /// state); the hosted root view observes that model directly, exactly
+    /// like the floating deck's controller owns its own window.
+    private let dashboardWindowController: DashboardWindowController
 
     init() {
         let configuration = DaemonConfiguration.resolved()
@@ -119,6 +135,13 @@ struct ModelDeckMacApp: App {
         // same shape. One shared instance each — Settings must never hold a
         // second, divergent copy of an in-flight attempt.
         let proxyPoolModel = ProxyPoolModel(manager: client, stateProvider: client)
+        // Issue #396: same shape. The browser opener is injected so the flow
+        // is testable end to end without a browser ever appearing.
+        let proxyReloginModel = ProxyReloginModel(
+            manager: client,
+            stateProvider: client,
+            browser: WorkspaceBrowserOpener()
+        )
         let identityVerifyModel = IdentityVerifyModel(verifier: client, stateProvider: client)
         // Issue #204: the daemon owns the shared-scope mechanism end to end
         // (backups, section-level merge, reversibility); the model only asks
@@ -166,6 +189,15 @@ struct ModelDeckMacApp: App {
         // /api/health probe); in dev builds without a bundled daemon manifest
         // the whole surface stays quiet.
         let daemonSetupModel = DaemonSetupModel(dependencies: .live(client: client))
+        // Issue #421: all seams live (bundled binary resolved from the
+        // cliproxyapi pin, loopback /healthz probe, guarded config writer).
+        let managedProxyModel = ManagedProxyModel(dependencies: .live(reporter: client))
+        // Issue #422: all seams live (one named management handshake for
+        // detection, launchd/process discovery for adoption, UserDefaults
+        // for the remembered choice). Nothing acts without a button press.
+        let proxyOnboardingModel = ManagedProxyOnboardingModel(
+            dependencies: .live(proxy: managedProxyModel)
+        )
         // Issue #59: the status-item context menu shares the same update
         // model as the gear menu and Settings — one check state everywhere.
         contextMenuController = MenuBarContextMenuController(
@@ -342,6 +374,12 @@ struct ModelDeckMacApp: App {
         proxyPoolModel.onStateChanged = { [weak statusModel] state in
             statusModel?.apply(deckState: state)
         }
+        // Issue #396: a completed re-login lands the daemon's fresh state,
+        // where the member's credential reads healthy again — the visible
+        // restoration, and the fact #395's alert clears on.
+        proxyReloginModel.onStateChanged = { [weak statusModel] state in
+            statusModel?.apply(deckState: state)
+        }
         // Issue #280: a verified identity is promoted daemon-side, so the
         // fresh state simply drops the seeded pill (and this button with
         // it) — the disappearance is the success feedback.
@@ -421,6 +459,50 @@ struct ModelDeckMacApp: App {
         let launchAtLoginModel = LaunchAtLoginModel()
         _launchAtLoginModel = StateObject(wrappedValue: launchAtLoginModel)
 
+        // Issue #423 (charter d2, #402(a)(c)): the app window. Its WKWebView
+        // loads the daemon's OWN /dashboard over loopback — the same URL the
+        // browser used, no second serving mechanism. The window reads the
+        // daemon health the deck already tracks (connection status + the #96
+        // setup phase), so it opens honest when the daemon is down and
+        // recovers live the moment it answers.
+        //
+        // Issue #424 (#402(b)(d)): the window is a navigation target. It
+        // reopens where the reader left it, every jump point hands it a route
+        // object the BUNDLE parses (there is no Swift-side navigator), and
+        // its requests carry the daemon's own session token as a header plus
+        // the modeldeck_session cookie — never in the URL.
+        let dashboardRouteStore = DashboardRouteStore()
+        let dashboardWindowModel = DashboardWindowModel(
+            dashboardURL: UsageAnalytics.dashboardURL(base: configuration.baseURL),
+            route: dashboardRouteStore.restored()
+        )
+        dashboardWindowModel.onRouteChanged = { dashboardRouteStore.record($0) }
+        let dashboardWindowController = DashboardWindowController(
+            model: dashboardWindowModel,
+            // The same `GET /api/session` every other client uses. A failure
+            // is not an error here: the page is a GET, and the window shows
+            // its honest empty state when the daemon is genuinely down.
+            sessionToken: { try? await client.session().token }
+        )
+        dashboardWindowController.observe(status: statusModel, setup: daemonSetupModel)
+        // The empty state's single action runs the deck's EXISTING setup
+        // paths — never a second install/start mechanism.
+        dashboardWindowModel.onStart = { [weak statusModel, weak daemonSetupModel] action in
+            Task { @MainActor in
+                switch action {
+                case .installService:
+                    await daemonSetupModel?.consentToInstall()
+                case .checkAgain:
+                    await daemonSetupModel?.retry()
+                }
+                // Re-read the daemon's cached state so a service that came
+                // up flips the window live at once. GET only — reading
+                // cached state never triggers provider polling.
+                await statusModel?.refresh()
+            }
+        }
+        self.dashboardWindowController = dashboardWindowController
+
         // Issue #295: the floating deck — same models, a second home. The
         // controller builds the floating DeckPopoverView lazily from the
         // SAME instances the popover observes (one deck's state, wherever
@@ -437,8 +519,14 @@ struct ModelDeckMacApp: App {
                 appUpdateInstallModel: appUpdateInstallModel,
                 stagedPromptModel: appUpdateStagedPrompt,
                 setupModel: daemonSetupModel,
+                proxyModel: managedProxyModel,
+                onboardingModel: proxyOnboardingModel,
                 launchAtLoginModel: launchAtLoginModel,
-                isFloating: true
+                isFloating: true,
+                onOpenDashboardWindow: {
+                    dashboardWindowController.show(jumpPoint: .usageAnalytics)
+                    Task { @MainActor in await statusModel.refresh() }
+                }
             ))
         }
         floatingDeckModel.onDetach = { floatingDeckController.show() }
@@ -455,6 +543,7 @@ struct ModelDeckMacApp: App {
         _signInModel = StateObject(wrappedValue: signInModel)
         _renewModel = StateObject(wrappedValue: renewModel)
         _proxyPoolModel = StateObject(wrappedValue: proxyPoolModel)
+        _proxyReloginModel = StateObject(wrappedValue: proxyReloginModel)
         _identityVerifyModel = StateObject(wrappedValue: identityVerifyModel)
         _sharedScopeModel = StateObject(wrappedValue: sharedScopeModel)
         _toolUpdateModel = StateObject(wrappedValue: toolUpdateModel)
@@ -465,6 +554,8 @@ struct ModelDeckMacApp: App {
         self.sparkleDriver = sparkleDriver
         _notifications = StateObject(wrappedValue: notifications)
         _daemonSetupModel = StateObject(wrappedValue: daemonSetupModel)
+        _managedProxyModel = StateObject(wrappedValue: managedProxyModel)
+        _proxyOnboardingModel = StateObject(wrappedValue: proxyOnboardingModel)
     }
 
     /// Issue #45 reopen diagnostics: log every status-bar window's frame and
@@ -508,6 +599,8 @@ struct ModelDeckMacApp: App {
                     appUpdateInstallModel: appUpdateInstallModel,
                     stagedPromptModel: appUpdateStagedPrompt,
                     setupModel: daemonSetupModel,
+                    proxyModel: managedProxyModel,
+                    onboardingModel: proxyOnboardingModel,
                     launchAtLoginModel: launchAtLoginModel,
                     onDetach: { [weak floatingDeckModel = floatingDeckModel] in
                         // Flip the mode (opens the window via the model's
@@ -515,6 +608,12 @@ struct ModelDeckMacApp: App {
                         // left — the same choke point Settings uses.
                         floatingDeckModel?.detach()
                         SettingsWindowFronting.closeDeckPopover()
+                    },
+                    // Issue #423: re-invoking this entry fronts the ONE
+                    // window instead of opening another.
+                    onOpenDashboardWindow: {
+                        dashboardWindowController.show(jumpPoint: .usageAnalytics)
+                        Task { await statusModel.refresh() }
                     }
                 )
             }
@@ -538,6 +637,26 @@ struct ModelDeckMacApp: App {
                     // the first refresh so a true first run shows the
                     // consent card, not a bare "daemon unreachable".
                     await daemonSetupModel.evaluateOnLaunch()
+                    // Issue #421: after the daemon, before the first refresh.
+                    // Starts the bundled proxy — or refuses loudly when one
+                    // is already answering — then watches for a crash.
+                    // Issue #422: NEVER silent-on. The lifecycle only runs
+                    // for a user who said yes; anyone undecided or declined
+                    // is held stopped (which also keeps the supervisor from
+                    // starting one on its monitoring tick) until they choose
+                    // — at the card below, or later in Settings.
+                    if managedProxyMayRunAtLaunch(
+                        recordedChoice: proxyOnboardingModel.choice
+                    ) {
+                        await managedProxyModel.evaluateOnLaunch()
+                    } else {
+                        await managedProxyModel.stopManaging()
+                    }
+                    managedProxyModel.startMonitoring()
+                    // Issue #422: after slice C has said what is on the port,
+                    // ask the ONE first-launch question — and only if the
+                    // user has never answered it.
+                    await proxyOnboardingModel.evaluateOnLaunch()
                     // Issue #60: honors the stored preference; no-op when
                     // automatic checks are off.
                     appUpdateAutoChecker.start()
@@ -574,12 +693,15 @@ struct ModelDeckMacApp: App {
                 signInModel: signInModel,
                 renewModel: renewModel,
                 proxyPoolModel: proxyPoolModel,
+                proxyReloginModel: proxyReloginModel,
                 identityVerifyModel: identityVerifyModel,
                 updateModel: toolUpdateModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateAutoChecker: appUpdateAutoChecker,
                 appUpdateInstallModel: appUpdateInstallModel,
                 daemonSetupModel: daemonSetupModel,
+                proxyOnboardingModel: proxyOnboardingModel,
+                managedProxyAvailable: managedProxyModel.isAvailable,
                 launchAtLoginModel: launchAtLoginModel,
                 sharedScopeModel: sharedScopeModel
             )

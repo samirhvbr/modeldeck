@@ -126,6 +126,7 @@ test('TRIPWIRE: settings API immediately reschedules warehouse ingest when analy
   const app = createApp({ store, service, host: '127.0.0.1', port, mutationToken: token });
   const request = Readable.from([Buffer.from(JSON.stringify({ usageAnalyticsEnabled: false }))]);
   Object.assign(request, {
+    socket: { remoteAddress: '127.0.0.1' },
     method: 'PUT',
     url: '/api/settings',
     headers: {
