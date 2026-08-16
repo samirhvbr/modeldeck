@@ -12,6 +12,87 @@ import {
 import { parseArgs, usageText } from '../scripts/ingest-transcripts.mjs';
 
 const fixtureDirectory = fileURLToPath(new URL('./fixtures/claude-transcripts', import.meta.url));
+const subagentLabelsFixtureDirectory = fileURLToPath(
+  new URL('./fixtures/claude-subagent-labels', import.meta.url),
+);
+const multiAgentResultsFixtureDirectory = fileURLToPath(
+  new URL('./fixtures/claude-multi-agent-results', import.meta.url),
+);
+
+function bumpMtime(file) {
+  const stat = fs.statSync(file);
+  fs.utimesSync(file, stat.atime, new Date(stat.mtimeMs + 2_000));
+}
+
+test('tripwire: transcript ingest keeps typed and source-fallback subagent labels', async (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+
+  const summary = await ingestTranscriptArchive({
+    store,
+    directory: subagentLabelsFixtureDirectory,
+    machine: 'placeholder-machine',
+  });
+  assert.equal(summary.subagents, 3);
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT agent_id, agent_type FROM transcript_subagents ORDER BY agent_id
+    `).all().map((row) => ({ agentId: row.agent_id, agentType: row.agent_type })),
+    [
+      { agentId: 'description-placeholder', agentType: 'description: placeholder description fallback' },
+      { agentId: 'prompt-placeholder', agentType: 'prompt: placeholder prompt fallback' },
+      { agentId: 'typed-placeholder', agentType: 'placeholder-typed-agent' },
+    ],
+  );
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT DISTINCT agent_id FROM transcript_requests WHERE is_sidechain = 1 ORDER BY agent_id
+    `).all().map((row) => row.agent_id),
+    ['description-placeholder', 'prompt-placeholder', 'typed-placeholder'],
+  );
+
+  const replay = await ingestTranscriptArchive({
+    store,
+    directory: subagentLabelsFixtureDirectory,
+    machine: 'placeholder-machine',
+  });
+  assert.equal(replay.subagents, 0);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM transcript_subagents').get().count, 3);
+});
+
+test('tool results in one record keep their block-specific agent IDs', async (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+
+  const summary = await ingestTranscriptArchive({
+    store,
+    directory: multiAgentResultsFixtureDirectory,
+    machine: 'placeholder-machine',
+  });
+
+  assert.equal(summary.subagents, 2);
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT agent_id, agent_type, total_tokens FROM transcript_subagents ORDER BY agent_id
+    `).all().map((row) => ({
+      agentId: row.agent_id,
+      agentType: row.agent_type,
+      totalTokens: row.total_tokens,
+    })),
+    [
+      {
+        agentId: 'agent-multi-placeholder-a',
+        agentType: 'placeholder-agent-type-a',
+        totalTokens: null,
+      },
+      {
+        agentId: 'agent-multi-placeholder-b',
+        agentType: 'placeholder-agent-type-b',
+        totalTokens: null,
+      },
+    ],
+  );
+});
 
 test('Claude transcript ingest handles both eras, dedupes API calls, and single-counts subagents', async (t) => {
   const store = new Store(':memory:');
@@ -28,6 +109,7 @@ test('Claude transcript ingest handles both eras, dedupes API calls, and single-
   assert.deepEqual(first, {
     profiles: 2,
     files: 3,
+    filesSkipped: 0,
     sessions: 2,
     requests: 5,
     subagents: 1,
@@ -138,16 +220,119 @@ test('Claude transcript ingest handles both eras, dedupes API calls, and single-
   assert.deepEqual(second, {
     profiles: 2,
     files: 3,
+    filesSkipped: 3,
     sessions: 0,
     requests: 0,
     subagents: 0,
     skills: 0,
-    warnings: 1,
+    warnings: 0,
   });
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM transcript_sessions').get().count, 2);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM transcript_requests').get().count, 5);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM transcript_subagents').get().count, 1);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM transcript_skill_events').get().count, 2);
+});
+
+test('TRIPWIRE #476: transcript ingest skips unchanged files and re-parses only appended or shrunk files', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-transcript-incremental-'));
+  fs.cpSync(fixtureDirectory, root, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const currentFile = path.join(
+    root,
+    'profile-placeholder-02',
+    'projects',
+    '-workspace-placeholder',
+    'session-current-placeholder.jsonl',
+  );
+  const oldFile = path.join(
+    root,
+    'profile-placeholder-01',
+    'projects',
+    '-workspace-placeholder',
+    'session-old-placeholder.jsonl',
+  );
+
+  await ingestTranscriptArchive({ store, directory: root, machine: 'placeholder-machine' });
+
+  await t.test('unchanged second pass performs zero parses and zero row updates', async () => {
+    const changesBefore = store.db.prepare('SELECT total_changes() AS count').get().count;
+    const summary = await ingestTranscriptArchive({
+      store,
+      directory: root,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.files, 3);
+    assert.equal(summary.filesSkipped, 3, 'every enumerated file is skipped before parsing');
+    assert.equal(summary.sessions, 0);
+    assert.equal(summary.requests, 0);
+    assert.equal(store.db.prepare('SELECT total_changes() AS count').get().count, changesBefore);
+  });
+
+  await t.test('append plus mtime bump re-parses exactly one file and lands the new request', async () => {
+    const appendedRecord = {
+      type: 'assistant',
+      sessionId: 'session-current-placeholder',
+      cwd: '/workspace/placeholder-project',
+      uuid: 'record-incremental-placeholder',
+      timestamp: '2026-08-08T12:01:00.000Z',
+      message: {
+        id: 'message-incremental-placeholder',
+        model: 'claude-placeholder-current',
+        content: [{ type: 'text', text: 'placeholder incremental request' }],
+        usage: { input_tokens: 2, output_tokens: 1 },
+      },
+    };
+    fs.appendFileSync(currentFile, `${JSON.stringify(appendedRecord)}\n`);
+    bumpMtime(currentFile);
+
+    const summary = await ingestTranscriptArchive({
+      store,
+      directory: root,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 2);
+    assert.equal(summary.requests, 1);
+    assert.equal(
+      store.db.prepare('SELECT COUNT(*) AS count FROM transcript_requests WHERE message_id = ?')
+        .get('message-incremental-placeholder').count,
+      1,
+    );
+  });
+
+  await t.test('shrunk file re-ingests from scratch without rewriting unchanged rows', async () => {
+    store.db.exec(`
+      CREATE TABLE transcript_update_audit(table_name TEXT NOT NULL);
+      CREATE TRIGGER transcript_session_update_audit
+      AFTER UPDATE ON transcript_sessions
+      BEGIN
+        INSERT INTO transcript_update_audit(table_name) VALUES ('session');
+      END;
+      CREATE TRIGGER transcript_subagent_update_audit
+      AFTER UPDATE ON transcript_subagents
+      BEGIN
+        INSERT INTO transcript_update_audit(table_name) VALUES ('subagent');
+      END;
+    `);
+    const lines = fs.readFileSync(oldFile, 'utf8').trimEnd().split('\n');
+    fs.writeFileSync(oldFile, `${lines.slice(0, -1).join('\n')}\n`);
+    bumpMtime(oldFile);
+
+    const summary = await ingestTranscriptArchive({
+      store,
+      directory: root,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 2);
+    assert.equal(summary.sessions, 0);
+    assert.equal(summary.requests, 0);
+    assert.equal(
+      store.db.prepare('SELECT COUNT(*) AS count FROM transcript_update_audit').get().count,
+      0,
+      'the full-file replay issues no no-op session or subagent updates',
+    );
+  });
 });
 
 test('blank custom titles still block later last-prompt titles', (t) => {

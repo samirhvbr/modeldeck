@@ -304,6 +304,7 @@ in sync with it:
 - `docs/incidents/`
 - `scripts/lane-codex.sh`
 - `scripts/lane-watch.mjs`
+- `test/lane-codex-args.test.mjs`
 - `design/mac-app-roadmap.md`
 - The scrub-pattern file named by `MD_SCRUB_PATTERNS` when it is inside the
   source repository.

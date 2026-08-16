@@ -187,7 +187,7 @@ final class SharedScopeTests: XCTestCase {
     func testDisableOutcomePresentation() {
         let outcome = SharedScopeOutcome(enabled: false)
         XCTAssertEqual(SharedScope.presentation(for: outcome).headline,
-                       "Sharing is off — each account's own MCP servers and memory are restored.")
+                       "Sharing is off — each subscription's own MCP servers and memory are restored.")
     }
 
     func testDisableOutcomeWithSkippedEntriesRendersThem() {
@@ -203,7 +203,7 @@ final class SharedScopeTests: XCTestCase {
         )
         let presentation = SharedScope.presentation(for: outcome)
         XCTAssertEqual(presentation.headline,
-                       "Sharing is off — each account's own MCP servers and memory are restored.")
+                       "Sharing is off — each subscription's own MCP servers and memory are restored.")
         XCTAssertEqual(presentation.skippedLines,
                        ["Skipped profile config — deferred — file was being rewritten"])
     }

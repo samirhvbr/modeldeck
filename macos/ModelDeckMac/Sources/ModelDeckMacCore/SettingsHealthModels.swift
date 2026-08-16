@@ -268,8 +268,8 @@ public final class AccountSignInModel: ObservableObject {
             _ = try await activator.activateAccount(id: prior)
             return true
         } catch {
-            errors[accountID] = "The previously active account could not be restored — "
-                + "re-activate it from Settings → Accounts. "
+            errors[accountID] = "The previously active subscription could not be restored — "
+                + "re-activate it from Settings → Subscriptions. "
                 + "(\(SettingsSyncModel.message(for: error)))"
             return false
         }
@@ -299,7 +299,7 @@ public final class AccountSignInModel: ObservableObject {
     /// Core so the message ships with the mechanism it explains (and stays
     /// testable beside it).
     public static let duplicateReloginUnresolvedMessage =
-        "Re-login didn't start: this account no longer matches the duplicate "
+        "Re-login didn't start: this subscription no longer matches the duplicate "
         + "warning (it may have been resolved or removed). Refresh the deck "
         + "if the warning persists."
 

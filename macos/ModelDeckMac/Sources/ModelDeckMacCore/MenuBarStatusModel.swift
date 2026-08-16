@@ -538,14 +538,14 @@ public final class MenuBarStatusModel: ObservableObject {
     public struct FooterStatus: Equatable, Sendable {
         /// Tooltip for the healthy age line — nothing stale.
         public static let freshTooltip =
-            "Age of the oldest account's newest provider-reported usage"
+            "Age of the oldest subscription's newest provider-reported usage"
         /// Tooltip for the amber line — unexplained staleness (issue #168:
         /// the alarm's ONLY remaining trigger).
         public static let staleTooltip =
             "Usage data is older than expected — Refresh forces a fresh provider poll."
         /// Tooltip for the neutral explained-staleness summary (issue #168).
         public static let explainedTooltip =
-            "Idle, signed-out, or Keychain-blocked accounts pause their usage data; live accounts are up to date. Click for details."
+            "Idle, signed-out, or Keychain-blocked subscriptions pause their usage data; live subscriptions are up to date. Click for details."
 
         public var text: String
         public var isStale: Bool
@@ -571,7 +571,7 @@ public final class MenuBarStatusModel: ObservableObject {
     /// unexplained staleness. When every stale enabled account's age is
     /// explained by its card state (idle-decay #149, signed-out #114/#164,
     /// Keychain-blocked #98), the footer renders a neutral summary instead
-    /// ("Live accounts current · 3 idle") — an idle deck surviving Refresh
+    /// ("Live subscriptions current · 3 idle") — an idle deck surviving Refresh
     /// is expected behavior, not a contradiction.
     public func footerStatus(now: Date? = nil) -> FooterStatus? {
         let now = now ?? clock()

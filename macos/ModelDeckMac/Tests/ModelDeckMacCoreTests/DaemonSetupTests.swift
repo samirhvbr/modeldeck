@@ -1003,7 +1003,7 @@ final class KeychainPromptCoachingTests: XCTestCase {
 
     func testCoachingCopyCarriesTheLoadBearingGuidance() {
         XCTAssertTrue(SystemPromptCoaching.keychainBody.contains("Always Allow"))
-        XCTAssertTrue(SystemPromptCoaching.keychainBody.contains("one prompt per account"))
+        XCTAssertTrue(SystemPromptCoaching.keychainBody.contains("one prompt per subscription"))
         XCTAssertTrue(SystemPromptCoaching.keychainBody.contains("from macOS itself"))
         XCTAssertTrue(SystemPromptCoaching.keychainBody.contains("won't re-prompt"))
         XCTAssertTrue(SystemPromptCoaching.loginItemsConsentNote.contains("macOS, not ModelDeck"))

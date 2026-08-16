@@ -830,6 +830,133 @@ public struct MemberBlackoutStatus: Codable, Equatable, Sendable {
     }
 }
 
+/// Issue #377: one live Claude Code session that fell to a weaker model
+/// mid-flight. Carries what it fell FROM, why, and when that model returns —
+/// display-safe session facts only, no transcript content.
+public struct ModelDropAlert: Codable, Equatable, Sendable, Identifiable {
+    public var sessionId: String
+    public var accountId: String
+    public var accountLabel: String
+    public var fromModel: String
+    public var fromModelDisplay: String?
+    public var toModel: String
+    public var toModelDisplay: String?
+    public var droppedAt: String?
+    public var cwd: String?
+    /// "quota-exhausted" when the from-model's own weekly window was spent;
+    /// "unknown" when ModelDeck cannot prove the cause. Never guessed.
+    public var reason: String
+    public var windowScope: String?
+    public var windowUsedPercent: Double?
+    public var returnsAt: String?
+    /// Whether the from-model is believed available again right now.
+    public var available: Bool
+    public var remedy: String
+
+    public var id: String { "\(accountId):\(sessionId)" }
+
+    public init(
+        sessionId: String,
+        accountId: String,
+        accountLabel: String,
+        fromModel: String,
+        fromModelDisplay: String? = nil,
+        toModel: String,
+        toModelDisplay: String? = nil,
+        droppedAt: String? = nil,
+        cwd: String? = nil,
+        reason: String = "unknown",
+        windowScope: String? = nil,
+        windowUsedPercent: Double? = nil,
+        returnsAt: String? = nil,
+        available: Bool = false,
+        remedy: String = ""
+    ) {
+        self.sessionId = sessionId
+        self.accountId = accountId
+        self.accountLabel = accountLabel
+        self.fromModel = fromModel
+        self.fromModelDisplay = fromModelDisplay
+        self.toModel = toModel
+        self.toModelDisplay = toModelDisplay
+        self.droppedAt = droppedAt
+        self.cwd = cwd
+        self.reason = reason
+        self.windowScope = windowScope
+        self.windowUsedPercent = windowUsedPercent
+        self.returnsAt = returnsAt
+        self.available = available
+        self.remedy = remedy
+    }
+
+    /// Prefer the provider's own display name; fall back to the raw id so the
+    /// notice is never blank for a model ModelDeck has not seen before.
+    public var fromName: String { fromModelDisplay ?? fromModel }
+    public var toName: String { toModelDisplay ?? toModel }
+
+    /// Line 1 — WHAT happened, named plainly.
+    public var headline: String {
+        "\(accountLabel) session dropped \(fromName) → \(toName)"
+    }
+
+    /// Line 2 — WHY, and WHEN the model comes back. Says so when it doesn't
+    /// know; an invented cause would be worse than none.
+    public var explanation: String {
+        guard reason == "quota-exhausted", let scope = windowScope else {
+            return "Reason unknown — the model changed with no spent window to explain it."
+        }
+        let percent = windowUsedPercent.map { " (\(Int($0.rounded()))% used)" } ?? ""
+        guard let returnsAt, let date = ModelDropAlert.parseTimestamp(returnsAt) else {
+            return "The \(scope) window is spent\(percent)."
+        }
+        // CodeRabbit (PR #472): a fixed "EEE h:mm a" forces a 12-hour clock and
+        // a fixed field order on everyone. The "j" skeleton resolves to the
+        // hour symbol the user's own locale and clock preference call for, so a
+        // 24-hour machine reads "Tue 17:00" with no stray AM/PM. The locale is
+        // assigned BEFORE the template, which is what makes the template
+        // resolve against it.
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.setLocalizedDateFormatFromTemplate("EEE jmm")
+        return "The \(scope) window is spent\(percent). \(fromName) returns \(formatter.string(from: date))."
+    }
+
+    static func parseTimestamp(_ iso: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return withFraction.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
+    }
+
+    // CodeRabbit (PR #472): the deck's header stack does not scroll, so an
+    // unbounded list of drop banners could push the account content off screen.
+    // Tim runs many concurrent lanes on one subscription, so "many at once" is
+    // his normal, not an edge case. Render a few and count the rest.
+    public static let maxRenderedBanners = 3
+
+    public static func rendered(_ drops: [ModelDropAlert]) -> [ModelDropAlert] {
+        Array(drops.prefix(maxRenderedBanners))
+    }
+
+    /// The "and N more" line, or nil when everything is on screen.
+    public static func overflowLine(_ drops: [ModelDropAlert]) -> String? {
+        let hidden = drops.count - maxRenderedBanners
+        guard hidden > 0 else { return nil }
+        return "\(hidden) more session\(hidden == 1 ? "" : "s") dropped their model."
+    }
+}
+
+/// `/api/state.modelDrop`. Optional on `DeckState` for daemon-version skew,
+/// same contract as `memberBlackout`.
+public struct ModelDropStatus: Codable, Equatable, Sendable {
+    public var quotaPercent: Double
+    public var drops: [ModelDropAlert]
+
+    public init(quotaPercent: Double, drops: [ModelDropAlert] = []) {
+        self.quotaPercent = quotaPercent
+        self.drops = drops
+    }
+}
+
 /// `GET /api/state` — only the slices Phase 3 needs. The daemon also returns
 /// `projects` and `launches`; they are ignored here and picked up in Phase 4+.
 public struct DeckState: Codable, Equatable, Sendable {
@@ -853,6 +980,9 @@ public struct DeckState: Codable, Equatable, Sendable {
     /// shape-tolerant so older daemons render no alert without breaking the
     /// account deck.
     public var memberBlackout: MemberBlackoutStatus?
+    /// Issue #377: live mid-session model drops. Same optional, shape-
+    /// tolerant contract as `memberBlackout` above.
+    public var modelDrop: ModelDropStatus?
     /// Issue #204: the shared-user-scope feature state (`sharedScope:
     /// {enabled, lastOutcome}`). The WHOLE object is optional for
     /// daemon-version skew — the #174 claudeStatusline / #196 renew
@@ -866,6 +996,7 @@ public struct DeckState: Codable, Equatable, Sendable {
         scheduler: DeckScheduler? = nil,
         daemon: DeckDaemonRuntime? = nil,
         memberBlackout: MemberBlackoutStatus? = nil,
+        modelDrop: ModelDropStatus? = nil,
         sharedScope: SharedScopeStatus? = nil
     ) {
         self.accounts = accounts
@@ -874,11 +1005,12 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.scheduler = scheduler
         self.daemon = daemon
         self.memberBlackout = memberBlackout
+        self.modelDrop = modelDrop
         self.sharedScope = sharedScope
     }
 
     private enum CodingKeys: String, CodingKey {
-        case accounts, usage, activation, scheduler, daemon, memberBlackout, sharedScope
+        case accounts, usage, activation, scheduler, daemon, memberBlackout, modelDrop, sharedScope
     }
 
     public init(from decoder: Decoder) throws {
@@ -889,6 +1021,7 @@ public struct DeckState: Codable, Equatable, Sendable {
         self.scheduler = try? container.decodeIfPresent(DeckScheduler.self, forKey: .scheduler)
         self.daemon = try? container.decodeIfPresent(DeckDaemonRuntime.self, forKey: .daemon)
         self.memberBlackout = try? container.decodeIfPresent(MemberBlackoutStatus.self, forKey: .memberBlackout)
+        self.modelDrop = try? container.decodeIfPresent(ModelDropStatus.self, forKey: .modelDrop)
         self.sharedScope = try? container.decodeIfPresent(SharedScopeStatus.self, forKey: .sharedScope)
     }
 

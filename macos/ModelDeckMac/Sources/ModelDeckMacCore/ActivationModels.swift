@@ -95,7 +95,7 @@ public enum ActiveIndicator: Equatable, Sendable {
                 + "a one-time migration is needed first")
         case .mismatched:
             return .pending(caption: "Selected as active, but the active link "
-                + "points at a different account")
+                + "points at a different subscription")
         case .unlinked:
             return .pending(caption: "Selected as active, but not in effect yet — "
                 + "no active link exists")
@@ -134,7 +134,7 @@ public enum DuplicateTokenMarker {
     /// running sessions).
     public static func reloginHint(label: String, providerName: String) -> String {
         "Re-log in opens \(providerName)'s own login for \(label). "
-            + "Re-logging either duplicate under its correct account clears both."
+            + "Re-logging either duplicate under its own login clears both."
     }
 }
 
@@ -174,21 +174,21 @@ public struct ActivationNotice: Equatable, Identifiable, Sendable {
         case .effective, .unknown:
             return nil
         case .blocked:
-            return "\(name) usage tracking is accurate today, but switching accounts "
+            return "\(name) usage tracking is accurate today, but switching subscriptions "
                 + "isn't in effect yet — a one-time migration is needed before "
                 + "activation can take hold."
         case .mismatched:
             return "\(name) usage tracking is accurate today, but the active link "
-                + "points at a different account than the one marked active, so "
-                + "switching accounts hasn't taken hold."
+                + "points at a different subscription than the one marked active, so "
+                + "switching subscriptions hasn't taken hold."
         case .unlinked:
             // Issue #61: unlinked is the post-migration "ready" state (the
             // blocker directory is gone) — say so, and point at the button.
             return "\(name) usage tracking is accurate today, and the path is clear — "
-                + "use Complete Activation on the active account to finish switching."
+                + "use Complete Activation on the active subscription to finish switching."
         case .identityMismatch:
             return "\(name) usage tracking is accurate today, but the provider is "
-                + "signed in as a different identity than the active account — "
+                + "signed in as a different identity than the active subscription — "
                 + "log out and run /login as that account."
         case .identityUnverified:
             // Soft state (fresh profile, or secure storage unreadable) — the

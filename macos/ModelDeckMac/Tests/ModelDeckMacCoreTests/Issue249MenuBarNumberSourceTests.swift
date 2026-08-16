@@ -46,7 +46,7 @@ struct MenuBarPercentSourceTests {
         #expect(m.menuBarPercentSource == WorstRemaining(percent: 36, accountId: "c1", scope: "5h"))
         let line = m.menuBarNumberSourceLine
         #expect(line?.text == "Menu bar 36% — Studio · 5-hour limit")
-        #expect(line?.tooltip.contains("follows the active account") == true)
+        #expect(line?.tooltip.contains("follows the active subscription") == true)
         #expect(line?.tooltip.contains("limit window") == false)
         #expect(line?.tooltip.contains("Studio's 5-hour limit") == true)
     }
@@ -57,7 +57,7 @@ struct MenuBarPercentSourceTests {
         m.apply(deckState: fieldState)
         let line = m.menuBarNumberSourceLine
         #expect(line?.text == "Menu bar 36% — Studio · 5-hour limit")
-        #expect(line?.tooltip.contains("pinned to this account") == true)
+        #expect(line?.tooltip.contains("pinned to this subscription") == true)
         #expect(line?.tooltip.contains("Right-click its card to unpin") == true)
     }
 
@@ -70,7 +70,7 @@ struct MenuBarPercentSourceTests {
         #expect(m.menuBarPercentSource == WorstRemaining(percent: 18, accountId: "c2", scope: "5h"))
         let line = m.menuBarNumberSourceLine
         #expect(line?.text == "Menu bar 18% — Client · 5-hour limit")
-        #expect(line?.tooltip.contains("lowest % left across every account") == true)
+        #expect(line?.tooltip.contains("lowest % left across every subscription") == true)
     }
 
     @Test func unresolvablePinFallsBackWithHonestCopy() {
@@ -189,7 +189,7 @@ struct CheckmarkWindowSuffixTests {
             accountID: "c1",
             windowTitle: "5-hour limit"
         )
-        #expect(tooltip == "Shown in the menu bar — currently the lowest % left across accounts. "
+        #expect(tooltip == "Shown in the menu bar — currently the lowest % left across subscriptions. "
             + "Its 5-hour limit is the number in the menu bar.")
     }
 
@@ -199,7 +199,7 @@ struct CheckmarkWindowSuffixTests {
         let unpinned = MenuBarSourceResolver.checkmarkTooltip(
             pinnedSetting: nil, resolvedPinnedAccountID: nil, accountID: "c1"
         )
-        #expect(unpinned == "Shown in the menu bar — currently the lowest % left across accounts")
+        #expect(unpinned == "Shown in the menu bar — currently the lowest % left across subscriptions")
         let pinned = MenuBarSourceResolver.checkmarkTooltip(
             pinnedSetting: "c1", resolvedPinnedAccountID: "c1", accountID: "c1"
         )
@@ -207,11 +207,11 @@ struct CheckmarkWindowSuffixTests {
         let active = MenuBarSourceResolver.checkmarkTooltip(
             pinnedSetting: "active:claude", resolvedPinnedAccountID: "c1", accountID: "c1"
         )
-        #expect(active == "Shown in the menu bar — following the active account")
+        #expect(active == "Shown in the menu bar — following the active subscription")
         let fallback = MenuBarSourceResolver.checkmarkTooltip(
             pinnedSetting: "acct-gone", resolvedPinnedAccountID: nil, accountID: "c1"
         )
         #expect(fallback == "Shown in the menu bar — the pinned selection isn't available, "
-            + "so the lowest % left across accounts is shown")
+            + "so the lowest % left across subscriptions is shown")
     }
 }

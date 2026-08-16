@@ -23,9 +23,9 @@ struct Issue45RegressionTests {
     private static let stateJSON = """
     {
       "accounts": [
-        {"id": "acct-a", "provider": "claude", "label": "Account A", "identity": "", "purpose": "", "profileRef": "/tmp/profiles/a", "color": "#d97757", "enabled": true, "isDefault": true, "metadata": {"claudePlan": {"subscriptionType": null, "rateLimitTier": "default_claude_max_20x"}}, "createdAt": "2026-07-20T04:57:52.148Z", "updatedAt": "2026-07-20T06:00:32.880Z", "authState": "ok"},
-        {"id": "acct-b", "provider": "claude", "label": "Account B", "identity": "", "purpose": "", "profileRef": "/tmp/profiles/b", "color": "#d97757", "enabled": true, "isDefault": false, "metadata": {"claudePlan": {"subscriptionType": null, "rateLimitTier": "default_claude_max_20x"}}, "createdAt": "2026-07-20T04:57:52.166Z", "updatedAt": "2026-07-20T06:00:32.881Z", "authState": "ok"},
-        {"id": "acct-c", "provider": "codex", "label": "Account C", "identity": "", "purpose": "", "profileRef": "/tmp/profiles/c", "color": "#48a868", "enabled": true, "isDefault": true, "metadata": {"codexPlan": {"planType": "pro", "displayName": "Pro"}}, "createdAt": "2026-07-20T04:57:52.222Z", "updatedAt": "2026-07-20T07:55:38.014Z", "authState": "ok"}
+        {"id": "acct-a", "provider": "claude", "label": "Subscription A", "identity": "", "purpose": "", "profileRef": "/tmp/profiles/a", "color": "#d97757", "enabled": true, "isDefault": true, "metadata": {"claudePlan": {"subscriptionType": null, "rateLimitTier": "default_claude_max_20x"}}, "createdAt": "2026-07-20T04:57:52.148Z", "updatedAt": "2026-07-20T06:00:32.880Z", "authState": "ok"},
+        {"id": "acct-b", "provider": "claude", "label": "Subscription B", "identity": "", "purpose": "", "profileRef": "/tmp/profiles/b", "color": "#d97757", "enabled": true, "isDefault": false, "metadata": {"claudePlan": {"subscriptionType": null, "rateLimitTier": "default_claude_max_20x"}}, "createdAt": "2026-07-20T04:57:52.166Z", "updatedAt": "2026-07-20T06:00:32.881Z", "authState": "ok"},
+        {"id": "acct-c", "provider": "codex", "label": "Subscription C", "identity": "", "purpose": "", "profileRef": "/tmp/profiles/c", "color": "#48a868", "enabled": true, "isDefault": true, "metadata": {"codexPlan": {"planType": "pro", "displayName": "Pro"}}, "createdAt": "2026-07-20T04:57:52.222Z", "updatedAt": "2026-07-20T07:55:38.014Z", "authState": "ok"}
       ],
       "usage": [
         {"accountId": "acct-a", "scope": "5-hour", "usedPercent": 0, "remainingPercent": 100, "resetsAt": null, "observedAt": "2026-07-20T08:28:24.034Z", "source": "claude-oauth-api", "stale": false, "detail": {}},
@@ -49,7 +49,7 @@ struct Issue45RegressionTests {
 
     /// The live `/api/capacity/worst` at repro time (labels placeholdered).
     private static let worstJSON = """
-    {"status": "critical", "iconState": "red", "worst": {"accountId": "acct-b", "accountLabel": "Account B", "provider": "claude", "scope": "Fable weekly", "remainingPercent": 3, "resetsAt": "2026-07-22T05:59:59.968Z", "observedAt": "2026-07-20T08:28:24.072Z"}, "thresholdPercent": 20, "criticalPercent": 10, "notify": true, "accountsEvaluated": 7, "windowsEvaluated": 18, "excluded": [{"accountId": "acct-a", "scope": "spend", "reason": "spend scope deprioritized"}], "checkedAt": "2026-07-20T08:31:44.477Z"}
+    {"status": "critical", "iconState": "red", "worst": {"accountId": "acct-b", "accountLabel": "Subscription B", "provider": "claude", "scope": "Fable weekly", "remainingPercent": 3, "resetsAt": "2026-07-22T05:59:59.968Z", "observedAt": "2026-07-20T08:28:24.072Z"}, "thresholdPercent": 20, "criticalPercent": 10, "notify": true, "accountsEvaluated": 7, "windowsEvaluated": 18, "excluded": [{"accountId": "acct-a", "scope": "spend", "reason": "spend scope deprioritized"}], "checkedAt": "2026-07-20T08:31:44.477Z"}
     """
 
     private func decodedState() throws -> DeckState {

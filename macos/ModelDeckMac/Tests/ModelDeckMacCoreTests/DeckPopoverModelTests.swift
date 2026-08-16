@@ -105,7 +105,7 @@ struct DeckBuilderTests {
         #expect(columns[1].provider == .codex)
         #expect(columns[0].rows.map(\.id) == ["c1", "c2", "c3"])
         #expect(columns[1].rows.map(\.id) == ["x2", "x1"])
-        #expect(columns[0].accountCountText == "3 accounts")
+        #expect(columns[0].subscriptionCountText == "3 subscriptions")
     }
 
     // Issue #43: the Reset sort keys on the DISPLAYED binding (worst)
@@ -931,7 +931,7 @@ struct DeckPopoverModelTests {
             usage: []
         )
         #expect(DeckPopoverModel.isDeckEmpty(state: disabledOnly, layout: layout, now: now),
-            "disabled accounts render no rows — the fresh-install CTA must still show")
+            "disabled subscriptions render no rows — the fresh-install CTA must still show")
     }
 
     // CodeRabbit on PR #232: an enabled unknown-provider account is omitted
@@ -998,7 +998,7 @@ struct DeckPopoverModelTests {
         let columnIDs = model.columns(for: state, now: now).flatMap { $0.rows.map(\.id) }
         model.layout = .singleColumn
         let listIDs = model.interleavedRows(for: state, now: now).map(\.id)
-        #expect(Set(columnIDs) == Set(listIDs), "both layouts render the same accounts")
+        #expect(Set(columnIDs) == Set(listIDs), "both layouts render the same subscriptions")
     }
 
     @Test func sortOrderAppliesToBothLayouts() {
@@ -1759,7 +1759,7 @@ struct SilentActivationOutcomeTests {
     }
 }
 
-@Suite("Menu bar pin from the deck cards (account percentage picker)")
+@Suite("Menu bar pin from the deck cards (subscription percentage picker)")
 @MainActor
 struct DeckMenuBarPinTests {
     private func freshDefaults() -> UserDefaults {

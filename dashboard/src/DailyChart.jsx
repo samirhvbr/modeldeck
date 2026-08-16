@@ -3,7 +3,7 @@ import {
   Area, Bar, Brush, CartesianGrid, ComposedChart, DefaultZIndexes, ResponsiveContainer,
   Tooltip, XAxis, YAxis, ZIndexLayer,
 } from 'recharts';
-import { formatDayShort, formatHourShort, formatSubs, formatUsd } from './format.js';
+import { formatDayShort, formatHourOnly, formatHourShort, formatSubs, formatUsd } from './format.js';
 import { Legend, Why } from './ui.jsx';
 
 /*
@@ -98,6 +98,28 @@ export function BandCursor({ points, top, left, width, height, buckets, fill, cl
       />
     </ZIndexLayer>
   );
+}
+
+/*
+ * THE AXIS LABEL: granularity matches the visible span (issue #447). Hour
+ * buckets whose whole span sits inside one calendar day print the hour alone —
+ * the date is the same on every tick there, so it only crowds the axis, and it
+ * is already carried by the range control and the hover readout. A span that
+ * crosses midnight keeps its date, which is what makes an hourly axis over
+ * several days placeable at all (#369).
+ *
+ * The date is dropped by NOT FORMATTING ONE rather than by stripping it back
+ * out of a formatted string: the previous `.replace(/^.*?, /, '')` matched the
+ * comma ICU used to put between date and hour, and current ICU writes "Aug 14
+ * at 12 AM" — so in the shipped app the strip matched nothing and every tick
+ * kept its date. Exported (like stackKey above) so the regression test can hold
+ * the rule over a whole day of buckets, not just the ticks a layout survives.
+ */
+export function tickLabeler(buckets, resolution) {
+  if (resolution !== 'hour') return formatDayShort;
+  const spansOneDay = buckets.length > 0
+    && String(buckets[0]).slice(0, 10) === String(buckets[buckets.length - 1]).slice(0, 10);
+  return spansOneDay ? formatHourOnly : formatHourShort;
 }
 
 // A readout lists at most this many series before the rest become one row.
@@ -241,9 +263,7 @@ export default function DailyChart({
       <CartesianGrid stroke="var(--grid)" strokeWidth={1} vertical={false} />
       <XAxis
         dataKey="bucket"
-        tickFormatter={(value) => (formatTick ? formatTick(value)
-          : resolution === 'hour' ? formatHourShort(value).replace(/^.*?, /, '')
-            : formatDayShort(value))}
+        tickFormatter={formatTick || tickLabeler(buckets, resolution)}
         tick={{ fill: 'var(--text-muted)', fontSize: 11 }}
         axisLine={{ stroke: 'var(--baseline)' }}
         tickLine={false}

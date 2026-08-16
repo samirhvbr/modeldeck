@@ -237,9 +237,11 @@ function SectionFilter({ name, filter }) {
         />
       ) : null}
       {showAccount ? (
+        // A section whose name already carries the noun ("By subscription")
+        // labels its picker "… filter" — never "By subscription subscription".
         <select
           className="pick"
-          aria-label={name + ' account'}
+          aria-label={/subscription/i.test(name) ? name + ' filter' : name + ' subscription'}
           value={filter.account}
           onChange={(event) => filter.setAccount(event.target.value)}
         >
@@ -315,7 +317,7 @@ function Headroom({ model }) {
           </div>
           <div className="hero-sub">
             {hot.length} at or above 80% used
-            <Why text="Headroom is per ACCOUNT here. The landing answers the pool question — can I start heavy work now — and this page is where the reader asks which subscription is the one that is nearly out." />
+            <Why text="Headroom is per SUBSCRIPTION here. The landing answers the pool question — can I start heavy work now — and this page is where the reader asks which subscription is the one that is nearly out." />
           </div>
         </div>
       </section>
@@ -324,7 +326,7 @@ function Headroom({ model }) {
         <div className="card-head">
           <h2 className="card-title">
             By subscription
-            <Why text="Each account's own measured burn over this range, and its current level. Nested weekly limits describe the same requests, so only the limit that moved most is counted — they are never summed. The column adds up to the figure beside this title exactly, filtered or not." />
+            <Why text="Each subscription's own measured burn over this range, and its current level. Nested weekly limits describe the same requests, so only the limit that moved most is counted — they are never summed. The column adds up to the figure beside this title exactly, filtered or not." />
           </h2>
           <span className="card-note">
             {formatSubs(total)}
@@ -348,7 +350,7 @@ function Headroom({ model }) {
             {rows.length === 0 ? (
               <tr>
                 <td colSpan={5} className="empty">
-                  {bySub.narrowed ? 'No subscriptions match this filter.' : 'No enabled accounts in this scope.'}
+                  {bySub.narrowed ? 'No subscriptions match this filter.' : 'No enabled subscriptions in this scope.'}
                 </td>
               </tr>
             ) : rows.map((row, index) => {
@@ -378,7 +380,7 @@ function Headroom({ model }) {
         <div className="card-head">
           <h2 className="card-title">
             Every weekly limit
-            <Why text="One row per limit, not per account: an account carries an account-wide weekly limit and a model-scoped one, and the binding constraint is often the model-scoped one. These rows are NOT summable — the same requests count against more than one of them — so no total is printed." />
+            <Why text="One row per limit, not per subscription: a subscription carries a subscription-wide weekly limit and a model-scoped one, and the binding constraint is often the model-scoped one. These rows are NOT summable — the same requests count against more than one of them — so no total is printed." />
           </h2>
           <span className="card-note">
             {byLimit.narrowed

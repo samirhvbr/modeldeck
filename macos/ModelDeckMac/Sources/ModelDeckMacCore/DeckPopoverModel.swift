@@ -703,19 +703,22 @@ public struct DeckColumn: Equatable, Identifiable, Sendable {
     /// Issue #315 (generalized by #319): how many of this column's accounts
     /// the hide/show system is currently hiding, whatever the mode. Purely
     /// presentational bookkeeping so the header count can keep telling the
-    /// truth about the ROSTER ("7 accounts" over 4 visible rows is the
+    /// truth about the ROSTER ("7 subscriptions" over 4 visible rows is the
     /// deliberate, minimal hint that the filter is on — Tim's suggestion on
     /// the issue; no banner).
     public var hiddenAccountCount: Int
 
     public var id: String { provider.rawValue }
     public var title: String { provider.displayName }
-    public var accountCountText: String {
+    /// Issue #458 (Tim's design amendment): the header line reads
+    /// "7 subscriptions · 341% left", so this half says SUBSCRIPTIONS. Issue
+    /// #459 then swept the rest of the app's user-facing copy to match.
+    public var subscriptionCountText: String {
         // Issue #315: counts ALL of the provider's deck accounts, hidden
         // ones included — hiding is visual, and the count not shrinking is
         // the quiet cue that rows are filtered, not gone.
         let total = rows.count + hiddenAccountCount
-        return total == 1 ? "1 account" : "\(total) accounts"
+        return total == 1 ? "1 subscription" : "\(total) subscriptions"
     }
 
     public init(provider: DeckProvider, rows: [DeckAccountRow], hiddenAccountCount: Int = 0) {
@@ -1545,13 +1548,13 @@ public final class DeckPopoverModel: ObservableObject {
 
     // MARK: Add account from the deck (issue #226)
 
-    /// Issue #226: true while a deck-initiated "Add Account…" request is
+    /// Issue #226: true while a deck-initiated "Add Subscription…" request is
     /// waiting for Settings → Accounts to pick it up. Published so the pane
     /// can react the moment the request lands even when the Settings window
     /// is already open on the Accounts tab (no onAppear fires then).
     @Published public private(set) var pendingAddAccountRequest = false
 
-    /// The deck's "Add Account…" path (both the fresh-install CTA and the
+    /// The deck's "Add Subscription…" path (both the fresh-install CTA and the
     /// populated footer affordance): routes Settings to the Accounts pane —
     /// same navigation contract as `requestSignInAgain` — and marks the
     /// pending request the pane consumes to present its EXISTING
@@ -1838,7 +1841,7 @@ public final class DeckPopoverModel: ObservableObject {
 
         public var displayName: String {
             switch self {
-            case .byAccount: return "By account"
+            case .byAccount: return "By subscription"
             case .byRemaining: return "By remaining"
             case .byZeroWeightings: return "By zero weightings"
             }
@@ -2121,19 +2124,19 @@ public final class DeckPopoverModel: ObservableObject {
     /// the sentence and the controls cannot drift apart. These four shapes
     /// are the prototype-validated, Tim-confirmed verbatim patterns.
     public static let byRemainingRenewalCriterionCaption =
-        "Hides accounts with a known reset outside the window."
+        "Hides subscriptions with a known reset outside the window."
 
     public var byRemainingCaption: String {
         let threshold = hideRemainingThreshold.displayName
         switch (hideRemainingThresholdEnabled, hideRenewingSoonEnabled) {
         case (true, true):
-            return "Accounts with \(threshold) or more remaining AND renewing within "
+            return "Subscriptions with \(threshold) or more remaining AND renewing within "
                 + "\(hideResetsHorizon.displayName) stay visible."
         case (true, false):
-            return "Accounts with \(threshold) or more remaining stay visible. "
+            return "Subscriptions with \(threshold) or more remaining stay visible. "
                 + "Everything else is hidden."
         case (false, true):
-            return "Accounts renewing within \(hideResetsHorizon.displayName) stay visible. "
+            return "Subscriptions renewing within \(hideResetsHorizon.displayName) stay visible. "
                 + "Everything else is hidden."
         case (false, false):
             return "No filters active — nothing is hidden."
@@ -2142,7 +2145,7 @@ public final class DeckPopoverModel: ObservableObject {
 
     public var byRemainingMissingDataCaption: String? {
         guard hideRemainingThresholdEnabled || hideRenewingSoonEnabled else { return nil }
-        return "Accounts with missing data stay visible."
+        return "Subscriptions with missing data stay visible."
     }
 
     /// Whether this row's DISPLAYED binding has a real absolute reset in the
@@ -2288,23 +2291,23 @@ public final class DeckPopoverModel: ObservableObject {
     ) -> String {
         switch mode {
         case .byAccount:
-            return "Right-click any account to hide it."
+            return "Right-click any subscription to hide it."
         case .byRemaining:
             switch (remainingThresholdEnabled, renewingSoonEnabled) {
             case (true, true):
-                return "No accounts are hidden by your \(remainingThreshold.displayName) "
+                return "No subscriptions are hidden by your \(remainingThreshold.displayName) "
                     + "remaining and \(resetsHorizon.filterAdjective) renewal filters."
             case (true, false):
-                return "No accounts are hidden by your \(remainingThreshold.displayName) "
+                return "No subscriptions are hidden by your \(remainingThreshold.displayName) "
                     + "remaining filter."
             case (false, true):
-                return "No accounts are hidden by your \(resetsHorizon.filterAdjective) "
+                return "No subscriptions are hidden by your \(resetsHorizon.filterAdjective) "
                     + "renewal filter."
             case (false, false):
                 return "No filters are active."
             }
         case .byZeroWeightings:
-            return "No accounts are at zero weight right now."
+            return "No subscriptions are at zero weight right now."
         }
     }
 
@@ -2881,7 +2884,7 @@ public final class DeckPopoverModel: ObservableObject {
     static func activationMessage(for error: Error) -> String {
         switch error {
         case DeckActivationError.verificationFailed:
-            return "Switch not confirmed — the daemon still reports the previous account."
+            return "Switch not confirmed — the daemon still reports the previous subscription."
         case DaemonClientError.daemonError(let message, _),
              DaemonClientError.daemonCodedError(let message, _, _):
             return "Couldn't activate: \(message)"

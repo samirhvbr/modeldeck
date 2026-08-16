@@ -102,7 +102,7 @@ private func poolFixture() -> DeckState {
     )
 }
 
-@Suite("Issue #319 Hide/Show Accounts")
+@Suite("Issue #319 Hide/Show Subscriptions")
 @MainActor
 struct Issue319HideShowTests {
     private func freshDefaults() -> UserDefaults {
@@ -301,7 +301,7 @@ struct Issue319HideShowTests {
         let claude = claudeColumn(model, resetsFixture())
         #expect(Set(claude.rows.map(\.id)) == ["r1", "r3", "r4"])
         #expect(claude.hiddenAccountCount == 2)
-        #expect(claude.accountCountText == "5 accounts",
+        #expect(claude.subscriptionCountText == "5 subscriptions",
                 "the count keeps stating the roster total")
     }
 
@@ -361,7 +361,7 @@ struct Issue319HideShowTests {
         var claude = claudeColumn(model, state)
         #expect(Set(claude.rows.map(\.id)) == ["r1", "r2", "r3", "r4"])
         #expect(claude.hiddenAccountCount == 1)
-        #expect(claude.accountCountText == "5 accounts")
+        #expect(claude.subscriptionCountText == "5 subscriptions")
 
         // Renewal alone uses its rolling window and exempts r4's unknown
         // reset instead of inventing a failure.
@@ -395,7 +395,7 @@ struct Issue319HideShowTests {
         model.setManualVisibility(.hidden, for: "r1")
         let claude = claudeColumn(model, resetsFixture())
         #expect(!claude.rows.map(\.id).contains("r1"),
-                "a manual Hide hides an account even when its active criterion passes")
+                "a manual Hide hides a subscription even when its active criterion passes")
         #expect(Set(claude.rows.map(\.id)) == ["r2", "r3", "r4"])
         #expect(claude.hiddenAccountCount == 2)
     }
@@ -407,7 +407,7 @@ struct Issue319HideShowTests {
         model.setManualVisibility(.shown, for: "r5")
         let claude = claudeColumn(model, resetsFixture())
         #expect(claude.rows.map(\.id).contains("r5"),
-                "a manual Show pins an account visible when its active criterion fails")
+                "a manual Show pins a subscription visible when its active criterion fails")
         #expect(Set(claude.rows.map(\.id)) == ["r1", "r2", "r3", "r4", "r5"])
     }
 
@@ -448,7 +448,7 @@ struct Issue319HideShowTests {
         model.toggleManualVisibility(row("r2", in: state), now: now)
         #expect(model.manuallyHiddenAccountIDs.isEmpty)
         #expect(model.manuallyShownAccountIDs.isEmpty,
-                "By-account Show clears, it does not pin")
+                "By-subscription Show clears, it does not pin")
         #expect(!model.manualToggleOffersShow(row("r2", in: state), now: now))
     }
 
@@ -464,7 +464,7 @@ struct Issue319HideShowTests {
         model.hideMode = .byAccount
         model.setManualVisibility(.hidden, for: "r2")
         model.toggleManualVisibility(row("r2", in: state), now: now) // Show
-        #expect(model.manualVisibility(for: "r2") == nil, "By-account Show neutralizes")
+        #expect(model.manualVisibility(for: "r2") == nil, "By-subscription Show neutralizes")
     }
 
     @Test func byAccountShowIsTheEscapeHatchForAStalePin() {
@@ -478,7 +478,7 @@ struct Issue319HideShowTests {
         #expect(model.manuallyShownAccountIDs == ["r5"])
         model.hideMode = .byAccount
         #expect(!model.manualToggleOffersShow(row("r5", in: state), now: now),
-                "a pinned row is visible in By account, so the line reads Hide")
+                "a pinned row is visible in By subscription, so the line reads Hide")
         model.toggleManualVisibility(row("r5", in: state), now: now) // Hide
         #expect(model.manualVisibility(for: "r5") == .hidden)
         model.toggleManualVisibility(row("r5", in: state), now: now) // Show
@@ -619,7 +619,7 @@ struct Issue319HideShowTests {
         let claude = claudeColumn(model, state)
         #expect(claude.rows.isEmpty)
         #expect(claude.hiddenAccountCount == 5)
-        #expect(claude.accountCountText == "5 accounts")
+        #expect(claude.subscriptionCountText == "5 subscriptions")
         #expect(model.isHidingAnyRow(state: state, now: now),
                 "the footer eye reads eye.slash — the visible way back")
         model.toggleHideShowSystem()
@@ -658,7 +658,7 @@ struct Issue319HideShowTests {
 
             let worst = WorstRemainingCalculator.worstRemaining(in: probeState, now: now)
             #expect(worst?.accountId == hiddenID,
-                    "\(mode): the hidden account still drives the menu-bar number")
+                    "\(mode): the hidden subscription still drives the menu-bar number")
             #expect(MenuBarSourceResolver.sourceAccountID(
                 pinnedSetting: nil, state: probeState, worstRemaining: worst) == hiddenID)
             #expect(Set(DeckBuilder.rows(state: probeState, now: now).map(\.id))

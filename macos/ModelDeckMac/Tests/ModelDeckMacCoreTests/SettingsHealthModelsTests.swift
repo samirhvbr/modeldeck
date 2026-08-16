@@ -7,7 +7,7 @@ import Testing
 
 // MARK: - Per-account chip mapping
 
-@Suite("Per-account health chips (issue #32)")
+@Suite("Per-subscription health chips (issue #32)")
 struct PerAccountHealthChipTests {
     @Test func authStatesMapToChipsPerAccount() {
         #expect(DeckAccount(id: "a", provider: "claude", label: "Deck One", authState: "ok").healthChip == .healthy)
@@ -174,7 +174,7 @@ final class StubSignInBackend: AccountReauthenticating, DeckStateProviding, Logi
     }
 }
 
-@Suite("Account sign-in-again model (issue #32)")
+@Suite("Subscription sign-in-again model (issue #32)")
 @MainActor
 struct AccountSignInModelTests {
     private var account: DeckAccount {

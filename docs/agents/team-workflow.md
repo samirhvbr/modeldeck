@@ -40,6 +40,7 @@ Every pack skill says "the decider"; this line is where the role resolves. Sessi
 - **Decision maps**: `docs/<scope>-decision-map.md` (e.g. `docs/full-app-1.0-decision-map.md`)
 - **Research findings**: `docs/research/`
 - **Domain/context docs agents should load**: `docs/lane-routing-policy.md` (orchestration), `.claude/handoff.md` (session state — tracked in this repo by design, see Accepted drift)
+- **Anthropic-model use is ask-first** per shared conduct rule 13 (`~/.claude-shared/agent-conduct.md`, Tim-confirmed 2026-08-15, modeldeck#376): recorded standing authorizations satisfy the ask — in this repo that is `docs/lane-routing-policy.md` and Tim rulings recorded on issues/decision records; anything not recorded asks first, and dev/mechanical work defaults to the cheapest capable non-Anthropic model
 
 ## Precedence & exemptions
 

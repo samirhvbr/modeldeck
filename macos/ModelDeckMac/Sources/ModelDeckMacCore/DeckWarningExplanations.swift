@@ -168,13 +168,13 @@ extension DeckFreshness {
         autoRefreshInterval: TimeInterval
     ) -> DeckWarningExplanation {
         let title = "Data freshness"
-        let agedLead = "This is the age of the OLDEST account's newest "
-            + "provider-reported data — one lagging account sets this number "
+        let agedLead = "This is the age of the OLDEST subscription's newest "
+            + "provider-reported data — one lagging subscription sets this number "
             + "even while the others refresh."
         guard let state, !state.accounts.isEmpty else {
             return DeckWarningExplanation(
                 title: title,
-                body: "\(agedLead)\n\nNo account data has arrived yet."
+                body: "\(agedLead)\n\nNo subscription data has arrived yet."
             )
         }
         // Issue #168: one shared classification with the footer line itself
@@ -188,7 +188,7 @@ extension DeckFreshness {
         guard !breakdown.stale.isEmpty else {
             return DeckWarningExplanation(
                 title: title,
-                body: "\(agedLead)\n\nAll accounts are currently fresh."
+                body: "\(agedLead)\n\nAll subscriptions are currently fresh."
             )
         }
         // Neutral state gets a calm lead (nothing here is lagging — it is
@@ -198,12 +198,12 @@ extension DeckFreshness {
         // signed out — when one is present the lead must say so.
         let hasKeychainBlocked = breakdown.stale.contains { $0.reason == .keychainAccess }
         let explainedLead = hasKeychainBlocked
-            ? "Live accounts are refreshing normally. Idle or signed-out "
-                + "accounts pause their usage data until they're next used "
-                + "or signed in; accounts waiting on Keychain access resume "
+            ? "Live subscriptions are refreshing normally. Idle or signed-out "
+                + "subscriptions pause their usage data until they're next used "
+                + "or signed in; subscriptions waiting on Keychain access resume "
                 + "once it's granted."
-            : "Live accounts are refreshing normally. Idle or signed-out "
-                + "accounts pause their usage data until they're next used "
+            : "Live subscriptions are refreshing normally. Idle or signed-out "
+                + "subscriptions pause their usage data until they're next used "
                 + "or signed in."
         let lead = breakdown.allExplained ? explainedLead : agedLead
         let header = breakdown.allExplained ? "Paused:" : "Waiting on:"

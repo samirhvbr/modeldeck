@@ -75,6 +75,13 @@ export function formatHourShort(key) {
   return date.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric' });
 }
 
+/** The hour alone — "3 AM". For an axis whose whole span sits in one day. */
+export function formatHourOnly(key) {
+  const date = parseLocalKey(key);
+  if (!date) return String(key);
+  return date.toLocaleString('en-US', { hour: 'numeric' });
+}
+
 export function formatClock(iso) {
   if (!iso) return '—';
   const date = new Date(iso);

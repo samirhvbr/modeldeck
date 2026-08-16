@@ -166,7 +166,7 @@ struct MenuBarSourceResolverTests {
             resolvedPinnedAccountID: "c1",
             accountID: "c1"
         )
-        #expect(tooltip.contains("following the active account"))
+        #expect(tooltip.contains("following the active subscription"))
     }
 
     @Test func tooltipIsHonestAboutTheFallbackWhenThePinDidNotResolve() {

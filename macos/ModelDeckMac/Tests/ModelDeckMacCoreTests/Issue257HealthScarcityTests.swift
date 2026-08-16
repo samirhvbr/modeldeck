@@ -179,12 +179,22 @@ struct HealthScarcityTests {
         // The runway sentence ("you could sustain N× your pace") reads as an
         // all-clear beside four near-empty cards — that was the complaint.
         #expect(p.readout.contains("usable right now"))
-        #expect(p.readout.contains("2 of 6 accounts"))
+        #expect(p.readout.contains("2 of 6 subscriptions"))
         #expect(p.readout.contains("sustain") == false)
         // And the fact list states the reachable number beside the raw pool.
         let usable = p.section(AvailabilityHealthPresentation.SectionTitle.now)?.row("Usable")
-        #expect(usable?.value.contains("2 of 6 accounts") == true)
-        #expect(usable?.value.hasSuffix(" accounts") == true)
+        #expect(usable?.value.contains("2 of 6 subscriptions") == true)
+        #expect(usable?.value.hasSuffix(" subscriptions") == true)
+    }
+
+    @Test func aOneSubscriptionPoolReadsSingular() {
+        // Review finding: a single-member deck said "0 of 1 subscriptions".
+        let r = AvailabilityHealthEngine.report(
+            for: .claude, state: claudeState([("c1", "max_20x", 2, 40, 100)]), now: fixedNow
+        )
+        let p = AvailabilityHealthPresentation.make(report: r, now: fixedNow)
+        let usable = p.section(AvailabilityHealthPresentation.SectionTitle.now)?.row("Usable")
+        #expect(usable?.value.hasSuffix("0 of 1 subscription") == true)
     }
 }
 

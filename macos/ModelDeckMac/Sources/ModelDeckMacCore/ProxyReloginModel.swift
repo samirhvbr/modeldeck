@@ -119,7 +119,7 @@ public enum ProxyRelogin {
     public static let startingText = "Asking the proxy to start a sign-in…"
     public static let awaitingBrowserText = "Finish the sign-in in your browser…"
     public static let succeededText =
-        "Signed in again. The proxy is using this account once more."
+        "Signed in again. The proxy is using this subscription once more."
     public static let cancelledText = "Sign-in stopped. Nothing changed."
     public static let cancelTooltip =
         "Stop the sign-in. The proxy drops it too, so nothing keeps waiting."

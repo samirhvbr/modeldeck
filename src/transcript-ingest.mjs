@@ -13,6 +13,12 @@ function text(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function firstLine(value) {
+  return typeof value === 'string'
+    ? value.split(/\r?\n/u).map((line) => line.trim()).find(Boolean) || null
+    : null;
+}
+
 function nonNegativeInteger(value, fallback = 0) {
   if (value === undefined || value === null || value === '') return fallback;
   const number = typeof value === 'number' ? value : Number(value);
@@ -218,6 +224,8 @@ function agentInvocation(block) {
   return {
     toolUseId,
     agentType: text(input.subagent_type) || text(input.agentType) || text(input.agent_type),
+    description: firstLine(input.description),
+    prompt: firstLine(input.prompt),
     requestedModel: text(input.model),
   };
 }
@@ -227,6 +235,20 @@ function toolResultIds(message) {
     .filter((block) => block?.type === 'tool_result')
     .map((block) => text(block.tool_use_id))
     .filter(Boolean);
+}
+
+function toolResultAgentId(block) {
+  if (block?.type !== 'tool_result') return null;
+  const values = typeof block.content === 'string'
+    ? [block.content]
+    : Array.isArray(block.content)
+      ? block.content.map((part) => part?.text).filter((value) => typeof value === 'string')
+      : [];
+  let agentId = null;
+  for (const value of values) {
+    for (const match of value.matchAll(/^\s*agentId:\s*(\S+)/gmu)) agentId = text(match[1]);
+  }
+  return agentId;
 }
 
 function resolvedModel(result, invocation) {
@@ -245,15 +267,26 @@ function toolStatsJson(result) {
   return totalToolUseCount == null ? null : JSON.stringify({ totalToolUseCount });
 }
 
-function subagentRollup(record, file, sessionId, timestamp, invocation) {
-  const result = object(record.toolUseResult || record.tool_use_result);
-  const agentId = text(result.agentId) || text(result.agent_id);
+function recordedAgentLabel(result, invocation) {
+  const agentType = text(result.agentType) || text(result.agent_type) || invocation?.agentType;
+  if (agentType) return agentType;
+  const description = firstLine(result.description) || invocation?.description;
+  if (description) return `description: ${description}`;
+  const prompt = firstLine(result.prompt) || invocation?.prompt;
+  return prompt ? `prompt: ${prompt}` : null;
+}
+
+function subagentRollup(record, file, sessionId, timestamp, invocation, linkedAgentId = null, useRecordResult = true) {
+  const result = useRecordResult ? object(record.toolUseResult || record.tool_use_result) : {};
+  const agentId = text(linkedAgentId) || text(result.agentId) || text(result.agent_id);
   if (!agentId) return null;
   return {
     agentId,
     sessionId,
     profileSlug: file.profileSlug,
-    agentType: text(result.agentType) || text(result.agent_type) || invocation?.agentType || null,
+    // Prefix fallback text with its source so agent_type never implies that
+    // Claude supplied a real type when the spawn style did not record one.
+    agentType: recordedAgentLabel(result, invocation),
     resolvedModel: resolvedModel(result, invocation),
     totalTokens: optionalNonNegativeInteger(result.totalTokens ?? result.total_tokens),
     toolStatsJson: toolStatsJson(result),
@@ -308,6 +341,7 @@ export async function ingestTranscriptArchive({
   const summary = {
     profiles: enumeration.profiles,
     files: enumeration.files.length,
+    filesSkipped: 0,
     sessions: 0,
     requests: 0,
     subagents: 0,
@@ -324,7 +358,15 @@ export async function ingestTranscriptArchive({
   }
 
   for (const file of enumeration.files) {
+    const fileStat = fs.statSync(file.path);
+    const ingestState = store.getIngestFileState(file.path);
+    if (ingestState?.size === fileStat.size && ingestState.mtimeMs === fileStat.mtimeMs
+      && ingestState.ino === fileStat.ino) {
+      summary.filesSkipped += 1;
+      continue;
+    }
     let queuedFileSubagent = false;
+    let fileAgentId = file.agentId;
     const input = fs.createReadStream(file.path, { encoding: 'utf8', highWaterMark: 1024 * 1024 });
     const lines = readline.createInterface({ input, crlfDelay: Number.POSITIVE_INFINITY });
     let lineNumber = 0;
@@ -349,11 +391,16 @@ export async function ingestTranscriptArchive({
         const timestamp = canonicalTimestamp(record.timestamp);
         queueSession(batch, sessionRecord(record, file, text(machine), sessionId, timestamp));
 
-        if (file.isSubagent && file.agentId && !queuedFileSubagent) {
+        if (file.isSubagent) {
+          fileAgentId = text(record.agentId) || text(record.agent_id) || fileAgentId;
+        }
+        const currentFile = fileAgentId === file.agentId ? file : { ...file, agentId: fileAgentId };
+
+        if (currentFile.isSubagent && currentFile.agentId && !queuedFileSubagent) {
           batch.subagents.push({
-            agentId: file.agentId,
+            agentId: currentFile.agentId,
             sessionId,
-            profileSlug: file.profileSlug,
+            profileSlug: currentFile.profileSlug,
             observedAt: timestamp,
           });
           queuedFileSubagent = true;
@@ -361,7 +408,7 @@ export async function ingestTranscriptArchive({
 
         const synthetic = record?.message?.model === '<synthetic>';
         if (!synthetic) {
-          const request = transcriptRequest(record, file, sessionId, timestamp);
+          const request = transcriptRequest(record, currentFile, sessionId, timestamp);
           if (request) batch.requests.push(request);
           else if ((record.type === 'assistant' || text(record.requestId))
               && text(record?.message?.model) && !timestamp) {
@@ -408,11 +455,39 @@ export async function ingestTranscriptArchive({
             }
           }
 
-          if (!file.isSubagent && (record.toolUseResult || record.tool_use_result)) {
-            const resultIds = toolResultIds(message);
+          const resultIds = toolResultIds(message);
+          const matchingResultCount = resultIds
+            .map((id) => agentInvocations.get(id))
+            .filter(Boolean).length;
+          const recordResult = object(record.toolUseResult || record.tool_use_result);
+          const recordResultId = text(recordResult.toolUseId) || text(recordResult.tool_use_id);
+          let queuedResult = false;
+          for (const block of contentBlocks(message)) {
+            if (block?.type !== 'tool_result') continue;
+            const id = text(block.tool_use_id);
+            const invocation = id ? agentInvocations.get(id) : null;
+            if (!invocation) continue;
+            const rollup = subagentRollup(
+              record,
+              currentFile,
+              sessionId,
+              timestamp,
+              invocation,
+              toolResultAgentId(block),
+              recordResultId ? recordResultId === id : matchingResultCount === 1,
+            );
+            if (rollup) {
+              batch.subagents.push(rollup);
+              queuedResult = true;
+            }
+          }
+          if (!queuedResult && matchingResultCount === 0
+              && (record.toolUseResult || record.tool_use_result)) {
             const invocation = resultIds.map((id) => agentInvocations.get(id)).find(Boolean) || null;
-            const rollup = subagentRollup(record, file, sessionId, timestamp, invocation);
+            const rollup = subagentRollup(record, currentFile, sessionId, timestamp, invocation);
             if (rollup) batch.subagents.push(rollup);
+          }
+          if (resultIds.length) {
             for (const id of resultIds) agentInvocations.delete(id);
           }
         }
@@ -425,6 +500,13 @@ export async function ingestTranscriptArchive({
     } finally {
       try { lines.close(); }
       finally { input.destroy(); }
+    }
+    batch = flushBatch(store, batch, summary);
+    linesSinceFlush = 0;
+    const finalStat = fs.statSync(file.path);
+    if (finalStat.size === fileStat.size && finalStat.mtimeMs === fileStat.mtimeMs
+      && finalStat.ino === fileStat.ino) {
+      store.recordIngestFileState(file.path, finalStat);
     }
   }
   flushBatch(store, batch, summary);

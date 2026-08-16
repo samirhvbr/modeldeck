@@ -422,14 +422,14 @@ public enum MenuBarSourceResolver {
     ) -> String {
         let base: String
         if pinnedSetting == nil || pinnedSetting?.isEmpty == true {
-            base = "Shown in the menu bar — currently the lowest % left across accounts"
+            base = "Shown in the menu bar — currently the lowest % left across subscriptions"
         } else if resolvedPinnedAccountID != accountID {
             // The stored pin didn't resolve; this row won the lowest-across
             // fallback (#123).
             base = "Shown in the menu bar — the pinned selection isn't available, "
-                + "so the lowest % left across accounts is shown"
+                + "so the lowest % left across subscriptions is shown"
         } else if pinnedSetting?.hasPrefix("active:") == true {
-            base = "Shown in the menu bar — following the active account"
+            base = "Shown in the menu bar — following the active subscription"
         } else {
             base = "Shown in the menu bar — pinned (right-click to unpin)"
         }
@@ -499,14 +499,14 @@ public enum MenuBarSourceResolver {
         // stay true when the source is a spend budget (CodeRabbit, PR #250).
         let tooltip: String
         if pinnedSetting == nil || pinnedSetting?.isEmpty == true {
-            tooltip = "The menu bar shows the lowest % left across every account and "
+            tooltip = "The menu bar shows the lowest % left across every subscription and "
                 + "usage window — right now \(possessiveWindow). "
-                + "Right-click a card to pin one account instead."
+                + "Right-click a card to pin one subscription instead."
         } else if resolvedPinnedAccountID != source.accountId {
             tooltip = "The pinned selection isn't available, so the menu bar shows the "
-                + "lowest % left across every account — right now \(possessiveWindow)."
+                + "lowest % left across every subscription — right now \(possessiveWindow)."
         } else if pinnedSetting?.hasPrefix("active:") == true {
-            tooltip = "The menu bar follows the active account and shows its lowest "
+            tooltip = "The menu bar follows the active subscription and shows its lowest "
                 + "usage window — right now \(possessiveWindow)."
         } else if let choice = pinnedSetting.flatMap(MenuBarPinResolver.pinWindow) {
             // Issue #292: a pin carrying a window choice states the rule
@@ -516,13 +516,13 @@ public enum MenuBarSourceResolver {
                 tooltip = "The menu bar is pinned to \(possessiveWindow). "
                     + "Right-click its card to unpin."
             } else {
-                tooltip = "The pinned account's \(choice.genericTitle) window isn't "
+                tooltip = "The pinned subscription's \(choice.genericTitle) window isn't "
                     + "reported right now, so the menu bar shows its lowest "
                     + "usage window — right now \(possessiveWindow). "
                     + "Right-click its card to unpin."
             }
         } else {
-            tooltip = "The menu bar is pinned to this account and shows its lowest "
+            tooltip = "The menu bar is pinned to this subscription and shows its lowest "
                 + "usage window — right now \(possessiveWindow). "
                 + "Right-click its card to unpin."
         }

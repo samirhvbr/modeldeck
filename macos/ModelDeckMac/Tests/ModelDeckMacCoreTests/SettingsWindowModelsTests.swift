@@ -54,7 +54,7 @@ final class StubAccountBackend: AccountEditing, DeckStateProviding, ToolsProbing
     }
 }
 
-@Suite("Accounts settings model (issue #7)")
+@Suite("Subscriptions settings model (issue #7)")
 @MainActor
 struct AccountsSettingsModelTests {
     private var editable: DeckAccount {

@@ -338,7 +338,7 @@ struct Issue326ByRemainingTests {
             .byAccount, .byRemaining, .byZeroWeightings,
         ])
         #expect(DeckPopoverModel.DeckHideMode.allCases.map(\.displayName) == [
-            "By account", "By remaining", "By zero weightings",
+            "By subscription", "By remaining", "By zero weightings",
         ])
         #expect(DeckPopoverModel.DeckRemainingThreshold.allCases == [
             .one, .five, .ten, .twentyFive, .fifty,
@@ -427,15 +427,15 @@ struct Issue326ByRemainingTests {
     @Test func settingsCaptionIsVerbatimAndTracksBothLiveSelections() {
         let model = DeckPopoverModel(defaults: freshDefaults())
         #expect(model.byRemainingCaption
-            == "Accounts with 5% or more remaining AND renewing within 24 hours stay visible.")
+            == "Subscriptions with 5% or more remaining AND renewing within 24 hours stay visible.")
 
         model.hideRemainingThreshold = .twentyFive
         model.hideResetsHorizon = .sixDays
         #expect(model.byRemainingCaption
-            == "Accounts with 25% or more remaining AND renewing within 6 days stay visible.")
+            == "Subscriptions with 25% or more remaining AND renewing within 6 days stay visible.")
 
         model.hideRenewingSoonEnabled = false
         #expect(model.byRemainingCaption
-            == "Accounts with 25% or more remaining stay visible. Everything else is hidden.")
+            == "Subscriptions with 25% or more remaining stay visible. Everything else is hidden.")
     }
 }

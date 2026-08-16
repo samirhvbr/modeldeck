@@ -172,7 +172,7 @@ final class AccountRenewTests: XCTestCase {
         )
         XCTAssertEqual(
             AccountRenew.outcomeText(for: AccountRenewal(outcome: "signin-required")),
-            "This account needs a fresh sign-in — renewal can't fix that."
+            "This subscription needs a fresh sign-in — renewal can't fix that."
         )
         XCTAssertEqual(
             AccountRenew.outcomeText(for: AccountRenewal(outcome: "auth-overridden")),

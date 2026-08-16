@@ -154,13 +154,13 @@ function seed(store) {
     [
       {
         turnIndex: 0, turnId: 'turn-0', model: 'gpt-placeholder-sol', reasoningEffort: 'medium',
-        inputTokens: 300, cachedInputTokens: 700, cacheWriteInputTokens: 0,
+        inputTokens: 1000, cachedInputTokens: 700, cacheWriteInputTokens: 0,
         outputTokens: 150, reasoningOutputTokens: 90, totalTokens: 1150,
         timestamp: '2026-08-01T13:10:00.000Z',
       },
       {
         turnIndex: 1, turnId: 'turn-1', model: 'gpt-placeholder-sol', reasoningEffort: 'medium',
-        inputTokens: 100, cachedInputTokens: 900, cacheWriteInputTokens: 0,
+        inputTokens: 1000, cachedInputTokens: 900, cacheWriteInputTokens: 0,
         outputTokens: 60, reasoningOutputTokens: 20, totalTokens: 1060,
         timestamp: '2026-08-01T13:50:00.000Z',
       },
@@ -374,7 +374,7 @@ test('a profile slug present under BOTH providers stays split by the account pro
     },
     [{
       turnIndex: 0, turnId: 'same-slug-turn-0', model: 'gpt-placeholder-sol', reasoningEffort: 'high',
-      inputTokens: 900, cachedInputTokens: 100, cacheWriteInputTokens: 0,
+      inputTokens: 1000, cachedInputTokens: 100, cacheWriteInputTokens: 0,
       outputTokens: 50, reasoningOutputTokens: 10, totalTokens: 1050,
       timestamp: '2026-08-01T15:10:00.000Z',
     }],

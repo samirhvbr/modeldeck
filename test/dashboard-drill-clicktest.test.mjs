@@ -57,6 +57,22 @@ import {
   bootPage, installDom, installFetch, loadModule, waitFor,
 } from '../dashboard/test-support/index.mjs';
 
+// #450: these fixtures anchor "recent" events a couple of hours in the past
+// and their tests click the chart's last ("today") bar — between 00:00 and
+// 02:00 local the anchors crossed midnight, the last day emptied, and the
+// suite failed two hours every day. Pin the process to a DST-free
+// fixed-offset zone where it is currently early afternoon, so "a couple of
+// hours ago" is always today at any wall-clock time, without disturbing the
+// fixtures' hand-tuned burn/rounding numbers. (POSIX inverts the sign:
+// Etc/GMT-5 means UTC+5.) The spawned daemon inherits TZ from process.env.
+{
+  const utcHour = new Date().getUTCHours();
+  const offset = (((13 - utcHour) % 24) + 24) % 24;
+  process.env.TZ = offset === 0 ? 'Etc/GMT'
+    : offset <= 14 ? `Etc/GMT-${offset}` : `Etc/GMT+${24 - offset}`;
+}
+
+
 const DASHBOARD_SRC = fileURLToPath(new URL('../dashboard/src', import.meta.url));
 const PORT = 43387;
 const TOKEN = 'drill-clicktest-placeholder-token';
@@ -292,7 +308,7 @@ function seed(store, root) {
       turnId: 'turn-' + turnIndex,
       model: 'gpt-5.6-sol',
       reasoningEffort: 'medium',
-      inputTokens: 3000 + turnIndex * 100,
+      inputTokens: 9000 + turnIndex * 300,
       cachedInputTokens: 6000 + turnIndex * 200,
       cacheWriteInputTokens: 0,
       outputTokens: 900 + turnIndex * 10,

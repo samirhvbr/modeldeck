@@ -115,11 +115,11 @@ struct Issue321NoOpCalloutTests {
 
     @Test func calloutCopyIsModeHonest() {
         #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byAccount)
-            == "Right-click any account to hide it.")
+            == "Right-click any subscription to hide it.")
         #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byRemaining)
-            == "No accounts are hidden by your 5% remaining and 24-hour renewal filters.")
+            == "No subscriptions are hidden by your 5% remaining and 24-hour renewal filters.")
         #expect(DeckPopoverModel.eyeNoOpCalloutCopy(for: .byZeroWeightings)
-            == "No accounts are at zero weight right now.")
+            == "No subscriptions are at zero weight right now.")
     }
 
     // MARK: The no-op predicate, per mode
@@ -213,12 +213,12 @@ struct Issue321NoOpCalloutTests {
         model.toggleHideShowSystemFromEye(state: state, now: now)
         #expect(model.hideShowEnabled == false,
                 "the callout explains the click; it never blocks the toggle")
-        #expect(model.eyeCalloutText == "Right-click any account to hide it.")
+        #expect(model.eyeCalloutText == "Right-click any subscription to hide it.")
         // The way back is a no-op too — it fires on EVERY such click, in
         // any mode, forever (no seen-it state).
         model.toggleHideShowSystemFromEye(state: state, now: now)
         #expect(model.hideShowEnabled)
-        #expect(model.eyeCalloutText == "Right-click any account to hide it.")
+        #expect(model.eyeCalloutText == "Right-click any subscription to hide it.")
     }
 
     @Test func calloutCopyFollowsTheCurrentMode() {
@@ -228,11 +228,11 @@ struct Issue321NoOpCalloutTests {
         model.hideRemainingThreshold = .one // every displayed percentage passes
         model.toggleHideShowSystemFromEye(state: resetsFixture(), now: now)
         #expect(model.eyeCalloutText
-            == "No accounts are hidden by your 1% remaining and 7-day renewal filters.")
+            == "No subscriptions are hidden by your 1% remaining and 7-day renewal filters.")
         let zeroModel = DeckPopoverModel(defaults: freshDefaults())
         zeroModel.hideMode = .byZeroWeightings
         zeroModel.toggleHideShowSystemFromEye(state: poolAllRouted(), now: now)
-        #expect(zeroModel.eyeCalloutText == "No accounts are at zero weight right now.")
+        #expect(zeroModel.eyeCalloutText == "No subscriptions are at zero weight right now.")
     }
 
     @Test func aClickThatChangesRowsNeverShowsTheCallout() {
@@ -311,7 +311,7 @@ struct Issue321NoOpCalloutTests {
         // beside its own contradiction must not render.
         let model = DeckPopoverModel(defaults: freshDefaults())
         model.hideMode = .byAccount
-        #expect(model.contextMenuHideShowEnabled, "caption renders in By account")
+        #expect(model.contextMenuHideShowEnabled, "caption renders in By subscription")
         model.hideMode = .byRemaining
         #expect(model.contextMenuHideShowEnabled, "caption renders in By remaining")
         model.hideMode = .byZeroWeightings

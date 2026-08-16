@@ -19,6 +19,73 @@ import Testing
 private let crashingBinary = URL(fileURLWithPath: "/bin/sleep")
 private let longLivedBinary = URL(fileURLWithPath: "/usr/bin/yes")
 
+// TRIPWIRE test-leaves-no-stand-in (#449): a FAILING run of a spawn test must
+// not orphan its long-lived stand-in. Four /usr/bin/yes processes at ~100% CPU
+// each survived earlier failing suite runs for hours in the field — the
+// refusal test asserts nothing starts, so its teardown never terminated the
+// process the failure path had started. Every test that hands longLivedBinary
+// to a real controller defers this reaper: any process still carrying the
+// test's unique scratch marker is terminated AND fails the test by name, on
+// every exit path including assertion failures.
+// Returns nil when the process list itself could not be taken — the caller
+// must FAIL on nil rather than read it as "no leaks" (fail closed).
+private func psOutput(_ arguments: [String]) -> String? {
+    let ps = Process()
+    ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+    ps.arguments = arguments
+    let pipe = Pipe()
+    ps.standardOutput = pipe
+    do { try ps.run() } catch { return nil }
+    // Drain before waiting — the runtool-pipe-drain lesson (PR #433): a full
+    // process listing can exceed the pipe buffer.
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    ps.waitUntilExit()
+    // ps exits 1 for an empty -p match; that is an answer, not a failure.
+    guard ps.terminationStatus == 0 || arguments.first == "-p" else { return nil }
+    return String(decoding: data, as: UTF8.self)
+}
+
+private func reapLeakedStandIns(marker: String) -> [Int32]? {
+    guard let listing = psOutput(["-axo", "pid=,args="]) else { return nil }
+    var leaked: [Int32] = []
+    var unkillable: [Int32] = []
+    for line in listing.split(separator: "\n") where line.contains(marker) {
+        let fields = line.trimmingCharacters(in: .whitespaces)
+            .split(separator: " ", maxSplits: 1)
+        guard let pid = Int32(fields.first ?? "") else { continue }
+        // Revalidate identity immediately before signalling: the pid could
+        // have been reaped and reused since the listing (TOCTOU). The
+        // remaining window after this re-check is unavoidable with ps and
+        // vanishingly small for a test-scoped UUID marker.
+        guard let args = psOutput(["-p", String(pid), "-o", "args="]),
+              args.contains(marker) else { continue }
+        guard kill(pid, SIGTERM) == 0 else { continue }
+        // Wait for the exit rather than reporting termination on faith; a
+        // stand-in that ignores SIGTERM gets SIGKILL, and the escalation is
+        // itself verified by polling until the pid is really gone.
+        func waitForExit() -> Bool {
+            var polls = 0
+            while kill(pid, 0) == 0 && polls < 200 {
+                usleep(10_000)
+                polls += 1
+            }
+            return kill(pid, 0) != 0
+        }
+        if !waitForExit() {
+            _ = kill(pid, SIGKILL)
+            if !waitForExit() {
+                unkillable.append(pid)
+            }
+        }
+        leaked.append(pid)
+    }
+    // A pid that survived SIGKILL polling is a louder problem than a leak —
+    // surface it distinctly instead of implying it was reaped.
+    precondition(unkillable.isEmpty,
+                 "#449 reaper: stand-in(s) survived SIGKILL: \(unkillable)")
+    return leaked
+}
+
 private func waitUntilNotRunning(
     _ controller: ManagedProxyProcessController,
     _ token: ManagedProxyProcessToken,
@@ -61,6 +128,12 @@ struct ManagedProxyLiveProcessTests {
         let root = scratch()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        defer {
+            let leaked = reapLeakedStandIns(marker: root.lastPathComponent)
+            #expect(leaked != nil, "the #449 reaper could not take a process listing")
+            #expect(leaked?.isEmpty ?? true,
+                    "leaked live stand-in \(leaked ?? []) — terminated by the #449 tripwire")
+        }
 
         let controller = ManagedProxyProcessController()
         let token = try controller.start(
@@ -204,6 +277,16 @@ struct ManagedProxyRefusalIntegrationTests {
             .appendingPathComponent("modeldeck-refusal-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        // This test asserts the model starts NOTHING — which is exactly why a
+        // probe race that makes it start the stand-in used to leak it: the
+        // failure path spawned a process no teardown owned (#449, the field
+        // incident). The reaper guards every exit.
+        defer {
+            let leaked = reapLeakedStandIns(marker: root.lastPathComponent)
+            #expect(leaked != nil, "the #449 reaper could not take a process listing")
+            #expect(leaked?.isEmpty ?? true,
+                    "leaked live stand-in \(leaked ?? []) — terminated by the #449 tripwire")
+        }
 
         let probe = CLIProxyHealthProbe(
             baseURL: URL(string: "http://127.0.0.1:\(responder.port)")!

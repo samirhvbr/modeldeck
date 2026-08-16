@@ -210,12 +210,13 @@ export async function parseCodexRolloutFile({
       label: 'token_count total_token_usage',
     });
     let delta;
-    // Prefer Codex's per-event last_token_usage whenever it is well-formed.
-    // Cumulative diffing is only a fallback for absent or malformed last usage.
-    if (lastUsage) {
-      delta = lastUsage;
-    } else if (!observed) {
+    // total_token_usage is Codex's session-cumulative source of truth.
+    // last_token_usage can be repeated on an emission where the cumulative
+    // counter did not advance, so use it only when no cumulative value exists.
+    if (!observed && !lastUsage) {
       throw new Error('token_count has no usable last_token_usage or total_token_usage');
+    } else if (!observed) {
+      delta = lastUsage;
     } else if (!previousCumulative) {
       delta = { ...observed };
     } else {
@@ -245,6 +246,8 @@ export async function parseCodexRolloutFile({
         estimated[field] = value;
       }
       if (previousCumulative) previousCumulative = estimated;
+    } else if (lastUsage) {
+      previousCumulative = { ...lastUsage };
     }
     // token_count carries no turn_id. Keeping the preceding context active
     // even after task_complete also handles trailing counters deterministically.
@@ -383,6 +386,7 @@ export async function ingestCodexRollouts({
   const summary = {
     profiles: profileEntries.length,
     files: 0,
+    filesSkipped: 0,
     sessions: 0,
     turns: 0,
     sessionsInserted: 0,
@@ -413,6 +417,13 @@ export async function ingestCodexRollouts({
     summary.files += files.length;
     for (const item of files) {
       try {
+        const fileStat = fs.statSync(item.file);
+        const ingestState = store.getIngestFileState(item.file);
+        if (ingestState?.size === fileStat.size && ingestState.mtimeMs === fileStat.mtimeMs
+          && ingestState.ino === fileStat.ino) {
+          summary.filesSkipped += 1;
+          continue;
+        }
         const parsed = await parseCodexRolloutFile({
           ...item,
           profileSlug: profile.name,
@@ -425,6 +436,11 @@ export async function ingestCodexRollouts({
         summary.turns += parsed.turns.length;
         const stored = store.ingestCodexSession(parsed.session, parsed.turns);
         for (const [key, value] of Object.entries(stored)) summary[key] += value;
+        const finalStat = fs.statSync(item.file);
+        if (finalStat.size === fileStat.size && finalStat.mtimeMs === fileStat.mtimeMs
+          && finalStat.ino === fileStat.ino) {
+          store.recordIngestFileState(item.file, finalStat);
+        }
       } catch (error) {
         summary.warnings.malformedFiles += 1;
         warn(`codex-rollout-ingest: skipped ${item.file}: ${error.message}`);

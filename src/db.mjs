@@ -177,6 +177,22 @@ function usageRow(row) {
   };
 }
 
+// Issue #377.
+function sessionModelStateRow(row) {
+  if (!row) return null;
+  return {
+    accountId: row.account_id,
+    sessionId: row.session_id,
+    model: row.model,
+    modelDisplay: row.model_display,
+    cwd: row.cwd,
+    observedAt: row.observed_at,
+    droppedFrom: row.dropped_from,
+    droppedFromDisplay: row.dropped_from_display,
+    droppedAt: row.dropped_at,
+  };
+}
+
 const USAGE_HISTORY_BUCKETS = new Set(['raw', 'hour', 'day']);
 const USAGE_HISTORY_INDEX_PADDING_MS = 24 * 60 * 60 * 1_000;
 const ISO_TIMESTAMP_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|([+-])(\d{2}):(\d{2}))$/;
@@ -417,12 +433,13 @@ function usageSessionsLimit(value) {
   return parsed;
 }
 
-// Claude transcripts store the four token splits; the session total is their
-// sum. Codex rollouts store a per-turn total the ingester validated, so it is
-// used as given rather than re-derived.
+// Claude transcripts store disjoint token splits. Codex input_tokens already
+// includes cached_input_tokens, while cache_write_input_tokens is a separate
+// additive input flow. The ingester preserves those rollout counters as-is.
 const TRANSCRIPT_TOTAL = '(r.input_tokens + r.cache_creation_input_tokens + r.cache_read_input_tokens + r.output_tokens)';
 const TRANSCRIPT_INPUT = '(r.input_tokens + r.cache_creation_input_tokens + r.cache_read_input_tokens)';
-const CODEX_INPUT = '(t.input_tokens + t.cached_input_tokens + t.cache_write_input_tokens)';
+const CODEX_INPUT_UNCACHED = '(t.input_tokens - t.cached_input_tokens)';
+const CODEX_INPUT = '(t.input_tokens + t.cache_write_input_tokens)';
 
 function sessionAverage(total, count) {
   if (!count) return 0;
@@ -433,6 +450,8 @@ function sessionAverage(total, count) {
 // session's cwd — the only project identity the ingested transcript/rollout
 // corpus carries. Issue #365 folds ModelDeck's exact linked-worktree layout
 // back into the parent checkout while retaining the worktree name as detail.
+// Tracked projects nested below another tracked project fold to their
+// outermost tracked ancestor; unrelated cwd paths remain verbatim.
 // Traffic whose session has no cwd (or whose session row is missing) is NOT
 // dropped: it lands in this explicitly keyed bucket. Real cwds are absolute
 // paths, so this non-path key cannot collide with one.
@@ -528,12 +547,29 @@ function projectKeyOf(cwd) {
   return key;
 }
 
-function projectIdentityOf(cwd) {
-  const key = projectKeyOf(cwd);
-  if (key === PROJECT_BURN_UNATTRIBUTED) return { key, project: null, worktree: null };
-  if (key === cwd) return { key, project: key, worktree: null };
+function pathContains(ancestor, descendant) {
+  const relative = path.relative(ancestor, descendant);
+  return relative !== '' && relative !== '..'
+    && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function trackedProjectRollups(projects) {
+  const paths = projects.map((project) => project.path).sort((a, b) => a.length - b.length);
+  return new Map(paths.map((projectPath) => [
+    projectPath,
+    paths.find((candidate) => candidate === projectPath || pathContains(candidate, projectPath)),
+  ]));
+}
+
+function projectIdentityOf(cwd, rollups = null) {
+  const sourceKey = projectKeyOf(cwd);
+  if (sourceKey === PROJECT_BURN_UNATTRIBUTED) {
+    return { key: sourceKey, project: null, worktree: null };
+  }
+  const key = rollups?.get(sourceKey) || sourceKey;
+  if (sourceKey === cwd) return { key, project: key, worktree: null };
   const worktree = cwd
-    .slice(key.length + 1)
+    .slice(sourceKey.length + 1)
     .replace(/^(?:\.claude\/worktrees|\.worktrees)\//, '');
   return { key, project: key, worktree };
 }
@@ -543,11 +579,21 @@ function projectIdentityOf(cwd) {
 // including sessions missing entirely, which the LEFT JOIN leaves NULL. A
 // parent checkout selects itself plus everything under either worktree
 // marker (nested cwds included — they fold to the same parent); an explicit
-// worktree path narrows to that checkout, nested cwds included.
-function projectPredicate(column, project) {
+// worktree path narrows to that checkout, nested cwds included. A tracked
+// parent also selects its tracked descendants so its rolled-up drill is whole.
+function projectPredicate(column, project, containedProjects = []) {
   if (project === PROJECT_BURN_UNATTRIBUTED) {
     return { sql: `(${column} IS NULL OR TRIM(${column}) = '')`, params: [] };
   }
+  const scopes = [project, ...containedProjects];
+  const predicates = scopes.map((scope) => projectPathPredicate(column, scope));
+  return {
+    sql: `(${predicates.map((predicate) => predicate.sql).join(' OR ')})`,
+    params: predicates.flatMap((predicate) => predicate.params),
+  };
+}
+
+function projectPathPredicate(column, project) {
   // Prefix boundaries are computed by SQLite's own length(): JS .length
   // counts UTF-16 code units while SQLite counts Unicode characters, and the
   // two disagree the moment a path carries a non-BMP character.
@@ -657,6 +703,29 @@ export class Store {
       CREATE INDEX IF NOT EXISTS request_usage_reasoning_effort
         ON request_usage(reasoning_effort);
 
+      -- Issue #377: the model each live Claude Code session is currently on,
+      -- observed from the #174 statusline tee, plus the standing unresolved
+      -- DROP for that session. One row per (account, session): the last
+      -- observation and the open drop live together so a daemon restart
+      -- cannot forget a drop or re-raise one that already recovered.
+      CREATE TABLE IF NOT EXISTS session_model_state (
+        account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        model_display TEXT,
+        cwd TEXT,
+        observed_at TEXT NOT NULL,
+        -- Non-null exactly while a drop stands unresolved. dropped_from
+        -- keeps the ORIGINAL model, so a second downgrade never rewrites the
+        -- story from "you were on Fable" to "you were on Sonnet".
+        dropped_from TEXT,
+        dropped_from_display TEXT,
+        dropped_at TEXT,
+        PRIMARY KEY(account_id, session_id)
+      );
+      CREATE INDEX IF NOT EXISTS session_model_state_dropped
+        ON session_model_state(dropped_at) WHERE dropped_at IS NOT NULL;
+
       CREATE TABLE IF NOT EXISTS codex_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL UNIQUE,
@@ -702,6 +771,13 @@ export class Store {
         ON codex_turns(timestamp);
       CREATE INDEX IF NOT EXISTS codex_turns_model_effort
         ON codex_turns(model, reasoning_effort);
+      CREATE TABLE IF NOT EXISTS ingest_file_state (
+        path TEXT PRIMARY KEY,
+        size INTEGER NOT NULL,
+        mtime_ms REAL NOT NULL,
+        ino INTEGER NOT NULL,
+        last_ingested_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS transcript_sessions (
         session_id TEXT NOT NULL,
         profile_slug TEXT NOT NULL,
@@ -1127,6 +1203,14 @@ export class Store {
     return this.db.prepare('SELECT * FROM projects ORDER BY name COLLATE NOCASE').all().map(projectRow);
   }
 
+  projectPredicate(column, project) {
+    const trackedPaths = this.listProjects().map((tracked) => tracked.path);
+    const contained = trackedPaths.includes(project)
+      ? trackedPaths.filter((candidate) => pathContains(project, candidate))
+      : [];
+    return projectPredicate(column, project, contained);
+  }
+
   getProject(id) {
     return projectRow(this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id));
   }
@@ -1394,6 +1478,77 @@ export class Store {
   /// durable request archive instead of trusting ingest order or process memory.
   /// parseUsageRecord canonicalizes observed_at to UTC ISO, so indexed text
   /// ordering is chronological here.
+  // -------------------------------------------------------------------------
+  // Issue #377 — per-session model state (see the session_model_state DDL).
+
+  /// The last recorded state for one session, or null.
+  sessionModelState(accountId, sessionId) {
+    const row = this.db.prepare(`
+      SELECT * FROM session_model_state WHERE account_id = ? AND session_id = ?
+    `).get(accountId, sessionId);
+    return row ? sessionModelStateRow(row) : null;
+  }
+
+  /// Upsert one session's state. `droppedFrom`/`droppedAt` are written on
+  /// every call, so passing null CLEARS a standing drop — recovery and
+  /// detection use the same single write.
+  saveSessionModelState({
+    accountId,
+    sessionId,
+    model,
+    modelDisplay = null,
+    cwd = null,
+    observedAt,
+    droppedFrom = null,
+    droppedFromDisplay = null,
+    droppedAt = null,
+  }) {
+    this.db.prepare(`
+      INSERT INTO session_model_state(
+        account_id, session_id, model, model_display, cwd, observed_at,
+        dropped_from, dropped_from_display, dropped_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(account_id, session_id) DO UPDATE SET
+        model = excluded.model,
+        model_display = excluded.model_display,
+        cwd = excluded.cwd,
+        observed_at = excluded.observed_at,
+        dropped_from = excluded.dropped_from,
+        dropped_from_display = excluded.dropped_from_display,
+        dropped_at = excluded.dropped_at
+    `).run(
+      accountId, sessionId, model, modelDisplay, cwd, observedAt,
+      droppedFrom, droppedFromDisplay, droppedAt,
+    );
+    return this.sessionModelState(accountId, sessionId);
+  }
+
+  /// Every session carrying an unresolved drop, newest drop first. `since`
+  /// bounds the result to sessions still observed at or after that instant —
+  /// a closed session can never report the recovery that clears its own drop
+  /// (CodeRabbit, PR #472).
+  listSessionModelDrops({ since = null } = {}) {
+    const bound = typeof since === 'string' && since.trim() ? since : null;
+    return this.db.prepare(`
+      SELECT * FROM session_model_state
+      WHERE dropped_at IS NOT NULL
+        AND (? IS NULL OR observed_at >= ?)
+      ORDER BY dropped_at DESC, session_id ASC
+    `).all(bound, bound).map(sessionModelStateRow);
+  }
+
+  /// Remove rows for sessions last observed before `before`. The reader bound
+  /// above hides them; this is what keeps the table from growing forever.
+  /// Returns the number of rows removed.
+  pruneSessionModelState(before) {
+    if (typeof before !== 'string' || !before.trim()) {
+      throw new Error('session model state prune cutoff is required');
+    }
+    return this.db.prepare(`
+      DELETE FROM session_model_state WHERE observed_at < ?
+    `).run(before).changes;
+  }
+
   requestFailureStreak({ accountId = null, provider = null, source = null } = {}) {
     let selector;
     let selectorParameters;
@@ -1453,6 +1608,25 @@ export class Store {
     };
   }
 
+  getIngestFileState(filePath) {
+    const row = this.db.prepare(`
+      SELECT size, mtime_ms, ino FROM ingest_file_state WHERE path = ?
+    `).get(filePath);
+    return row ? { size: row.size, mtimeMs: row.mtime_ms, ino: row.ino } : null;
+  }
+
+  recordIngestFileState(filePath, { size, mtimeMs, ino }) {
+    this.db.prepare(`
+      INSERT INTO ingest_file_state(path, size, mtime_ms, ino, last_ingested_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(path) DO UPDATE SET
+        size = excluded.size,
+        mtime_ms = excluded.mtime_ms,
+        ino = excluded.ino,
+        last_ingested_at = excluded.last_ingested_at
+    `).run(filePath, size, mtimeMs, ino, now());
+  }
+
   /// Upsert one streamed Codex rollout summary. Active rollout files grow in
   /// place, so replay safety cannot be INSERT-only: the session bounds and
   /// existing turn aggregates must advance on later scans. The stable
@@ -1479,6 +1653,18 @@ export class Store {
         first_timestamp=MIN(codex_sessions.first_timestamp, excluded.first_timestamp),
         last_timestamp=MAX(codex_sessions.last_timestamp, excluded.last_timestamp),
         archived=MAX(codex_sessions.archived, excluded.archived)
+      WHERE codex_sessions.profile_slug IS NOT excluded.profile_slug
+        OR codex_sessions.machine IS NOT excluded.machine
+        OR codex_sessions.cwd IS NOT COALESCE(excluded.cwd, codex_sessions.cwd)
+        OR codex_sessions.originator IS NOT COALESCE(excluded.originator, codex_sessions.originator)
+        OR codex_sessions.source IS NOT COALESCE(excluded.source, codex_sessions.source)
+        OR codex_sessions.cli_version IS NOT COALESCE(excluded.cli_version, codex_sessions.cli_version)
+        OR codex_sessions.git_branch IS NOT COALESCE(excluded.git_branch, codex_sessions.git_branch)
+        OR codex_sessions.git_repo IS NOT COALESCE(excluded.git_repo, codex_sessions.git_repo)
+        OR codex_sessions.git_commit IS NOT COALESCE(excluded.git_commit, codex_sessions.git_commit)
+        OR codex_sessions.first_timestamp IS NOT MIN(codex_sessions.first_timestamp, excluded.first_timestamp)
+        OR codex_sessions.last_timestamp IS NOT MAX(codex_sessions.last_timestamp, excluded.last_timestamp)
+        OR codex_sessions.archived IS NOT MAX(codex_sessions.archived, excluded.archived)
     `);
     const insertTurn = this.db.prepare(`
       INSERT INTO codex_turns(
@@ -1500,6 +1686,18 @@ export class Store {
         duration_ms=COALESCE(excluded.duration_ms, codex_turns.duration_ms),
         time_to_first_token_ms=COALESCE(excluded.time_to_first_token_ms, codex_turns.time_to_first_token_ms),
         timestamp=COALESCE(excluded.timestamp, codex_turns.timestamp)
+      WHERE codex_turns.turn_id IS NOT COALESCE(excluded.turn_id, codex_turns.turn_id)
+        OR codex_turns.model IS NOT COALESCE(excluded.model, codex_turns.model)
+        OR codex_turns.reasoning_effort IS NOT COALESCE(excluded.reasoning_effort, codex_turns.reasoning_effort)
+        OR codex_turns.input_tokens IS NOT excluded.input_tokens
+        OR codex_turns.cached_input_tokens IS NOT excluded.cached_input_tokens
+        OR codex_turns.cache_write_input_tokens IS NOT excluded.cache_write_input_tokens
+        OR codex_turns.output_tokens IS NOT excluded.output_tokens
+        OR codex_turns.reasoning_output_tokens IS NOT excluded.reasoning_output_tokens
+        OR codex_turns.total_tokens IS NOT excluded.total_tokens
+        OR codex_turns.duration_ms IS NOT COALESCE(excluded.duration_ms, codex_turns.duration_ms)
+        OR codex_turns.time_to_first_token_ms IS NOT COALESCE(excluded.time_to_first_token_ms, codex_turns.time_to_first_token_ms)
+        OR codex_turns.timestamp IS NOT COALESCE(excluded.timestamp, codex_turns.timestamp)
     `);
     const existingSession = this.db.prepare('SELECT 1 FROM codex_sessions WHERE session_id = ?');
     const existingTurn = this.db.prepare('SELECT 1 FROM codex_turns WHERE session_id = ? AND turn_index = ?');
@@ -1507,7 +1705,7 @@ export class Store {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const sessionExists = Boolean(existingSession.get(session.sessionId));
-      insertSession.run(
+      const sessionResult = insertSession.run(
         session.sessionId,
         session.profileSlug,
         session.machine,
@@ -1522,11 +1720,11 @@ export class Store {
         session.lastTimestamp,
         session.archived ? 1 : 0,
       );
-      if (sessionExists) summary.sessionsUpdated += 1;
-      else summary.sessionsInserted += 1;
+      if (!sessionExists) summary.sessionsInserted += 1;
+      else if (sessionResult.changes > 0) summary.sessionsUpdated += 1;
       for (const turn of turns) {
         const turnExists = Boolean(existingTurn.get(session.sessionId, turn.turnIndex));
-        insertTurn.run(
+        const turnResult = insertTurn.run(
           session.sessionId,
           turn.turnIndex,
           turn.turnId ?? null,
@@ -1542,8 +1740,8 @@ export class Store {
           turn.timeToFirstTokenMs ?? null,
           turn.timestamp ?? null,
         );
-        if (turnExists) summary.turnsUpdated += 1;
-        else summary.turnsInserted += 1;
+        if (!turnExists) summary.turnsInserted += 1;
+        else if (turnResult.changes > 0) summary.turnsUpdated += 1;
       }
       this.db.exec('COMMIT');
       return summary;
@@ -1591,6 +1789,32 @@ export class Store {
           ELSE ?
         END
       WHERE session_id = ? AND profile_slug = ?
+        AND (
+          cwd IS NOT COALESCE(?, cwd)
+          OR git_branch IS NOT COALESCE(?, git_branch)
+          OR entrypoint IS NOT COALESCE(?, entrypoint)
+          OR client_version IS NOT COALESCE(?, client_version)
+          OR first_at IS NOT CASE
+            WHEN ? IS NULL THEN first_at
+            WHEN first_at IS NULL OR ? < first_at THEN ?
+            ELSE first_at
+          END
+          OR last_at IS NOT CASE
+            WHEN ? IS NULL THEN last_at
+            WHEN last_at IS NULL OR ? > last_at THEN ?
+            ELSE last_at
+          END
+          OR title IS NOT CASE
+            WHEN ? IS NULL THEN title
+            WHEN title_source = 'custom-title' AND ? <> 'custom-title' THEN title
+            ELSE ?
+          END
+          OR title_source IS NOT CASE
+            WHEN ? IS NULL THEN title_source
+            WHEN title_source = 'custom-title' AND ? <> 'custom-title' THEN title_source
+            ELSE ?
+          END
+        )
     `);
     const insertRequest = this.db.prepare(`
       INSERT OR IGNORE INTO transcript_requests(
@@ -1616,6 +1840,14 @@ export class Store {
         duration_ms = COALESCE(?, duration_ms),
         observed_at = COALESCE(?, observed_at)
       WHERE agent_id = ? AND profile_slug = ?
+        AND (
+          agent_type IS NOT COALESCE(?, agent_type)
+          OR resolved_model IS NOT COALESCE(?, resolved_model)
+          OR total_tokens IS NOT COALESCE(?, total_tokens)
+          OR tool_stats_json IS NOT COALESCE(?, tool_stats_json)
+          OR duration_ms IS NOT COALESCE(?, duration_ms)
+          OR observed_at IS NOT COALESCE(?, observed_at)
+        )
     `);
     const insertSkill = this.db.prepare(`
       INSERT OR IGNORE INTO transcript_skill_events(
@@ -1641,26 +1873,32 @@ export class Store {
           session.titleSource ?? null,
         );
         if (inserted.changes > 0) summary.sessions += 1;
-        else updateSession.run(
-          session.cwd ?? null,
-          session.gitBranch ?? null,
-          session.entrypoint ?? null,
-          session.clientVersion ?? null,
-          session.firstAt ?? null,
-          session.firstAt ?? null,
-          session.firstAt ?? null,
-          session.lastAt ?? null,
-          session.lastAt ?? null,
-          session.lastAt ?? null,
-          session.title ?? null,
-          session.titleSource ?? null,
-          session.title ?? null,
-          session.titleSource ?? null,
-          session.titleSource ?? null,
-          session.titleSource ?? null,
-          session.sessionId,
-          session.profileSlug,
-        );
+        else {
+          const updateValues = [
+            session.cwd ?? null,
+            session.gitBranch ?? null,
+            session.entrypoint ?? null,
+            session.clientVersion ?? null,
+            session.firstAt ?? null,
+            session.firstAt ?? null,
+            session.firstAt ?? null,
+            session.lastAt ?? null,
+            session.lastAt ?? null,
+            session.lastAt ?? null,
+            session.title ?? null,
+            session.titleSource ?? null,
+            session.title ?? null,
+            session.titleSource ?? null,
+            session.titleSource ?? null,
+            session.titleSource ?? null,
+          ];
+          updateSession.run(
+            ...updateValues,
+            session.sessionId,
+            session.profileSlug,
+            ...updateValues,
+          );
+        }
       }
       for (const request of requests) {
         const result = insertRequest.run(
@@ -1697,16 +1935,22 @@ export class Store {
           subagent.observedAt ?? null,
         );
         if (inserted.changes > 0) summary.subagents += 1;
-        else updateSubagent.run(
-          subagent.agentType ?? null,
-          subagent.resolvedModel ?? null,
-          subagent.totalTokens ?? null,
-          subagent.toolStatsJson ?? null,
-          subagent.durationMs ?? null,
-          subagent.observedAt ?? null,
-          subagent.agentId,
-          subagent.profileSlug,
-        );
+        else {
+          const updateValues = [
+            subagent.agentType ?? null,
+            subagent.resolvedModel ?? null,
+            subagent.totalTokens ?? null,
+            subagent.toolStatsJson ?? null,
+            subagent.durationMs ?? null,
+            subagent.observedAt ?? null,
+          ];
+          updateSubagent.run(
+            ...updateValues,
+            subagent.agentId,
+            subagent.profileSlug,
+            ...updateValues,
+          );
+        }
       }
       for (const skill of skills) {
         const result = insertSkill.run(
@@ -2060,7 +2304,7 @@ export class Store {
     // Issue #346 drill-down: the project burn view asks this same reader for
     // one project's sessions rather than growing a parallel session shape.
     if (project) {
-      const predicate = projectPredicate('s.cwd', project);
+      const predicate = this.projectPredicate('s.cwd', project);
       clauses.push(predicate.sql);
       params.push(...predicate.params);
     }
@@ -2152,7 +2396,7 @@ export class Store {
     if (profileSlug) { clauses.push('c.profile_slug = ?'); params.push(profileSlug); }
     if (sessionId) { clauses.push('c.session_id = ?'); params.push(sessionId); }
     if (project) {
-      const predicate = projectPredicate('c.cwd', project);
+      const predicate = this.projectPredicate('c.cwd', project);
       clauses.push(predicate.sql);
       params.push(...predicate.params);
     }
@@ -2368,7 +2612,7 @@ export class Store {
       ORDER BY observed_at, id LIMIT ?
     `).all(session.sessionId, session.profileSlug, SESSION_ANATOMY_ROW_LIMIT + 1) : this.db.prepare(`
       SELECT COALESCE(t.timestamp, c.last_timestamp) AS at, t.model, t.reasoning_effort AS effort,
-             NULL AS agent_id, t.input_tokens AS fresh, t.cache_write_input_tokens AS write,
+             NULL AS agent_id, ${CODEX_INPUT_UNCACHED} AS fresh, t.cache_write_input_tokens AS write,
              t.cached_input_tokens AS read, t.output_tokens AS out, t.total_tokens AS reported
       FROM codex_turns t JOIN codex_sessions c ON c.session_id = t.session_id
       WHERE t.session_id = ? ORDER BY t.turn_index LIMIT ?
@@ -2518,7 +2762,7 @@ export class Store {
     if (since) { clauses.push('r.observed_at >= ?'); params.push(since); }
     if (until) { clauses.push('r.observed_at < ?'); params.push(until); }
     if (project) {
-      const predicate = projectPredicate('s.cwd', project);
+      const predicate = this.projectPredicate('s.cwd', project);
       clauses.push(predicate.sql);
       params.push(...predicate.params);
     }
@@ -2565,7 +2809,7 @@ export class Store {
     if (since) { clauses.push(`${turnAt} >= ?`); params.push(since); }
     if (until) { clauses.push(`${turnAt} < ?`); params.push(until); }
     if (project) {
-      const predicate = projectPredicate('c.cwd', project);
+      const predicate = this.projectPredicate('c.cwd', project);
       clauses.push(predicate.sql);
       params.push(...predicate.params);
     }
@@ -2574,7 +2818,7 @@ export class Store {
       SELECT c.cwd AS cwd, c.git_branch AS git_branch, c.profile_slug AS profile_slug,
              COUNT(*) AS requests,
              COUNT(DISTINCT t.session_id) AS sessions,
-             COALESCE(SUM(t.input_tokens), 0) AS input_uncached,
+             COALESCE(SUM(${CODEX_INPUT_UNCACHED}), 0) AS input_uncached,
              COALESCE(SUM(t.cached_input_tokens), 0) AS input_cache_read,
              COALESCE(SUM(t.cache_write_input_tokens), 0) AS input_cache_write,
              COALESCE(SUM(t.output_tokens), 0) AS output_total,
@@ -2627,7 +2871,7 @@ export class Store {
       if (since) { clauses.push('r.observed_at >= ?'); params.push(since); }
       if (until) { clauses.push('r.observed_at < ?'); params.push(until); }
       if (project) {
-        const predicate = projectPredicate('s.cwd', project);
+        const predicate = this.projectPredicate('s.cwd', project);
         clauses.push(predicate.sql);
         params.push(...predicate.params);
       }
@@ -2653,7 +2897,7 @@ export class Store {
       if (since) { clauses.push(`${turnAt} >= ?`); params.push(since); }
       if (until) { clauses.push(`${turnAt} < ?`); params.push(until); }
       if (project) {
-        const predicate = projectPredicate('c.cwd', project);
+        const predicate = this.projectPredicate('c.cwd', project);
         clauses.push(predicate.sql);
         params.push(...predicate.params);
       }
@@ -2732,7 +2976,7 @@ export class Store {
       if (since) { clauses.push('r.observed_at >= ?'); params.push(since); }
       if (until) { clauses.push('r.observed_at < ?'); params.push(until); }
       if (project) {
-        const predicate = projectPredicate('s.cwd', project);
+        const predicate = this.projectPredicate('s.cwd', project);
         clauses.push(predicate.sql);
         params.push(...predicate.params);
       }
@@ -2756,7 +3000,7 @@ export class Store {
       if (since) { clauses.push(`${turnAt} >= ?`); params.push(since); }
       if (until) { clauses.push(`${turnAt} < ?`); params.push(until); }
       if (project) {
-        const predicate = projectPredicate('c.cwd', project);
+        const predicate = this.projectPredicate('c.cwd', project);
         clauses.push(predicate.sql);
         params.push(...predicate.params);
       }
@@ -2778,9 +3022,10 @@ export class Store {
       throw error;
     }
 
+    const rollups = trackedProjectRollups(this.listProjects());
     const folded = new Map();
     for (const row of rows) {
-      const identity = projectIdentityOf(row.cwd);
+      const identity = projectIdentityOf(row.cwd, rollups);
       const key = identity.key;
       const cell = `${key}\n${row.bucket}`;
       if (!folded.has(cell)) {
@@ -2846,6 +3091,7 @@ export class Store {
     // and nesting transactions is neither needed nor allowed here.
     const warehouse = this.usageSummary({ since, until, provider });
     const accounts = this.accountsByProfileSlug();
+    const rollups = trackedProjectRollups(this.listProjects());
 
     // Both halves under one read snapshot, so an ingester committing between
     // them cannot produce project rows that disagree with the totals.
@@ -2865,7 +3111,7 @@ export class Store {
     const folded = new Map();
     const totals = emptyProjectBurnAggregate();
     for (const row of rows) {
-      const identity = projectIdentityOf(row.cwd);
+      const identity = projectIdentityOf(row.cwd, rollups);
       const key = identity.key;
       if (!folded.has(key)) {
         folded.set(key, {

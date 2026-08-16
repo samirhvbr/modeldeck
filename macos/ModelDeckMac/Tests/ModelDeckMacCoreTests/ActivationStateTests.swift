@@ -109,7 +109,7 @@ struct ActiveIndicatorTests {
 
     @Test func mismatchedRendersPendingWithLinkCaption() {
         #expect(caption(for: .mismatched)
-            == "Selected as active, but the active link points at a different account")
+            == "Selected as active, but the active link points at a different subscription")
     }
 
     @Test func unlinkedRendersPendingWithNoLinkCaption() {
@@ -165,7 +165,7 @@ struct ActivationNoticeTests {
         #expect(notices.map(\.provider) == [.codex])
         // The notice says what works and what doesn't, calmly.
         #expect(notices[0].message.contains("usage tracking is accurate"))
-        #expect(notices[0].message.contains("switching accounts"))
+        #expect(notices[0].message.contains("switching subscriptions"))
         #expect(notices[0].message.contains("one-time migration"))
     }
 
@@ -193,7 +193,7 @@ struct ActivationNoticeTests {
 
     @Test func mismatchedAndUnlinkedGetHonestMessages() {
         #expect(ActivationNotice.message(for: .mismatched, provider: .claude)?
-            .contains("points at a different account") == true)
+            .contains("points at a different subscription") == true)
         // Issue #61: unlinked is the post-migration "ready" state — the
         // banner flips from "migration needed" to pointing at the button.
         #expect(ActivationNotice.message(for: .unlinked, provider: .codex)?

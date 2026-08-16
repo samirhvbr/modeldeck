@@ -125,6 +125,57 @@ test('TRIPWIRE attribution-one-derivation: below-floor fit falls back and larges
   )), true);
 });
 
+test('TRIPWIRE multi-window-share-bounded: project shares stay at or below 100% across resets', (t) => {
+  const { store } = fixture(t);
+  const accountId = store.listAccounts().find((account) => account.provider === 'claude').id;
+  store.db.prepare('DELETE FROM usage_snapshots WHERE account_id = ?').run(accountId);
+  store.recordUsage(accountId, {
+    scope: 'weekly', usedPercent: 0, resetsAt: '2026-08-02T00:00:00.000Z',
+    observedAt: '2026-07-31T23:55:00.000Z', source: 'fixture',
+  });
+  store.recordUsage(accountId, {
+    scope: 'weekly', usedPercent: 80, resetsAt: '2026-08-02T00:00:00.000Z',
+    observedAt: '2026-08-01T12:00:00.000Z', source: 'fixture',
+  });
+  store.recordUsage(accountId, {
+    scope: 'weekly', usedPercent: 20, resetsAt: '2026-08-09T00:00:00.000Z',
+    observedAt: '2026-08-02T00:10:00.000Z', source: 'fixture',
+  });
+  store.recordUsage(accountId, {
+    scope: 'weekly', usedPercent: 50, resetsAt: '2026-08-09T00:00:00.000Z',
+    observedAt: '2026-08-02T12:00:00.000Z', source: 'fixture',
+  });
+  store.db.prepare(`
+    UPDATE usage_estimate_fits
+    SET input_uncached_weight = 20, input_cache_read_weight = 10,
+        input_cache_write_weight = 10, output_total_weight = 10,
+        fit_quality = 0.8
+    WHERE pool_id = 'claude' AND scope = 'weekly'
+  `).run();
+
+  const report = attributionReport(store, {
+    since: '2026-08-01T00:00:00.000Z',
+    until: '2026-08-03T00:00:00.000Z',
+  });
+  const legacyAbsolutePercent = report.projects
+    .filter((project) => project.tokenFlows != null)
+    .map((project) => 20 * project.tokenFlows.inputUncached
+      + 10 * project.tokenFlows.inputCacheRead
+      + 10 * project.tokenFlows.inputCacheWrite
+      + 10 * project.tokenFlows.outputTotal);
+
+  assert.deepEqual(legacyAbsolutePercent.sort((left, right) => right - left), [140, 40],
+    'fixture reproduces the legacy 180%-over-one-window arithmetic across two windows');
+  assert.equal(report.measured.total, 1.3, '80% + reset-to-20% + 30% = 130% measured burn');
+  assert.deepEqual(Object.fromEntries(report.projects.map((project) => [project.key, project.subscriptions])), {
+    '/placeholder/projects/alpha': 0,
+    '/placeholder/projects/beta': 0,
+    __untraced: 1.3,
+  });
+  assert.equal(report.projects.reduce((sum, project) => sum + project.subscriptions, 0), report.measured.total);
+  assert.ok(report.projects.every((project) => project.subscriptions / report.measured.total <= 1));
+});
+
 test('measured burn with no session corpus remains an explicit untraced exact-sum row', (t) => {
   const { store } = fixture(t);
   const accountId = store.listAccounts().find((account) => account.provider === 'claude').id;
@@ -304,7 +355,7 @@ test('TRIPWIRE anatomy-codex-honesty: Codex degrades to turns, timeline, curve, 
     sessionId: 'codex-placeholder', profileSlug: 'codex-placeholder', machine: 'placeholder-machine',
     cwd: '/placeholder/projects/alpha', gitBranch: 'lane/codex',
     firstTimestamp: '2026-08-01T05:00:00.000Z', lastTimestamp: '2026-08-01T06:00:00.000Z', archived: false,
-  }, [{ turnIndex: 0, turnId: 'turn-placeholder', model: 'gpt-5.6-sol', reasoningEffort: 'high', inputTokens: 10, cachedInputTokens: 20, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 2, totalTokens: 99, timestamp: '2026-08-01T05:30:00.000Z' }]);
+  }, [{ turnIndex: 0, turnId: 'turn-placeholder', model: 'gpt-5.6-sol', reasoningEffort: 'high', inputTokens: 30, cachedInputTokens: 20, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 2, totalTokens: 35, timestamp: '2026-08-01T05:30:00.000Z' }]);
   const anatomy = store.sessionAnatomy({ sessionId: 'codex-placeholder', profile: 'codex-placeholder', provider: 'codex' });
   assert.equal(anatomy.supports.unit, 'turn');
   assert.equal(anatomy.supports.composition, false);
@@ -312,7 +363,7 @@ test('TRIPWIRE anatomy-codex-honesty: Codex degrades to turns, timeline, curve, 
   assert.equal(anatomy.supports.cacheRate, false);
   assert.match(anatomy.supports.note, /no subagent or skill records/);
   assert.equal(anatomy.timeline.buckets[0].tokens, 35);
-  assert.equal(anatomy.totals.reportedTokens, 99);
+  assert.equal(anatomy.totals.reportedTokens, 35);
   assert.equal(anatomy.curve.length, 1);
 });
 

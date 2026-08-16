@@ -111,7 +111,7 @@ struct Issue315ZeroWeightFilterTests {
             row(account("b", label: "Routed", proxyWeight: 5))))
         #expect(!DeckPopoverModel.isHiddenByZeroWeightFilter(
             row(account("c", label: "Unrouted"))),
-            "nil weight is absence, not zero — an unrouted account stays visible")
+            "nil weight is absence, not zero — an unrouted subscription stays visible")
         let benched = account("d", label: "Benched", proxyWeight: 3, proxyFableExcluded: true)
         let benchedRow = row(benched)
         #expect(benchedRow.proxyWeightPresentation?.weight == 0,
@@ -179,10 +179,10 @@ struct Issue315ZeroWeightFilterTests {
         let claude = model.columns(for: fixtureState(), now: now)
             .first { $0.provider == .claude }!
         #expect(claude.rows.count == 3)
-        #expect(claude.accountCountText == "5 accounts")
+        #expect(claude.subscriptionCountText == "5 subscriptions")
         // Singular form survives the arithmetic.
         #expect(DeckColumn(provider: .codex, rows: [], hiddenAccountCount: 1)
-            .accountCountText == "1 account")
+            .subscriptionCountText == "1 subscription")
     }
 
     @Test func filterOffIsByteIdenticalToPreFilterDerivation() {
@@ -193,7 +193,7 @@ struct Issue315ZeroWeightFilterTests {
         #expect(columns.allSatisfy { $0.hiddenAccountCount == 0 })
         let claude = columns.first { $0.provider == .claude }!
         #expect(Set(claude.rows.map(\.id)) == ["c1", "c2", "c3", "c4", "c5"])
-        #expect(claude.accountCountText == "5 accounts")
+        #expect(claude.subscriptionCountText == "5 subscriptions")
     }
 
     @Test func interleavedRowsRespectTheFilter() {

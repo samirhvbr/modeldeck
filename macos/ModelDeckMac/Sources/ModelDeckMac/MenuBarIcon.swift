@@ -62,7 +62,7 @@ struct MenuBarIconView: View {
             if let label = statusModel.pinnedAccountLabel {
                 return "ModelDeck: \(percent) percent left on \(label)"
             }
-            return "ModelDeck: \(percent) percent left on the pinned account"
+            return "ModelDeck: \(percent) percent left on the pinned subscription"
         case .warning(let percent):
             if let source = percentSourceText {
                 return "ModelDeck: \(percent) percent left on \(source)"

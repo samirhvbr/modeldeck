@@ -323,7 +323,7 @@ struct FooterFreshnessExplanationTests {
             ]
         )
         let explanation = explanation(for: state)
-        #expect(explanation.body.contains("All accounts are currently fresh."))
+        #expect(explanation.body.contains("All subscriptions are currently fresh."))
         #expect(!explanation.body.contains("Waiting on"))
     }
 
@@ -359,7 +359,7 @@ struct FooterFreshnessExplanationTests {
         )
         let explanation = explanation(for: state)
         #expect(!explanation.body.contains("Retired"))
-        #expect(explanation.body.contains("All accounts are currently fresh."))
+        #expect(explanation.body.contains("All subscriptions are currently fresh."))
     }
 
     @Test func accountsWithoutObservationsAreNotListed() {
@@ -369,12 +369,12 @@ struct FooterFreshnessExplanationTests {
             accounts: [DeckAccount(id: "a", provider: "claude", label: "Studio")],
             usage: []
         )
-        #expect(explanation(for: state).body.contains("All accounts are currently fresh."))
+        #expect(explanation(for: state).body.contains("All subscriptions are currently fresh."))
     }
 
     @Test func nilOrEmptyStateExplainsWithoutClaimingFreshness() {
-        #expect(explanation(for: nil).body.contains("No account data has arrived yet."))
-        #expect(explanation(for: DeckState()).body.contains("No account data has arrived yet."))
+        #expect(explanation(for: nil).body.contains("No subscription data has arrived yet."))
+        #expect(explanation(for: DeckState()).body.contains("No subscription data has arrived yet."))
     }
 
     // MARK: Issue #168 — per-account reasons in the breakdown
@@ -401,7 +401,7 @@ struct FooterFreshnessExplanationTests {
             ]
         )
         let explanation = explanation(for: state)
-        #expect(explanation.body.contains("Live accounts are refreshing normally."))
+        #expect(explanation.body.contains("Live subscriptions are refreshing normally."))
         #expect(explanation.body.contains("Paused:"))
         #expect(explanation.body.contains("• Client — data from 1 day ago · idle, renews on next use"))
         #expect(explanation.body.contains("• Personal — data from 16 hr ago · sign in needed"))

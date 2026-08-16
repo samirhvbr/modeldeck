@@ -253,35 +253,44 @@ export default function App() {
   // the same `go` the crumbs call, so history behaves identically either way.
   const parent = parentOf(route);
   const trail = useRef(null);
-  const returning = useRef(false);
   const goUp = () => {
     if (!parent) return;
-    returning.current = true;
     go(parent.to);
   };
-  // A return click can unmount the control that was clicked — both controls are
-  // absent at the overview — which would strand focus on a removed node and drop
-  // the keyboard reader at the top of the document (#363). When that happens,
-  // and only then, focus parks on the breadcrumb trail: the one navigation
-  // landmark present at every level.
+  /*
+   * KEYBOARD FOCUS ACROSS RE-RENDERS (#363).
+   *
+   * A data re-render does not cost the reader his place: this page is React, so
+   * a refetch reconciles the tree and every control keeps the DOM node it had,
+   * focus included. NAVIGATION is the case that does, and it is the whole of the
+   * defect: the control a reader activates to change level is often removed BY
+   * that change — a treemap block and a session row open the level they name and
+   * then cease to exist, the crumb reading "Overview" becomes plain text once it
+   * IS the page, and both return controls are absent at the landing. The browser
+   * answers a removed focus by dropping to <body>, which puts a keyboard reader
+   * back at the top of the document with his position gone.
+   *
+   * So one rule, over every route change and therefore every view: if a
+   * navigation left focus stranded on <body>, park it on the breadcrumb trail —
+   * the one navigation landmark present at every level, and where a reader needs
+   * to be to walk back out of where he just went. Focus that SURVIVED the commit
+   * is never moved, which is what keeps a filter or a toggle exactly where it is.
+   *
+   * A deep-link arrival (#424) is the same problem without a click: nothing on
+   * this page was activated at all, so focus is wherever the host window left it
+   * — for the app window, on the window chrome. It parks unconditionally.
+   */
+  const mounted = useRef(false);
   useEffect(() => {
-    if (!returning.current) return;
-    returning.current = false;
+    const first = !mounted.current;
+    mounted.current = true;
+    // A plain load is not a navigation: the reader is at the top of the page
+    // because that is where he opened it, and stealing his focus would be rude.
+    if (first && !start.deepLinked) return;
     const active = document.activeElement;
-    if (active && active !== document.body) return;
+    if (!first && active && active !== document.body) return;
     if (trail.current) trail.current.focus();
   }, [route]);
-  // A DEEP-LINK arrival below the landing has the same problem a return click
-  // has (#363): nothing was clicked, so focus is wherever the host window left
-  // it — for the app window, on the window chrome. Park it on the crumb trail,
-  // the one navigation landmark present at every level, which is also where a
-  // keyboard reader needs to be to walk back OUT of where he was just sent.
-  const landed = useRef(start.deepLinked);
-  useEffect(() => {
-    if (!landed.current) return;
-    landed.current = false;
-    if (trail.current) trail.current.focus();
-  }, []);
   // Tell the host window where the reader is, so a relaunch reopens here
   // (#402(c)). One-way and advisory — a browser tab has no host and this is a
   // no-op there. It reports the position, never asks for one.

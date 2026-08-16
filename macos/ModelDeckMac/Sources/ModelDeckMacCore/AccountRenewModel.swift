@@ -178,7 +178,7 @@ public enum AccountRenew {
         case "busy":
             return busyFallback
         case "signin-required":
-            return "This account needs a fresh sign-in — renewal can't fix that."
+            return "This subscription needs a fresh sign-in — renewal can't fix that."
         case "auth-overridden":
             return authOverrideExplanation
         case "failed":

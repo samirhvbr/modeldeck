@@ -510,7 +510,7 @@ struct AvailabilityReportTests {
         let presentation = AvailabilityHealthPresentation.make(report: report, now: fixedNow)
         #expect(presentation.chipWord == "No data")
         #expect(presentation.score == nil)
-        #expect(presentation.readout == "No usable Claude accounts to score.")
+        #expect(presentation.readout == "No usable Claude subscriptions to score.")
         #expect(presentation.excludedLine == "Not counted: SignedOut (sign in needed)")
     }
 

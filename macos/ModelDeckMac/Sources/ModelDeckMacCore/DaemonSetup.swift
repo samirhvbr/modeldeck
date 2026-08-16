@@ -279,7 +279,7 @@ public func verifyDaemonAfterReregister(
 /// password prompt from a just-installed app reads as a credential grab, and
 /// a dismissed Keychain prompt silently strands the deck on stale data. The
 /// copy lives in Core so tests can pin the load-bearing guidance ("Always
-/// Allow", "once per account", "from macOS, not ModelDeck").
+/// Allow", "once per subscription", "from macOS, not ModelDeck").
 public enum SystemPromptCoaching {
     /// Rendered on the first-run consent card (issue #96's card — extended,
     /// not redesigned): frames the Login Items approval before macOS asks.
@@ -289,7 +289,7 @@ public enum SystemPromptCoaching {
     /// installing/starting — BEFORE its first refresh triggers the per-
     /// account Keychain prompts.
     public static let keychainHeadline = "Next: Keychain permission prompts"
-    public static let keychainBody = "Once the service starts, macOS will ask permission for it to read each Claude account's sign-in from your Keychain — one prompt per account, from macOS itself. Choose Always Allow (it may ask for your password once per account); plain Allow asks again on every refresh. Properly signed app updates won't re-prompt."
+    public static let keychainBody = "Once the service starts, macOS will ask permission for it to read each Claude subscription's sign-in from your Keychain — one prompt per subscription, from macOS itself. Choose Always Allow (it may ask for your password once per subscription); plain Allow asks again on every refresh. Properly signed app updates won't re-prompt."
 }
 
 // MARK: - Model

@@ -50,7 +50,7 @@ struct SettingsWindowView: View {
 
     var body: some View {
         // Issue #118: the tab selection is model state so the deck's
-        // "Sign in again…" action can land the window on Accounts even
+        // "Sign in again…" action can land the window on Subscriptions even
         // when the user last viewed General.
         TabView(selection: $deckModel.settingsPane) {
             AccountsSettingsPane(
@@ -64,7 +64,7 @@ struct SettingsWindowView: View {
                 proxyReloginModel: proxyReloginModel,
                 identityVerifyModel: identityVerifyModel
             )
-            .tabItem { Label("Accounts", systemImage: "person.2") }
+            .tabItem { Label("Subscriptions", systemImage: "person.2") }
             .tag(SettingsPane.accounts)
 
             GeneralSettingsPane(
@@ -156,7 +156,7 @@ struct AccountsSettingsPane: View {
                 Spacer()
                 Text(statusModel.deckState == nil
                     ? "Waiting for the daemon…"
-                    : "No accounts yet. Click Add Account to connect one.")
+                    : "No subscriptions yet. Click Add Subscription to connect one.")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
                 Spacer()
@@ -194,7 +194,7 @@ struct AccountsSettingsPane: View {
             Divider()
             HStack {
                 // Issue #8 — the 3-step add-account flow (spec "Add account").
-                Button("Add Account…") { isAddingAccount = true }
+                Button("Add Subscription…") { isAddingAccount = true }
                     .disabled(statusModel.deckState == nil)
                     .help(statusModel.deckState == nil
                         ? "Waiting for the daemon"
@@ -207,7 +207,7 @@ struct AccountsSettingsPane: View {
         .sheet(isPresented: $isAddingAccount) {
             AddAccountSheet(model: addAccountModel)
         }
-        // Issue #226: the deck popover's "Add Account…" entry points route
+        // Issue #226: the deck popover's "Add Subscription…" entry points route
         // here — one-shot consume (the model clears the flag) so a later
         // tab switch or window reopen can never resurrect a request that
         // already presented the sheet. Both hooks are needed: onAppear for
@@ -223,7 +223,7 @@ struct AccountsSettingsPane: View {
             AccountEditSheet(account: account, accountsModel: accountsModel)
         }
         .confirmationDialog(
-            "Remove \(removalCandidate?.label ?? "account")?",
+            "Remove \(removalCandidate?.label ?? "subscription")?",
             isPresented: Binding(
                 get: { removalCandidate != nil },
                 set: { if !$0 { removalCandidate = nil } }
@@ -238,7 +238,7 @@ struct AccountsSettingsPane: View {
             }
             Button("Cancel", role: .cancel) { removalCandidate = nil }
         } message: {
-            Text("Removes only ModelDeck's reference to this account. Provider credentials and sign-ins are never touched.")
+            Text("Removes only ModelDeck's reference to this subscription. Provider credentials and sign-ins are never touched.")
         }
         // Issue #279: EVERY proxy action confirms first (Tim: "ask each
         // time rather than make it automatic"), in one plain sentence. The
@@ -491,7 +491,7 @@ struct ProviderActivationBannerView: View {
                         .controlSize(.small)
                         .disabled(isActivationInFlight)
                         .help(banner.retryRunsActivation
-                            ? "Run activation again for the affected account. New sessions only — running sessions are never touched."
+                            ? "Run activation again for the affected subscription. New sessions only — running sessions are never touched."
                             : "Re-check the provider's activation state")
                 }
                 Button("Why?") { isShowingWhy = true }
@@ -729,7 +729,7 @@ struct AccountRosterRow: View {
                     Button("Complete Activation", action: onActivate)
                         .controlSize(.small)
                         .disabled(isBusy || isActivating || isActivationInFlight)
-                        .help("This account is selected as active but activation isn't in effect yet. Once any blocker is cleared, this lays the active link for new sessions. Running sessions are never touched.")
+                        .help("This subscription is selected as active but activation isn't in effect yet. Once any blocker is cleared, this lays the active link for new sessions. Running sessions are never touched.")
                         .accessibilityLabel("Complete activation for \(account.label)")
                 }
                 // Hover ⋯ — the visible path to Edit/Remove (the row's
@@ -743,7 +743,7 @@ struct AccountRosterRow: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
                 .opacity(isHovered ? 1 : 0)
-                .help("Edit or remove this account (also on right-click)")
+                .help("Edit or remove this subscription (also on right-click)")
                 .accessibilityLabel("Actions for \(account.label)")
                 radio
             }
@@ -818,8 +818,8 @@ struct AccountRosterRow: View {
         let providerName = DeckProvider.from(account.provider)?.displayName ?? "this provider"
         if account.isDefault {
             return isRadioPending
-                ? "Selected as active, but activation isn't in effect yet — see the notice above. New sessions keep the previous account until activation completes."
-                : "Active — new \(providerName) sessions use this account. Running sessions are never touched."
+                ? "Selected as active, but activation isn't in effect yet — see the notice above. New sessions keep the previous subscription until activation completes."
+                : "Active — new \(providerName) sessions use this subscription. Running sessions are never touched."
         }
         return onActivate == nil
             ? "Activation isn't available right now."
@@ -867,7 +867,7 @@ struct AccountRosterRow: View {
             Divider()
             Button("Stop routing sessions…", action: onProxyUnroute)
                 .disabled(isBusy)
-                .help("New sessions for this account stop going through the local proxy. "
+                .help("New sessions for this subscription stop going through the local proxy. "
                     + "Running sessions are never touched.")
         }
         // Issue #396: the repair stays reachable even for a member the proxy
@@ -985,7 +985,7 @@ struct AccountRosterRow: View {
                         Button("Add to proxy pool…", action: onProxyJoin)
                             .controlSize(.small)
                             .disabled(isBusy)
-                            .help("Signs this account in to the local proxy so it can serve "
+                            .help("Signs this subscription in to the local proxy so it can serve "
                                 + "pooled traffic. A browser sign-in opens; nothing changes until "
                                 + "it completes.")
                             .accessibilityLabel("Add \(account.label) to the proxy pool")
@@ -995,7 +995,7 @@ struct AccountRosterRow: View {
                         Button("Route sessions…", action: onProxyRoute)
                             .controlSize(.small)
                             .disabled(isBusy)
-                            .help("New sessions for this account go through the local proxy. "
+                            .help("New sessions for this subscription go through the local proxy. "
                                 + "Running sessions are never touched, and this is reversible.")
                             .accessibilityLabel("Route \(account.label) sessions through the proxy")
                     }
@@ -1225,8 +1225,8 @@ struct AccountRosterRow: View {
                 } else {
                     HealthChipView(chip: account.healthChip)
                         .help(signInAgainHelp(base: account.healthChip == .idleSignIn
-                            ? "This account's sign-in renews when it is next used; its usage data is paused until then"
-                            : "This account needs a fresh sign-in"))
+                            ? "This subscription's sign-in renews when it is next used; its usage data is paused until then"
+                            : "This subscription needs a fresh sign-in"))
                         // CodeRabbit PR #222: the pill shrank to "Idle", so
                         // VoiceOver needs the renewal context spoken here —
                         // stated as fact, no "Sign in now" (no action exists
@@ -1317,7 +1317,7 @@ struct AccountRosterRow: View {
                 if let onRenewNow {
                     Button("Renew now", action: onRenewNow)
                         .controlSize(.small)
-                        .help("Renews this account's sign-in in the background — no Terminal, no browser. "
+                        .help("Renews this subscription's sign-in in the background — no Terminal, no browser. "
                             + AccountRenew.disclosure)
                         .accessibilityLabel("Renew sign-in for \(account.label)")
                 }
@@ -1338,9 +1338,9 @@ struct AccountRosterRow: View {
     private var signInChipActionableHelp: String {
         let providerName = DeckProvider.from(account.provider)?.displayName ?? "the provider"
         if account.healthChip == .idleSignIn {
-            return "This account's sign-in renews when it is next used; its usage data is paused until then. Launch \(providerName)'s own login in Terminal to refresh now"
+            return "This subscription's sign-in renews when it is next used; its usage data is paused until then. Launch \(providerName)'s own login in Terminal to refresh now"
         }
-        return "Launch \(providerName)'s own login for this account in Terminal"
+        return "Launch \(providerName)'s own login for this subscription in Terminal"
     }
 
     /// Issue #149: VoiceOver hears WHICH case it is, then the same action.
@@ -1355,7 +1355,7 @@ struct AccountRosterRow: View {
     private var signInProgressText: String {
         switch signInPhase {
         case .verifying: return "Verifying…"
-        case .activating: return "Activating this account for sign-in…"
+        case .activating: return "Activating this subscription for sign-in…"
         default: return "Opening Terminal…"
         }
     }
@@ -1460,7 +1460,7 @@ struct GeneralSettingsPane: View {
     /// Issue #32 item 4: the CLI-row chip is the ACTIVE account's auth state
     /// (daemon contract), so the row names that account explicitly.
     @ObservedObject var statusModel: MenuBarStatusModel
-    /// Issue #73: owns the app-local "Show account emails" preference the
+    /// Issue #73: owns the app-local "Show subscription emails" preference the
     /// deck rows read (default off; never synced to the daemon).
     @ObservedObject var deckModel: DeckPopoverModel
     @ObservedObject var updateModel: ToolUpdateModel
@@ -1498,7 +1498,7 @@ struct GeneralSettingsPane: View {
     /// current selection does — state-honest, including the off state.
     private var hideShowCaption: String {
         guard deckModel.hideShowEnabled else {
-            return "Hiding is off — every account is shown. Your mode and hidden accounts are kept for when it's back on."
+            return "Hiding is off — every subscription is shown. Your mode and hidden subscriptions are kept for when it's back on."
         }
         switch deckModel.hideMode {
         case .byAccount:
@@ -1506,11 +1506,11 @@ struct GeneralSettingsPane: View {
             // caption under the mode picker (Settings parity, decision 4),
             // so this state-honest line keeps only what that caption
             // doesn't say.
-            return "Nothing hides until you hide an account."
+            return "Nothing hides until you hide a subscription."
         case .byRemaining:
             return deckModel.byRemainingCaption
         case .byZeroWeightings:
-            return "Accounts whose row shows routing weight 0 hide automatically. The right-click Hide line is off in this mode."
+            return "Subscriptions whose row shows routing weight 0 hide automatically. The right-click Hide line is off in this mode."
         }
     }
 
@@ -1569,18 +1569,18 @@ struct GeneralSettingsPane: View {
                 // disclosure of the tiny invocation and its possible
                 // 5-hour-window side effect. The daemon owns the schedule
                 // and every guard; this is only the switch.
-                Toggle("Keep idle Claude accounts fresh automatically", isOn: binding(
+                Toggle("Keep idle Claude subscriptions fresh automatically", isOn: binding(
                     get: { $0.autoRenewEnabled },
                     set: { model, value in await model.setAutoRenewEnabled(value) }
                 ))
-                .help("When an idle Claude account's stored sign-in expires, ModelDeck renews it in the background — no Terminal, no browser. "
+                .help("When an idle Claude subscription's stored sign-in expires, ModelDeck renews it in the background — no Terminal, no browser. "
                     + AccountRenew.disclosure)
                 // State-honest caption (CodeRabbit, PR #196; the Menu bar /
                 // ModelDeck section precedent): describe what is actually
                 // running, never the behavior a disabled toggle would have.
                 Text(settingsSync.settings.autoRenewEnabled
-                    ? "When an idle account's sign-in expires, ModelDeck renews it automatically. \(AccountRenew.disclosure)"
-                    : "Automatic renewal is off — an idle account's expired sign-in stays paused until you renew it or use the account.")
+                    ? "When an idle subscription's sign-in expires, ModelDeck renews it automatically. \(AccountRenew.disclosure)"
+                    : "Automatic renewal is off — an idle subscription's expired sign-in stays paused until you renew it or use the subscription.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 // Issue #343 (usage-analytics decision 12): the dashboard
@@ -1620,8 +1620,8 @@ struct GeneralSettingsPane: View {
                 // App-local preference (like Launch at Login); the daemon
                 // never stores it. Settings → Accounts always shows
                 // identities: it's the management surface.
-                Toggle("Show account emails", isOn: $deckModel.showAccountEmails)
-                    .help("Show each account's identity (email) under its name in the popover. Off by default; applies to both providers. The Accounts pane always shows identities.")
+                Toggle("Show subscription emails", isOn: $deckModel.showAccountEmails)
+                    .help("Show each subscription's identity (email) under its name in the popover. Off by default; applies to both providers. The Subscriptions pane always shows identities.")
                 // Tim directive 2026-08-02: the model window (e.g. Fable
                 // weekly) is the quota he plans around; the 5-hour burst
                 // limit kept stealing the headline. Off by default —
@@ -1636,9 +1636,9 @@ struct GeneralSettingsPane: View {
             // surfaces). Everything here is display-only: hidden accounts
             // keep routing, refreshing, and feeding the menu bar, and the
             // deck's counts keep stating roster totals.
-            Section("Hide/Show Accounts") {
-                Toggle("Hide accounts from the deck", isOn: $deckModel.hideShowEnabled)
-                    .help("The master switch for hiding — the deck footer's eye toggles the same thing. Display only: hidden accounts still count for routing, health, and the menu bar.")
+            Section("Hide/Show Subscriptions") {
+                Toggle("Hide subscriptions from the deck", isOn: $deckModel.hideShowEnabled)
+                    .help("The master switch for hiding — the deck footer's eye toggles the same thing. Display only: hidden subscriptions still count for routing, health, and the menu bar.")
                 Picker("Mode", selection: $deckModel.hideMode) {
                     ForEach(DeckPopoverModel.DeckHideMode.allCases, id: \.self) { mode in
                         Text(mode.displayName).tag(mode)
@@ -1657,7 +1657,7 @@ struct GeneralSettingsPane: View {
                 // is off in this mode" would contradict it (PR #322
                 // adversarial review, minor finding).
                 if deckModel.contextMenuHideShowEnabled {
-                    Text("Right-click an account on the deck to hide it.")
+                    Text("Right-click a subscription on the deck to hide it.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1669,7 +1669,7 @@ struct GeneralSettingsPane: View {
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("Remaining at least")
-                            Text("Hides accounts below the threshold")
+                            Text("Hides subscriptions below the threshold")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -1769,13 +1769,13 @@ struct GeneralSettingsPane: View {
                     // Issue #229: no number at all — just the glyph. At the
                     // top: it's the "least menu bar" end of the spectrum.
                     Text("None — icon only").tag(MenuBarPinResolver.noneSentinel)
-                    Text("Lowest across all accounts").tag("")
+                    Text("Lowest across all subscriptions").tag("")
                     // Tim's follow-up: after an account switch the menu bar
                     // should usually track the newly active account — these
                     // follow the provider's ACTIVE account automatically.
-                    Text("Active Claude account")
+                    Text("Active Claude subscription")
                         .tag(MenuBarPinResolver.followActiveSentinel(for: .claude))
-                    Text("Active Codex account")
+                    Text("Active Codex subscription")
                         .tag(MenuBarPinResolver.followActiveSentinel(for: .codex))
                     // Issue #235: the Availability Health display modes —
                     // the menu bar shows the provider's tier-aware 7-day
@@ -1792,7 +1792,7 @@ struct GeneralSettingsPane: View {
                         Text(option.title).tag(option.id)
                     }
                 }
-                .help("A pinned account shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. The Pinned window control below can show a specific window (like the Fable weekly) instead of the lowest. \"Active … account\" follows whichever account is currently active for that provider. \"Lowest across all accounts\" shows a percentage only when some account drops below the warning threshold. \"… availability health\" shows that provider's Availability Health verdict as a colored status dot beside the icon (green circle, yellow triangle, red octagon — the deck column chip's 7-day runway simulation) instead of a percentage. \"None — icon only\" never shows a percentage; notifications still watch every account.")
+                .help("A pinned subscription shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. The Pinned window control below can show a specific window (like the Fable weekly) instead of the lowest. \"Active … subscription\" follows whichever subscription is currently active for that provider. \"Lowest across all subscriptions\" shows a percentage only when some subscription drops below the warning threshold. \"… availability health\" shows that provider's Availability Health verdict as a colored status dot beside the icon (green circle, yellow triangle, red octagon — the deck column chip's 7-day runway simulation) instead of a percentage. \"None — icon only\" never shows a percentage; notifications still watch every subscription.")
                 // Issue #292 (Tim's field report): pinning Click AI to
                 // watch the Fable weekly showed the 5-hour window instead —
                 // the pin always displayed the account's lowest window.
@@ -1810,7 +1810,7 @@ struct GeneralSettingsPane: View {
                             Text(option.title).tag(option.key)
                         }
                     }
-                    .help("Which of the pinned account's usage windows the menu bar shows. \"Lowest window\" follows whichever non-spend window has the least left — the previous behavior. A chosen window the account stops reporting falls back to the lowest window; the deck's menu-bar source line always names the window actually shown.")
+                    .help("Which of the pinned subscription's usage windows the menu bar shows. \"Lowest window\" follows whichever non-spend window has the least left — the previous behavior. A chosen window the subscription stops reporting falls back to the lowest window; the deck's menu-bar source line always names the window actually shown.")
                 }
                 // Issue #238 quiet mode — the mode-specific WHEN row (Tim's
                 // refinement): percentage modes gate on an editable inline
@@ -1825,13 +1825,13 @@ struct GeneralSettingsPane: View {
                             Text("When yellow or worse").tag(MenuBarShowWhen.yellowOrWorse.stored)
                             Text("Only when red").tag(MenuBarShowWhen.redOnly.stored)
                         }
-                        .help("\"When yellow or worse\" shows the status dot only while the availability verdict is Yellow or Red — a green deck renders the plain icon. Display only: notifications keep watching every account regardless.")
+                        .help("\"When yellow or worse\" shows the status dot only while the availability verdict is Yellow or Red — a green deck renders the plain icon. Display only: notifications keep watching every subscription regardless.")
                     } else {
                         Picker("Show it", selection: percentQuietEnabledBinding) {
                             Text("Always").tag(false)
                             Text("Only below a threshold").tag(true)
                         }
-                        .help("\"Only below a threshold\" shows the percentage only while it is under the level you set — above it, just the icon. Display only: notifications keep watching every account regardless.")
+                        .help("\"Only below a threshold\" shows the percentage only while it is under the level you set — above it, just the icon. Display only: notifications keep watching every subscription regardless.")
                         if quietPercentThreshold != nil {
                             HStack(spacing: 6) {
                                 Text("Show when below")
@@ -1876,7 +1876,7 @@ struct GeneralSettingsPane: View {
             // feature (`/api/state` `sharedScope` — the #174 precedent: an
             // old daemon shows no control instead of a dead one).
             if statusModel.deckState?.sharedScope != nil {
-                Section("Claude accounts") {
+                Section("Claude subscriptions") {
                     sharedScopeControls
                 }
             }
@@ -2220,7 +2220,7 @@ struct GeneralSettingsPane: View {
     }
 
     /// The provider's active (default) account, for the CLI-row chip
-    /// caption. Distinguishes "no accounts at all" from "accounts exist but
+    /// caption. Distinguishes "no subscriptions at all" from "subscriptions exist but
     /// none is active" so the caption never claims nothing is set up when
     /// something is.
     private func activeAccountStatus(for provider: DeckProvider) -> ToolStatusRow.ActiveAccountStatus {
@@ -2245,7 +2245,7 @@ struct GeneralSettingsPane: View {
             return (id: account.id, title: "\(provider) — \(account.label)")
         }
         // Issue #292: matched on the pin's base so a window-choice suffix
-        // never earns a spurious "Removed account" ghost row.
+        // never earns a spurious "Removed subscription" ghost row.
         let current = MenuBarPinResolver.pinBase(settingsSync.settings.menuBarAccountId)
         // Follow-active sentinels, the #229 "none" sentinel, and the #235
         // health sentinels have their own static rows above. (An
@@ -2255,7 +2255,7 @@ struct GeneralSettingsPane: View {
             && !MenuBarPinResolver.isNone(current)
             && !MenuBarPinResolver.isHealth(current)
             && !options.contains(where: { $0.id == current }) {
-            options.append((id: current, title: "Removed account"))
+            options.append((id: current, title: "Removed subscription"))
         }
         return options
     }
@@ -2387,7 +2387,7 @@ struct GeneralSettingsPane: View {
     private var menuBarCaption: String {
         let current = settingsSync.settings.menuBarAccountId
         if MenuBarPinResolver.isNone(current) {
-            return "The menu bar shows only the ModelDeck icon — never a percentage. Notifications still watch every account."
+            return "The menu bar shows only the ModelDeck icon — never a percentage. Notifications still watch every subscription."
         }
         // Issue #235: the health modes name their own display behavior,
         // like every other branch here; #238 adds the quiet variants —
@@ -2396,21 +2396,21 @@ struct GeneralSettingsPane: View {
         if let provider = MenuBarPinResolver.healthProvider(current) {
             switch effectiveShowWhen {
             case .yellowOrWorse:
-                return "The \(provider.displayName) availability status dot appears only while the verdict is Yellow or Red — while it's green, just the plain icon. Display only: notifications still watch every account."
+                return "The \(provider.displayName) availability status dot appears only while the verdict is Yellow or Red — while it's green, just the plain icon. Display only: notifications still watch every subscription."
             case .redOnly:
-                return "The \(provider.displayName) availability status dot appears only while the verdict is Red — otherwise just the plain icon. Display only: notifications still watch every account."
+                return "The \(provider.displayName) availability status dot appears only while the verdict is Red — otherwise just the plain icon. Display only: notifications still watch every subscription."
             case .always, .belowPercent:
-                return "The menu bar shows \(provider.displayName)'s availability health as a colored status dot — green circle, yellow triangle, or red octagon from the 7-day runway simulation — instead of a percentage. Notifications still watch every account."
+                return "The menu bar shows \(provider.displayName)'s availability health as a colored status dot — green circle, yellow triangle, or red octagon from the 7-day runway simulation — instead of a percentage. Notifications still watch every subscription."
             }
         }
         if let threshold = quietPercentThreshold {
             if current.isEmpty {
-                return "The percentage appears only when the lowest account drops below \(threshold)% — otherwise just the icon. Display only: notifications still watch every account."
+                return "The percentage appears only when the lowest subscription drops below \(threshold)% — otherwise just the icon. Display only: notifications still watch every subscription."
             }
-            return "The pinned account's percentage appears only when it drops below \(threshold)% — otherwise just the icon. Display only: notifications still watch every account."
+            return "The pinned subscription's percentage appears only when it drops below \(threshold)% — otherwise just the icon. Display only: notifications still watch every subscription."
         }
         if current.isEmpty {
-            return "The percentage appears only when any account drops below the warning threshold."
+            return "The percentage appears only when any subscription drops below the warning threshold."
         }
         // Issue #292: a pin carrying a window choice names the window it
         // shows — and the honest fallback when that window isn't reported.
@@ -2420,9 +2420,9 @@ struct GeneralSettingsPane: View {
                     .first { $0.accountId == base && choice.matches(scope: $0.scope) }
                     .map { DeckBuilder.windowTitle(for: $0.scope) }
             } ?? choice.genericTitle
-            return "The pinned account's \(window) percentage stays visible while that window is reported; if it isn't, the account's lowest usable window is shown instead. Notifications still watch every account."
+            return "The pinned subscription's \(window) percentage stays visible while that window is reported; if it isn't, the subscription's lowest usable window is shown instead. Notifications still watch every subscription."
         }
-        return "The pinned account's percentage stays visible while it has a usable non-spend window; otherwise the plain glyph is shown. Notifications still watch every account."
+        return "The pinned subscription's percentage stays visible while it has a usable non-spend window; otherwise the plain glyph is shown. Notifications still watch every subscription."
     }
 
     /// Threshold choices (daemon validates 1–99). Includes the current value
@@ -2544,19 +2544,19 @@ struct ToolStatusRow: View {
     private var activeAccountCaption: String {
         switch activeAccount {
         case .active(let label): return "Active: \(label)"
-        case .noneActive: return "No active account"
-        case .noAccounts: return "No accounts"
+        case .noneActive: return "No active subscription"
+        case .noAccounts: return "No subscriptions"
         }
     }
 
     private var activeAccountHelp: String {
         switch activeAccount {
         case .active(let label):
-            return "Auth state of the active account (\(label)). Per-account health is in the Accounts pane."
+            return "Auth state of the active subscription (\(label)). Per-subscription health is in the Subscriptions pane."
         case .noneActive:
-            return "\(provider.displayName) accounts exist but none is active — activate one in the Accounts pane."
+            return "\(provider.displayName) subscriptions exist but none is active — activate one in the Subscriptions pane."
         case .noAccounts:
-            return "No \(provider.displayName) accounts are set up yet"
+            return "No \(provider.displayName) subscriptions are set up yet"
         }
     }
 

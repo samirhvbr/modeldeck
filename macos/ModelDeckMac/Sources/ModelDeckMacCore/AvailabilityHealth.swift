@@ -1044,7 +1044,7 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
         let providerName = report.provider.displayName
         let title = "\(providerName) availability"
         guard let verdict = report.verdict, let multiple = report.sustainableMultiple else {
-            let readout = "No usable \(providerName) accounts to score."
+            let readout = "No usable \(providerName) subscriptions to score."
             return AvailabilityHealthPresentation(
                 chipWord: noDataWord,
                 verdict: nil,
@@ -1071,7 +1071,7 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
             let usable = report.usableAccountCount
             let total = report.pool.count
             var line = "Only \(points(report.usablePoints)) pts are usable right now, "
-                + "across \(usable) of \(total) account\(total == 1 ? "" : "s")."
+                + "across \(usable) of \(total) subscription\(total == 1 ? "" : "s")."
             if let soonest = report.soonestResetHours ?? report.pool
                 .map({ $0.hoursToReset > 0 ? $0.hoursToReset : AvailabilityHealthEngine.cycleHours })
                 .min() {
@@ -1126,7 +1126,8 @@ public struct AvailabilityHealthPresentation: Equatable, Sendable {
             nowRows.append(HealthFactRow(
                 label: "Usable",
                 value: "\(points(report.usablePoints)) pts · "
-                    + "\(report.usableAccountCount) of \(report.pool.count) accounts"
+                    + "\(report.usableAccountCount) of \(report.pool.count) "
+                    + "subscription\(report.pool.count == 1 ? "" : "s")"
             ))
         }
         // Issue #244, Tim's two live numbers. "Current burn" shows

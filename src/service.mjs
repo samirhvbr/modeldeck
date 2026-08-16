@@ -29,8 +29,11 @@ import {
   chainCommandFromStatuslineCommand,
   execPathFromStatuslineCommand,
   isModelDeckStatuslineCommand,
+  STATUSLINE_SESSION_MARKER_TTL_MS,
+  statuslineSessionDir,
   statuslineSnapshotsFromCapture,
 } from './adapters/claude-statusline.mjs';
+import { claudeModelTier, isModelDowngrade, isModelRecovery } from './model-tier.mjs';
 import {
   createCodexProfileHome,
   fetchCodexRateLimits,
@@ -94,6 +97,13 @@ export const WAREHOUSE_INGEST_INTERVAL_MS = 15 * 60_000;
 // same evidence bar without adding a clock or polling loop.
 export const MEMBER_BLACKOUT_FAILURE_THRESHOLD = 3;
 const MEMBER_BLACKOUT_REMEDY = 'Sign in again to restore proxy routing.';
+
+// Issue #377. A model-scoped weekly window this used is the reason the
+// session fell off that model. Not 100: the window observation is at most one
+// statusline render old, and Claude Code stops routing the model a shade
+// before the window reads exactly full. Below this the drop is reported with
+// its cause honestly unknown rather than guessed.
+export const MODEL_DROP_QUOTA_PERCENT = 95;
 
 const CLAUDE_RENEWAL_TIMEOUT_MS = 60_000;
 const CLAUDE_RENEWAL_BACKOFF_MS = 30 * 60_000;
@@ -792,6 +802,9 @@ export class ModelDeckService {
     // down, then watch for new ones — server-truth windows should not wait
     // for the next scheduled provider refresh.
     void this.ingestClaudeStatuslineCaptures().catch(() => {});
+    // Issue #377: same for the per-session model markers, so a drop that
+    // happened while the daemon was down is still on the deck at startup.
+    void this.ingestClaudeStatuslineSessionModels().catch(() => {});
     // #282 adversarial review, major 2: a crash between the settings.json
     // write and the shell pin write leaves the two split-brained until the
     // next activation or routing change. Reconcile the pin from the active
@@ -1257,15 +1270,25 @@ export class ModelDeckService {
     if (this.statuslineWatcher) return;
     try {
       fs.mkdirSync(this.claudeStatuslineDir, { recursive: true, mode: 0o700 });
-      this.statuslineWatcher = fs.watch(this.claudeStatuslineDir, () => {
+      const onChange = () => {
         if (this.statuslineIngestTimer != null) return;
         this.statuslineIngestTimer = this.setTimeout(() => {
           this.statuslineIngestTimer = null;
           void this.ingestClaudeStatuslineCaptures().catch((error) => {
             console.error(`[modeldeck] statusline ingest failed: ${error?.message || error}`);
           });
+          // Issue #377: the per-session model markers live one level down
+          // (statusline/sessions/<accountId>/), hence the recursive watch.
+          void this.ingestClaudeStatuslineSessionModels().catch((error) => {
+            console.error(`[modeldeck] statusline session-model ingest failed: ${error?.message || error}`);
+          });
         }, 1_000);
-      });
+      };
+      // Recursive watch is macOS/Windows-only; elsewhere a flat watch still
+      // catches the #174 captures, and the #377 markers fall back to the
+      // startup and refresh-tick reads instead of degrading the whole watcher.
+      try { this.statuslineWatcher = fs.watch(this.claudeStatuslineDir, { recursive: true }, onChange); }
+      catch { this.statuslineWatcher = fs.watch(this.claudeStatuslineDir, onChange); }
       this.statuslineWatcher.on?.('error', () => {});
       // The watcher must never keep the daemon process alive on its own.
       this.statuslineWatcher.unref?.();
@@ -1309,6 +1332,192 @@ export class ModelDeckService {
       }
     }
     return ingested;
+  }
+
+  // -------------------------------------------------------------------------
+  // Issue #377 — mid-session model drops.
+
+  claudeStatuslineSessionDir(accountId) {
+    return statuslineSessionDir(this.claudeStatuslineCaptureFile(accountId));
+  }
+
+  /// Read every enabled Claude account's per-session model markers and fold
+  /// each one into `session_model_state`. Detection is a pure comparison of
+  /// two observations of the SAME session:
+  ///
+  ///   previous rankable, current weaker  → a drop opens (or an open drop
+  ///                                        keeps its ORIGINAL from-model)
+  ///   current at least as strong as the  → the open drop clears
+  ///   model the drop was from
+  ///
+  /// Nothing here reads, signals, or otherwise touches the running session —
+  /// the marker file is the only channel, written by the session's own
+  /// statusline render.
+  async ingestClaudeStatuslineSessionModels() {
+    const accounts = this.store.listAccounts()
+      .filter((account) => account.provider === 'claude' && account.enabled);
+    const changes = [];
+    for (const account of accounts) {
+      const directory = this.claudeStatuslineSessionDir(account.id);
+      let entries;
+      try { entries = await fs.promises.readdir(directory); }
+      catch { continue; } // no markers yet: normal, never an error state
+      for (const entry of entries) {
+        if (!entry.endsWith('.json')) continue;
+        let marker;
+        try { marker = JSON.parse(await fs.promises.readFile(path.join(directory, entry), 'utf8')); }
+        catch { continue; }
+        const change = this.recordSessionModelObservation(account.id, marker);
+        if (change) changes.push(change);
+      }
+    }
+    // Sessions that stopped reporting age out of the table on the same bound
+    // the notice uses (CodeRabbit, PR #472) — no separate timer, no growth.
+    try { this.store.pruneSessionModelState(this.sessionModelStateCutoff()); }
+    catch { /* housekeeping never fails an ingest pass */ }
+    return changes;
+  }
+
+  /// Fold one marker into the stored state. Returns the transition when the
+  /// model changed, otherwise null. Split out from the reader above so the
+  /// transition rules are testable without a filesystem.
+  recordSessionModelObservation(accountId, marker) {
+    const sessionId = typeof marker?.sessionId === 'string' ? marker.sessionId : null;
+    const model = typeof marker?.model === 'string' ? marker.model : null;
+    const observedAt = typeof marker?.observedAt === 'string' && !Number.isNaN(Date.parse(marker.observedAt))
+      ? new Date(Date.parse(marker.observedAt)).toISOString()
+      : null;
+    if (!sessionId || !model || !observedAt) return null;
+    const previous = this.store.sessionModelState(accountId, sessionId);
+    // Re-reading the same marker (a watcher fires per write, and every
+    // startup re-reads them all) must be idempotent.
+    if (previous && !(Date.parse(observedAt) > Date.parse(previous.observedAt))) return null;
+
+    const base = {
+      accountId,
+      sessionId,
+      model,
+      modelDisplay: typeof marker.modelDisplayName === 'string' ? marker.modelDisplayName : null,
+      cwd: typeof marker.cwd === 'string' ? marker.cwd : null,
+      observedAt,
+    };
+    if (!previous || previous.model === model) {
+      this.store.saveSessionModelState({
+        ...base,
+        droppedFrom: previous?.droppedFrom ?? null,
+        droppedFromDisplay: previous?.droppedFromDisplay ?? null,
+        droppedAt: previous?.droppedAt ?? null,
+      });
+      return null;
+    }
+
+    const standingFrom = previous.droppedFrom;
+    if (standingFrom && isModelRecovery(standingFrom, model)) {
+      this.store.saveSessionModelState(base);
+      return { kind: 'recovered', accountId, sessionId, from: standingFrom, to: model, at: observedAt };
+    }
+    if (standingFrom) {
+      // A further downgrade while a drop stands: same story, deeper.
+      this.store.saveSessionModelState({
+        ...base,
+        droppedFrom: standingFrom,
+        droppedFromDisplay: previous.droppedFromDisplay,
+        droppedAt: previous.droppedAt,
+      });
+      return null;
+    }
+    if (!isModelDowngrade(previous.model, model)) {
+      this.store.saveSessionModelState(base);
+      return null;
+    }
+    this.store.saveSessionModelState({
+      ...base,
+      droppedFrom: previous.model,
+      droppedFromDisplay: previous.modelDisplay,
+      droppedAt: observedAt,
+    });
+    return { kind: 'dropped', accountId, sessionId, from: previous.model, to: model, at: observedAt };
+  }
+
+  /// The `why` and `when` half of the notice. The dropped-from model's own
+  /// weekly window is already on the deck as a model-scoped scope ("Fable
+  /// weekly", src/adapters/claude.mjs); when that window is spent, it IS the
+  /// reason, and its reset is when the model comes back. When no such window
+  /// is observed the cause is reported as unknown — never guessed.
+  modelDropCause(accountId, droppedFrom, usage) {
+    const family = claudeModelTier(droppedFrom)?.family;
+    if (!family) return { reason: 'unknown', windowScope: null, windowUsedPercent: null, returnsAt: null };
+    const window = usage.find((row) => (
+      row.accountId === accountId
+      && /^(.+) weekly$/u.test(row.scope)
+      && row.scope.toLowerCase().startsWith(`${family} `)
+    ));
+    if (!window || window.usedPercent == null || window.usedPercent < MODEL_DROP_QUOTA_PERCENT) {
+      return {
+        reason: 'unknown',
+        windowScope: window?.scope ?? null,
+        windowUsedPercent: window?.usedPercent ?? null,
+        returnsAt: null,
+      };
+    }
+    return {
+      reason: 'quota-exhausted',
+      windowScope: window.scope,
+      windowUsedPercent: window.usedPercent,
+      returnsAt: window.resetsAt ?? null,
+    };
+  }
+
+  /// The instant before which a session counts as gone (CodeRabbit, PR #472).
+  /// A drop only ever clears when the SAME session reports getting back on the
+  /// model — but a session the user has closed never renders another
+  /// statusline, so without a bound its notice stood forever and every ended
+  /// session added one more permanent header line.
+  ///
+  /// The rule: a drop is reported for exactly as long as its session's own
+  /// statusline marker lives, because a drop in a session nobody can return to
+  /// is not actionable and must stop alarming. One constant bounds the marker
+  /// on disk and the row in the database, so the two cannot drift apart.
+  sessionModelStateCutoff() {
+    return new Date(this.now() - STATUSLINE_SESSION_MARKER_TTL_MS).toISOString();
+  }
+
+  /// `/api/state.modelDrop`. Every LIVE session with a standing drop, each one
+  /// carrying what it dropped from, why, and when that model returns.
+  ///
+  /// Switching the session BACK is deliberately advice, not an action: the
+  /// safety contract forbids touching a running Claude session, so the remedy
+  /// names the command the user runs in their own session (issue #377,
+  /// recorded on the PR).
+  modelDropStatus(accounts, usage) {
+    const enabled = new Map(accounts
+      .filter((account) => account.provider === 'claude' && account.enabled)
+      .map((account) => [account.id, account]));
+    const drops = [];
+    for (const row of this.store.listSessionModelDrops({ since: this.sessionModelStateCutoff() })) {
+      const account = enabled.get(row.accountId);
+      if (!account) continue;
+      const cause = this.modelDropCause(row.accountId, row.droppedFrom, usage);
+      const available = cause.reason !== 'quota-exhausted'
+        || (cause.returnsAt != null && Date.parse(cause.returnsAt) <= this.now());
+      drops.push({
+        sessionId: row.sessionId,
+        accountId: row.accountId,
+        accountLabel: account.label,
+        fromModel: row.droppedFrom,
+        fromModelDisplay: row.droppedFromDisplay,
+        toModel: row.model,
+        toModelDisplay: row.modelDisplay,
+        droppedAt: row.droppedAt,
+        cwd: row.cwd,
+        ...cause,
+        available,
+        remedy: available
+          ? `Run /model ${row.droppedFrom} in that session to switch back.`
+          : `Run /model ${row.droppedFrom} in that session once the window resets.`,
+      });
+    }
+    return { quotaPercent: MODEL_DROP_QUOTA_PERCENT, drops };
   }
 
   /// Whether a profile's settings.json currently carries ModelDeck's
@@ -2330,6 +2539,10 @@ export class ModelDeckService {
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = (async () => {
       const result = { claude: null, codex: null, checkedAt: new Date().toISOString() };
+      // Issue #377: a local file read, no provider traffic. The recursive
+      // watcher above is the fast path (about a second); this is the backstop
+      // for platforms without recursive fs.watch and for a watcher that died.
+      await this.ingestClaudeStatuslineSessionModels().catch(() => {});
       try {
         result.claude = { ok: true, profiles: await this.refreshClaude() };
         if (result.claude.profiles.some((item) => !item.ok)) result.claude.ok = false;
@@ -4305,6 +4518,7 @@ export class ModelDeckService {
       daemon: this.daemonRuntimeStatus(),
       managedProxy: this.managedProxyStatus(),
       memberBlackout: this.memberBlackoutStatus(accounts),
+      modelDrop: this.modelDropStatus(accounts, value.usage),
       sharedScope: this.sharedScope.status(),
     };
   }

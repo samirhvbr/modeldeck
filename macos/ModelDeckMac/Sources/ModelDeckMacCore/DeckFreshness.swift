@@ -321,7 +321,7 @@ public enum DeckFreshness {
             }
         }
         var parts: [String] = []
-        if breakdown.hasCurrentAccounts { parts.append("Live accounts current") }
+        if breakdown.hasCurrentAccounts { parts.append("Live subscriptions current") }
         if idle > 0 { parts.append("\(idle) idle") }
         if signedOut > 0 { parts.append("\(signedOut) signed out") }
         if keychain > 0 {
@@ -351,7 +351,7 @@ public enum DeckFreshness {
     }
 
     /// The recovery detail shared by the tooltip and VoiceOver label.
-    static let keychainRecoveryDetail = "macOS blocked ModelDeck's background service from reading this account's Claude sign-in — usually a dismissed Keychain prompt. Click Refresh and choose Always Allow when macOS asks (one prompt per account; properly signed app updates won't re-prompt)."
+    static let keychainRecoveryDetail = "macOS blocked ModelDeck's background service from reading this subscription's Claude sign-in — usually a dismissed Keychain prompt. Click Refresh and choose Always Allow when macOS asks (one prompt per subscription; properly signed app updates won't re-prompt)."
 
     /// Non-nil exactly when the daemon reported `keychain-denied` for this
     /// account (issue #98). Pure derivation, no clock involved — the denial
@@ -421,27 +421,27 @@ public enum DeckFreshness {
     }
 
     /// Shared recovery coaching for the tooltip and VoiceOver label.
-    static let signInRecoveryDetail = "This account's stored sign-in is missing or has expired, so ModelDeck can't refresh its usage. Sign in again from Settings → Accounts."
+    static let signInRecoveryDetail = "This subscription's stored sign-in is missing or has expired, so ModelDeck can't refresh its usage. Sign in again from Settings → Subscriptions."
 
     /// Issue #149: the calm idle-decay lead — the stored sign-in EXISTS but
     /// expired while the account sat idle; the provider CLI renews it
     /// automatically on next use, so the data is paused, not broken. The
     /// same one-click sign-in path stays for "fresh data now".
-    static let idleSignInDetail = "This account's stored sign-in expired while idle, so its usage data is paused. Using the account again renews the sign-in automatically — or sign in now from Settings → Accounts to refresh right away."
+    static let idleSignInDetail = "This subscription's stored sign-in expired while idle, so its usage data is paused. Using the subscription again renews the sign-in automatically — or sign in now from Settings → Subscriptions to refresh right away."
 
     /// Issue #264: the live lead — the stored sign-in is still marked
     /// expired, but a running session is reporting current usage
     /// (server-truth statusline captures), so the numbers on the card are
     /// live, not paused. ModelDeck's automatic renewal keeps working in the
     /// background; the same one-click sign-in path stays for doing it now.
-    static let liveIdleSignInDetail = "A running session is reporting this account's current usage, so its numbers are live. Its stored sign-in still needs renewal — ModelDeck keeps renewing it automatically in the background, or sign in now from Settings → Accounts."
+    static let liveIdleSignInDetail = "A running session is reporting this subscription's current usage, so its numbers are live. Its stored sign-in still needs renewal — ModelDeck keeps renewing it automatically in the background, or sign in now from Settings → Subscriptions."
 
     /// Claude-only context (issue #114 root cause): Claude Code ≥ 2.1.216
     /// renews only the ACTIVE account's stored sign-in, so every other
     /// account's sign-in expires within hours of its last use and stays
     /// expired. Worth saying on the card — otherwise a healthy-looking
     /// multi-account deck decays into sign-in failures with no visible cause.
-    static let signInRecoveryClaudeDetail = "Claude keeps only the active account's sign-in fresh, so other accounts' sign-ins expire until they are next signed in. Activating this account and running Claude Code once may also renew it."
+    static let signInRecoveryClaudeDetail = "Claude keeps only the active subscription's sign-in fresh, so other subscriptions' sign-ins expire until they are next signed in. Activating this subscription and running Claude Code once may also renew it."
 
     /// Non-nil exactly when the daemon reported `signin-required` for this
     /// account (issue #89's authState) — pure derivation, no clock. The

@@ -185,19 +185,19 @@ extension DaemonClient: SharedScopeControlling {}
 /// surfaces (the `AccountRenew` pattern) — the Settings section, the
 /// confirmation sheets, and the inline outcome can never drift apart.
 public enum SharedScope {
-    public static let toggleTitle = "Share tools & memory across Claude accounts"
+    public static let toggleTitle = "Share tools & memory across Claude subscriptions"
 
     /// The enable confirmation's disclosure, in house order: what will be
     /// shared, what never is, and that the one-time merge is reversible.
-    public static let enableTitle = "Share tools & memory across Claude accounts?"
-    public static let enableShares = "MCP server registrations and user memory become one shared set, used by every Claude account ModelDeck manages."
-    public static let enableNeverShares = "Sign-ins, account credentials, and per-account settings are never shared."
-    public static let enableMerge = "A one-time merge combines what each account has today. Per-account backups are kept, and turning sharing off restores them."
+    public static let enableTitle = "Share tools & memory across Claude subscriptions?"
+    public static let enableShares = "MCP server registrations and user memory become one shared set, used by every Claude subscription ModelDeck manages."
+    public static let enableNeverShares = "Sign-ins, credentials, and per-subscription settings are never shared."
+    public static let enableMerge = "A one-time merge combines what each subscription has today. Per-subscription backups are kept, and turning sharing off restores them."
     public static let enableConfirm = "Share & Merge"
 
     public static let disableTitle = "Stop sharing tools & memory?"
-    public static let disableRestores = "Each Claude account returns to its own MCP servers and memory, restored from the backups made when sharing was enabled."
-    public static let disableNeverShared = "Sign-ins and account credentials were never shared and are untouched."
+    public static let disableRestores = "Each Claude subscription returns to its own MCP servers and memory, restored from the backups made when sharing was enabled."
+    public static let disableNeverShared = "Sign-ins and credentials were never shared and are untouched."
     public static let disableConfirm = "Stop Sharing"
 
     /// The calm 409 notice — another shared-scope op is already running,
@@ -205,14 +205,14 @@ public enum SharedScope {
     public static let alreadyInProgress = "A sharing change is already in progress — the result appears when it finishes."
 
     public static let enableProgress = "Merging shared tools & memory…"
-    public static let disableProgress = "Restoring per-account tools & memory…"
+    public static let disableProgress = "Restoring per-subscription tools & memory…"
 
     /// State-honest captions under the toggle (the #196 caption precedent:
     /// describe what is actually running, never a hypothetical).
-    public static let enabledCaption = "MCP servers and user memory are shared by every Claude account. Sign-ins and credentials stay per-account."
-    public static let disabledCaption = "Each Claude account keeps its own MCP servers and user memory."
+    public static let enabledCaption = "MCP servers and user memory are shared by every Claude subscription. Sign-ins and credentials stay per-subscription."
+    public static let disabledCaption = "Each Claude subscription keeps its own MCP servers and user memory."
 
-    public static let toggleHelp = "Shares user-scope MCP server registrations and user memory across every Claude account ModelDeck manages. Sign-ins and credentials are never shared. Enabling runs a one-time, reversible merge."
+    public static let toggleHelp = "Shares user-scope MCP server registrations and user memory across every Claude subscription ModelDeck manages. Sign-ins and credentials are never shared. Enabling runs a one-time, reversible merge."
 
     /// The inline outcome, rendered calmly under the toggle: a one-line
     /// headline (merged counts), one line per resolved conflict (name +
@@ -250,7 +250,7 @@ public enum SharedScope {
 
     static func headline(for outcome: SharedScopeOutcome) -> String {
         guard outcome.enabled else {
-            return "Sharing is off — each account's own MCP servers and memory are restored."
+            return "Sharing is off — each subscription's own MCP servers and memory are restored."
         }
         guard let merged = outcome.merged else {
             return "Sharing is on."

@@ -63,9 +63,9 @@ public enum IdentityVerify {
             case (let actual?, let saved?):
                 return "The provider is signed in as \(actual), not \(saved)."
             case (let actual?, nil):
-                return "The provider is signed in as \(actual), not this account's saved identity."
+                return "The provider is signed in as \(actual), not this subscription's saved identity."
             case (nil, _):
-                return "The provider reports a different identity than this account's saved one."
+                return "The provider reports a different identity than this subscription's saved one."
             }
         case "unavailable":
             if let detail = verification.detail, !detail.isEmpty { return detail }

@@ -140,7 +140,7 @@ struct Issue264LiveToneTests {
 
 // MARK: - Availability Health inclusion by data age
 
-@Suite("Issue #264 — health includes flagged accounts on data age")
+@Suite("Issue #264 — health includes flagged subscriptions on data age")
 struct Issue264HealthInclusionTests {
     private func state(observedSecondsAgo: TimeInterval) -> DeckState {
         DeckState(

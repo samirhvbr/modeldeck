@@ -114,7 +114,7 @@ final class StubOnboardingBackend: AccountOnboarding, LoginLaunching, DeckStateP
     }
 }
 
-@Suite("Add-account flow model (issue #8)")
+@Suite("Add-subscription flow model (issue #8)")
 @MainActor
 struct AddAccountModelTests {
     private func makeModel(_ backend: StubOnboardingBackend) -> AddAccountModel {
@@ -384,7 +384,7 @@ struct AddAccountModelTests {
         backend.stateError = nil
         let confirmed = await model.confirmSignedIn()
         #expect(confirmed)
-        #expect(model.completionWarning?.contains("couldn't read which account was active") == true)
+        #expect(model.completionWarning?.contains("couldn't read which subscription was active") == true)
         // Only the target was ever activated — nothing restored.
         #expect(backend.activatedIDs == ["acct-1"])
     }

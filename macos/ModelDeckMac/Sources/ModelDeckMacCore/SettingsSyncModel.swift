@@ -208,7 +208,7 @@ public final class SettingsSyncModel: ObservableObject {
     }
 
     /// Issue #176: the daemon's scheduled renewal of expired-idle Claude
-    /// accounts ("Keep idle Claude accounts fresh automatically").
+    /// accounts ("Keep idle Claude subscriptions fresh automatically").
     public func setAutoRenewEnabled(_ enabled: Bool) async {
         guard enabled != settings.autoRenewEnabled else { return }
         await update(DaemonSettingsPatch(autoRenewEnabled: enabled))

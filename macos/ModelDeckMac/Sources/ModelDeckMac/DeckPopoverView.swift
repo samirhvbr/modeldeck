@@ -87,6 +87,7 @@ struct DeckPopoverView: View {
             }
             proxyBanner
             memberBlackoutBanner
+            modelDropBanner
             installProgressLine
             content
             Divider()
@@ -169,6 +170,10 @@ struct DeckPopoverView: View {
             // visible (staged-invisible is the #241 bug), and the header
             // corner is the deck's only always-rendered chrome.
             updateReadyBadge
+
+            // Issue #445: the external-proxy state's ONLY deck surface —
+            // a glyph inside chrome that already renders, never a row.
+            externalProxyGlyph
 
             weeklyFocusControl
 
@@ -342,7 +347,7 @@ struct DeckPopoverView: View {
         .fixedSize()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Sort")
-        .help("Sort accounts: next reset, lowest remaining, or grouped by provider. Click the active mode again to flip its direction.")
+        .help("Sort subscriptions: next reset, lowest remaining, or grouped by provider. Click the active mode again to flip its direction.")
     }
 
     private func sortSegment(_ order: DeckSortOrder) -> some View {
@@ -377,7 +382,7 @@ struct DeckPopoverView: View {
         .accessibilityValue(isActive ? order.directionDescription(direction) : "")
         .accessibilityHint(isActive
             ? "Reverses the sort direction"
-            : "Sorts accounts by \(order.displayName.lowercased())")
+            : "Sorts subscriptions by \(order.displayName.lowercased())")
         .accessibilityAddTraits(isActive ? .isSelected : [])
     }
 
@@ -506,6 +511,28 @@ struct DeckPopoverView: View {
         return false
     }
 
+    /// Issue #445: the external-proxy coexistence state, as a quiet header
+    /// glyph. Sized like the header's other icon controls so it reads as
+    /// chrome, not as an alert; the tooltip carries the retired row's whole
+    /// sentence and points at Settings, which keeps the full story.
+    /// `ProxyCoexistNotice` (pure) decides whether it appears at all.
+    @ViewBuilder
+    private var externalProxyGlyph: some View {
+        if case .headerGlyph(let tooltip) = ProxyCoexistNotice.display(
+            phase: proxyModel.phase,
+            choice: onboardingModel.choice,
+            onboardingCardPresented: onboardingModel.phase.needsPopoverCard
+        ) {
+            Image(systemName: ProxyCoexistNotice.glyphSystemImage)
+                .font(.system(size: 10, weight: .medium))
+                .frame(height: 16)
+                .foregroundStyle(.tertiary)
+                .help(tooltip)
+                .accessibilityLabel(ProxyCoexistNotice.glyphAccessibilityLabel)
+                .accessibilityHint(tooltip)
+        }
+    }
+
     /// Issue #421: the managed proxy's health. Live self-clearing state, so
     /// it belongs in the header info space WITHOUT a dismiss affordance
     /// (same exemption as "Daemon unreachable") — and like that line, a
@@ -517,17 +544,11 @@ struct DeckPopoverView: View {
         case .idle, .unavailable, .starting, .running:
             EmptyView()
         case .externalInstanceDetected:
-            // The #400 refusal. Stated, never acted on: slice D (#422) owns
-            // adoption, and ModelDeck never stops a process the user started.
-            // Issue #422: under a recorded coexist choice this is the
-            // user's own decision, so the hover states WHY managed-only
-            // features are off — never a bare "unavailable".
-            Label("External proxy detected — not managed by ModelDeck", systemImage: "info.circle")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help(onboardingModel.choice == .coexist
-                      ? ManagedProxyOnboardingCopy.coexistUnavailableReason
-                      : ManagedProxyModel.externalInstanceMessage)
+            // Issue #445 (Tim's ruling): this state may not cost a deck row.
+            // It moved to `externalProxyGlyph` in the header's existing
+            // control cluster and to Settings → General → Managed proxy —
+            // no row here, deliberately, and no icon that would make one.
+            EmptyView()
         case .restarting(let attempt):
             Label("Restarting the proxy… (attempt \(attempt))", systemImage: "arrow.clockwise")
                 .font(.caption)
@@ -571,6 +592,46 @@ struct DeckPopoverView: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .help(message)
                     .accessibilityLabel("Pool alert. \(message)")
+            }
+        }
+    }
+
+    /// Issue #377: a session that fell off its model mid-flight. Like the
+    /// #395 blackout above this sits in the always-visible header space and is
+    /// deliberately NOT dismissible — a silent drop is the whole bug, and the
+    /// notice clears itself the moment the session is back on the model.
+    /// Three short lines, in the order the question is actually asked: what
+    /// happened, why and when it comes back, and what to do about it.
+    @ViewBuilder
+    private var modelDropBanner: some View {
+        if let drops = statusModel.deckState?.modelDrop?.drops {
+            // CodeRabbit (PR #472): the header stack does not scroll, so the
+            // rendered count is bounded (ModelDropAlert.maxRenderedBanners) and
+            // the remainder counted — many concurrent lanes on one
+            // subscription is Tim's normal, not an edge case.
+            ForEach(ModelDropAlert.rendered(drops)) { drop in
+                let message = "\(drop.headline). \(drop.explanation) \(drop.remedy)"
+                VStack(alignment: .leading, spacing: 1) {
+                    Label(drop.headline, systemImage: "arrow.down.right.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(drop.available ? .orange : .red)
+                    Text(drop.explanation)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(drop.remedy)
+                        .font(.caption2)
+                        .foregroundStyle(drop.available ? .primary : .secondary)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .help(message)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Model drop. \(message)")
+            }
+            if let overflow = ModelDropAlert.overflowLine(drops) {
+                Text(overflow)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Model drop. \(overflow)")
             }
         }
     }
@@ -635,7 +696,7 @@ struct DeckPopoverView: View {
             // Issue #226: the fresh-install dead end (Tim's 2026-08-04 field
             // report) becomes the surface's ONE prominent next step. A single
             // provider-neutral CTA — the add flow's first screen already asks
-            // Claude vs Codex — replaces two "No accounts" columns that
+            // Claude vs Codex — replaces two "No subscriptions" columns that
             // offered nothing actionable.
             emptyDeckCTA
         } else if let state = statusModel.deckState {
@@ -747,26 +808,26 @@ struct DeckPopoverView: View {
     /// oversized hero button in a menu-bar popover).
     private var emptyDeckCTA: some View {
         VStack(spacing: 6) {
-            Text("No accounts yet")
+            Text("No subscriptions yet")
                 .font(.system(size: 12, weight: .semibold))
-            Text("Connect a Claude or Codex account to see its usage here.")
+            Text("Connect a Claude or Codex subscription to see its usage here.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Button("Add Account…") { beginAddAccount() }
+            Button("Add Subscription…") { beginAddAccount() }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .padding(.top, 4)
                 .help("Create an isolated profile and sign in via the provider's own flow")
-                .accessibilityLabel("Add account")
-                .accessibilityHint("Opens Settings and starts the add-account flow")
+                .accessibilityLabel("Add subscription")
+                .accessibilityHint("Opens Settings and starts the add-subscription flow")
         }
         .frame(maxWidth: .infinity, minHeight: 96)
     }
 
     /// Issue #226: the populated deck carries the quiet footer affordance
     /// instead — never both at once, so each state offers exactly ONE
-    /// "Add Account" entry point (Tim's clarification on #226). Gated on a
+    /// "Add Subscription" entry point (Tim's clarification on #226). Gated on a
     /// live connection too (CodeRabbit on PR #232): a failed refresh RETAINS
     /// the last deckState while flipping connection to `.unreachable`, and
     /// the flow's first step needs the daemon — same reason Settings
@@ -877,7 +938,7 @@ struct DeckPopoverView: View {
                     .buttonStyle(.plain)
                     // Issue #168: the tooltip rides on the model's
                     // FooterStatus so the neutral explained-staleness
-                    // summary ("Live accounts current · 3 idle") explains
+                    // summary ("Live subscriptions current · 3 idle") explains
                     // itself instead of claiming to be an age readout.
                     .help(status?.tooltip
                         ?? MenuBarStatusModel.FooterStatus.freshTooltip)
@@ -955,25 +1016,25 @@ struct DeckPopoverView: View {
             // (pinned by tests). Bare glyph per #283 with unchanged
             // semantics: eye = everything visible (including the armed-but-
             // empty default), eye.slash = rows currently hidden; the
-            // unchanged column count ("7 accounts" over fewer rows) is the
+            // unchanged column count ("7 subscriptions" over fewer rows) is the
             // quiet hint while filtering.
             if showsHideShowToggle {
                 DeckFooterIconButton(
                     systemImage: isHidingRows ? "eye.slash" : "eye",
                     name: deckModel.hideShowEnabled
-                        ? "Show all accounts"
-                        : "Resume hiding accounts",
+                        ? "Show all subscriptions"
+                        : "Resume hiding subscriptions",
                     help: deckModel.hideShowEnabled
-                        ? "Hide/Show Accounts is on (\(deckModel.hideMode.displayName)). "
-                            + "Click to show every account; your hide settings are kept. "
-                            + "Display only — hidden accounts still count for routing, health, and the menu bar."
-                        : "Hide/Show Accounts is off — every account is shown. "
+                        ? "Hide/Show Subscriptions is on (\(deckModel.hideMode.displayName)). "
+                            + "Click to show every subscription; your hide settings are kept. "
+                            + "Display only — hidden subscriptions still count for routing, health, and the menu bar."
+                        : "Hide/Show Subscriptions is off — every subscription is shown. "
                             + "Click to resume hiding (\(deckModel.hideMode.displayName)). "
                             + "Configure in Settings → General.",
                     accessibilityLabel: deckModel.hideShowEnabled
-                        ? "Turn off account hiding"
-                        : "Turn on account hiding",
-                    accessibilityHint: "Visual filter only; hidden accounts keep working",
+                        ? "Turn off subscription hiding"
+                        : "Turn on subscription hiding",
+                    accessibilityHint: "Visual filter only; hidden subscriptions keep working",
                     // Issue #321 decision 5: a single subtle bounce whenever
                     // hiding transitions none→some (the glyph flips
                     // plain→slash at the same moment). Generation-keyed in
@@ -1028,10 +1089,10 @@ struct DeckPopoverView: View {
                 // accessibility label, so nothing is actually lost.
                 DeckFooterIconButton(
                     systemImage: "plus",
-                    name: "Add account…",
+                    name: "Add subscription…",
                     help: "Create an isolated profile and sign in via the provider's own flow",
-                    accessibilityLabel: "Add account",
-                    accessibilityHint: "Opens Settings and starts the add-account flow",
+                    accessibilityLabel: "Add subscription",
+                    accessibilityHint: "Opens Settings and starts the add-subscription flow",
                     action: beginAddAccount
                 )
             }
@@ -1201,6 +1262,14 @@ struct DeckColumnView: View {
     var onCancelSignIn: (DeckAccountRow) -> Void = { _ in }
     var onDismissSignInError: (DeckAccountRow) -> Void = { _ in }
 
+    /// Issue #458: the header's aggregate "% left", or nil when nothing in
+    /// this column can be summed honestly. Staleness rides the SAME per-row
+    /// seam the cards use, so a card the deck already marks "Data from 16 hr
+    /// ago" can never quietly prop up the header's number.
+    private var columnUsageHeadline: DeckColumnUsageHeadline.Display? {
+        DeckColumnUsageHeadline.display(for: column, isStale: { staleness($0) != nil })
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
@@ -1222,19 +1291,44 @@ struct DeckColumnView: View {
                     )
                 }
                 Spacer()
-                Text(column.accountCountText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+                // Issue #458: "7 subscriptions · 341% left". The aggregate
+                // is LAST so it lands on the header's trailing edge, in line
+                // with the member rows' "% left" column (Tim's amendment),
+                // and the separator is the deck row's own "name · tier"
+                // bubble — same glyph, same tier-scale secondary treatment.
+                // `DeckColumnUsageHeadline` (pure) decides whether there is
+                // an honest number to show at all; the tooltip carries the
+                // denominator whenever the sum is partial.
+                HStack(spacing: 0) {
+                    Text(column.subscriptionCountText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                    if let usage = columnUsageHeadline {
+                        Text(" · ")
+                            .font(DeckType.tier)
+                            .foregroundStyle(.secondary)
+                        Text(usage.text)
+                            // The row's "% left" treatment, minus the
+                            // severity color: a sum crosses no threshold
+                            // (341% is not "healthy"), so coloring it would
+                            // invent a verdict the number cannot support.
+                            .font(DeckType.value)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                            .help(usage.tooltip)
+                            .accessibilityLabel(usage.accessibilityLabel)
+                    }
+                }
             }
             .padding(.bottom, 2)
 
             if column.rows.isEmpty {
                 // Issue #319: an all-hidden column says so instead of the
-                // misleading "No accounts" (the count above still states the
+                // misleading "No subscriptions" (the count above still states the
                 // roster total). The footer eye and Settings stay reachable,
                 // so this state never strands anyone.
-                Text(column.hiddenAccountCount > 0 ? "All accounts hidden" : "No accounts")
+                Text(column.hiddenAccountCount > 0 ? "All subscriptions hidden" : "No subscriptions")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 40)
@@ -1320,7 +1414,7 @@ struct DeckAccountRowView: View {
     @ObservedObject var deckModel: DeckPopoverModel
     let showsProviderMark: Bool
     /// Issue #73: identity (email) under the label renders only when the
-    /// Settings → General "Show account emails" toggle is on (default off).
+    /// Settings → General "Show subscription emails" toggle is on (default off).
     /// Uniform for both providers — no identity, no line.
     var showsIdentity: Bool = false
     /// Issue #131: whether THIS account's window feeds the menu bar — the
@@ -1668,7 +1762,7 @@ struct DeckAccountRowView: View {
                     SignInExplanationView(
                         explanation: .signIn(recovery, renew: renew),
                         secondaryTitle: renew?.action == .renewNow ? "Renew now" : nil,
-                        secondaryHelp: "Renews this account's sign-in in the background. "
+                        secondaryHelp: "Renews this subscription's sign-in in the background. "
                             + AccountRenew.disclosure,
                         secondaryAccessibilityLabel: "Renew sign-in for \(row.account.label)",
                         onSecondary: renew?.action == .renewNow && onRenewNow != nil
@@ -1794,7 +1888,7 @@ struct DeckAccountRowView: View {
             }
             if let provider = DeckProvider.from(row.account.provider) {
                 Toggle(
-                    "Follow Active \(provider.displayName) Account",
+                    "Follow Active \(provider.displayName) Subscription",
                     isOn: Binding(
                         get: { deckModel.isMenuBarFollowingActive(provider: provider) },
                         set: { _ in deckModel.toggleMenuBarFollowActive(provider: provider) }
@@ -1909,7 +2003,7 @@ struct DeckAccountRowView: View {
     private var signInProgressText: String {
         switch signInPhase {
         case .verifying: return "Verifying…"
-        case .activating: return "Activating this account for sign-in…"
+        case .activating: return "Activating this subscription for sign-in…"
         default: return "Opening Terminal…"
         }
     }
@@ -2157,8 +2251,8 @@ struct WarningExplanationView: View {
 struct SignInExplanationView: View {
     let explanation: DeckWarningExplanation
     var actionTitle: String = "Sign in again…"
-    var actionHelp: String = "Opens Settings → Accounts and starts this account's sign-in flow"
-    var actionAccessibilityLabel: String = "Sign in again for this account"
+    var actionHelp: String = "Opens Settings → Subscriptions and starts this subscription's sign-in flow"
+    var actionAccessibilityLabel: String = "Sign in again for this subscription"
     /// Issue #176: optional second action beside the primary — the idle
     /// notice's "Renew now" renders here (the #152 lesson: row actions live
     /// inside the explanation popover, never on the collapsed row). Nil
@@ -2546,7 +2640,7 @@ struct HealthSectionView: View {
             }
         }
         // Issue #65/#113 discipline, applied per GROUP: VoiceOver hears
-        // "Now: Pool 380 of 12000 pts; Usable 160 pts · 1 of 6 accounts"
+        // "Now: Pool 380 of 12000 pts; Usable 160 pts · 1 of 6 subscriptions"
         // instead of a scatter of bare values.
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(section.accessibilityLabel)
@@ -2607,7 +2701,7 @@ struct ProxyWeightBadge: View {
         }
         if presentation.benchedForFable {
             return "Benched for Fable routing — weight \(presentation.liveWeight) "
-                + "still routes this account's other-model traffic"
+                + "still routes this subscription's other-model traffic"
         }
         return "Proxy routing weight \(presentation.weight) — "
             + "rebalanced every few minutes from remaining quota"
@@ -2649,7 +2743,7 @@ struct ActiveCheckmark: View {
             // Issue #61: state the solid/amber distinction on hover —
             // solid means active AND in effect (the amber marker's tooltip
             // carries the "selected but not in effect" side).
-            .help("Active and in effect — new sessions use this account")
+            .help("Active and in effect — new sessions use this subscription")
             .accessibilityLabel("Active")
     }
 }
@@ -2737,7 +2831,7 @@ struct DuplicateTokenMarkerView: View {
                     SignInExplanationView(
                         explanation: explanation,
                         actionTitle: "Re-log in…",
-                        actionHelp: "Opens Settings → Accounts and launches "
+                        actionHelp: "Opens Settings → Subscriptions and launches "
                             + "the provider's own login for this profile",
                         actionAccessibilityLabel: "Re-log in this profile",
                         onSignInAgain: onRelogin

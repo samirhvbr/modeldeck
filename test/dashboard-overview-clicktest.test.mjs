@@ -1,6 +1,22 @@
 // Issue #385 — the Overview landing, CLICK-TESTED in a real DOM.
 //
-// THE NAMED TRIPWIRE of this slice is the first test below:
+// THE NAMED TRIPWIRES of this file:
+//
+//   TRIPWIRE landing-answers-without-navigation (issue #366) — 'the page the
+//   daemon serves IS the answer, and the why is one click away'. #366's premise
+//   is that the dashboard must not be a data explorer a reader navigates into:
+//   opening it, with nothing clicked and nothing typed, has to put the
+//   availability verdict, the burn figure in subscriptions, the time chart and a
+//   drillable project block on the page — and clicking the biggest block has to
+//   land on the why, one crumb from home. The pieces are each pinned elsewhere
+//   in this suite; the COMPOSITE — the landing needs no navigation — is what
+//   #366 was filed for, and it is what a later slice can take away one piece at
+//   a time (an app that opens on a detail view, a verdict demoted below the
+//   chart, an inert block). Held on the BUILT bytes, at first paint, before any
+//   event is dispatched. VERIFIED TO FAIL by seeding App's useRoute with
+//   { level: 'detail' }: the served page opens on Model × effort, the crumb
+//   reads that instead of Overview, and verdict, chart and blocks are all gone.
+//
 //   'provider stack order survives the load → Codex → Combined round-trip'
 // Round 13's regression was that after visiting a single-provider scope and
 // coming back to Combined, Codex stopped being the baseline band: Recharts
@@ -25,6 +41,22 @@ import { DASHBOARD_APP_HTML } from '../src/dashboard-app.mjs';
 import {
   bootPage, installDom, installFetch, loadModule, waitFor,
 } from '../dashboard/test-support/index.mjs';
+
+// #450: these fixtures anchor "recent" events a couple of hours in the past
+// and their tests click the chart's last ("today") bar — between 00:00 and
+// 02:00 local the anchors crossed midnight, the last day emptied, and the
+// suite failed two hours every day. Pin the process to a DST-free
+// fixed-offset zone where it is currently early afternoon, so "a couple of
+// hours ago" is always today at any wall-clock time, without disturbing the
+// fixtures' hand-tuned burn/rounding numbers. (POSIX inverts the sign:
+// Etc/GMT-5 means UTC+5.) The spawned daemon inherits TZ from process.env.
+{
+  const utcHour = new Date().getUTCHours();
+  const offset = (((13 - utcHour) % 24) + 24) % 24;
+  process.env.TZ = offset === 0 ? 'Etc/GMT'
+    : offset <= 14 ? `Etc/GMT-${offset}` : `Etc/GMT+${24 - offset}`;
+}
+
 
 const PORT = 43385;
 const TOKEN = 'overview-clicktest-placeholder-token';
@@ -160,13 +192,13 @@ function seed(store, root) {
     [
       {
         turnIndex: 0, turnId: 'turn-0', model: 'gpt-5.6-sol', reasoningEffort: 'medium',
-        inputTokens: 3000, cachedInputTokens: 6000, cacheWriteInputTokens: 0,
+        inputTokens: 9000, cachedInputTokens: 6000, cacheWriteInputTokens: 0,
         outputTokens: 900, reasoningOutputTokens: 300, totalTokens: 9900,
         timestamp: hoursAgo(26),
       },
       {
         turnIndex: 1, turnId: 'turn-1', model: 'gpt-5.6-sol', reasoningEffort: 'medium',
-        inputTokens: 5000, cachedInputTokens: 9000, cacheWriteInputTokens: 0,
+        inputTokens: 14000, cachedInputTokens: 9000, cacheWriteInputTokens: 0,
         outputTokens: 1200, reasoningOutputTokens: 400, totalTokens: 15200,
         timestamp: hoursAgo(2),
       },
@@ -288,6 +320,87 @@ function seriesCount() {
     .filter((node) => [...node.querySelectorAll('path')]
       .some((mark) => mark.getAttribute('fill') !== 'transparent')).length;
 }
+
+/** The drawn stacked series in an arbitrary document (seriesCount, unbound). */
+function drawnSeriesIn(page) {
+  return [...page.querySelectorAll('.recharts-bar')]
+    .filter((node) => [...node.querySelectorAll('path')]
+      .some((mark) => mark.getAttribute('fill') !== 'transparent')).length;
+}
+
+/** The blocks a reader can actually open, biggest first (the treemap's order). */
+function openableBlocksIn(page) {
+  return [...page.querySelectorAll('.treemap .block')]
+    .filter((node) => node.getAttribute('aria-disabled') !== 'true');
+}
+
+test('TRIPWIRE landing-answers-without-navigation — the served page IS the answer, and the why is one click', async (t) => {
+  // The BUILT bytes, in their own window, opened at /dashboard with no
+  // fragment — a reader opening the app, or the daemon's URL in a browser.
+  const data = fixture(t);
+  const dom = bootPage(DASHBOARD_APP_HTML, data.app, { host: `127.0.0.1:${PORT}` });
+  t.after(() => dom.window.close());
+  const page = dom.window.document;
+
+  // The POSITION comes first, and is asserted before anything is waited on: a
+  // page that opens anywhere but the landing must fail here, naming where it
+  // opened, rather than timing out downstream on a chart it never had.
+  await waitFor(() => page.querySelector('.crumbs [aria-current="page"]'), 'the served page to place itself');
+  assert.equal(page.querySelector('.crumbs [aria-current="page"]').textContent, 'Overview',
+    'the served page opens on the landing, with nothing clicked');
+  assert.equal(page.querySelectorAll('.crumbs button').length, 0, 'no level sits above the landing');
+
+  await waitFor(() => page.querySelector('.hero-figure'), 'the served page to draw');
+  await waitFor(() => drawnSeriesIn(page) > 0, 'the served page to chart the range');
+  await waitFor(() => openableBlocksIn(page).length > 0, 'the served page to tile its projects');
+
+  assert.equal(page.querySelectorAll('.uppill, .zoomout-puck').length, 0, 'and nothing offers to go up');
+  assert.equal(page.querySelectorAll('.card.error').length, 0, 'and the page did not fail to load');
+
+  // The ANSWER — "can I start heavy work now" — and the figure it is measured
+  // in, both on the first paint rather than behind a tab.
+  const hero = page.querySelector('.hero');
+  assert.match(hero.textContent, /Can I start heavy work now\?/);
+  assert.match(hero.querySelector('.verdict').textContent.trim(), /^(Yes|Thin|No)\b/);
+  assert.match(page.querySelector('.hero-figure').textContent, /^\d+\.\d{2}/);
+  assert.match(hero.textContent, /weekly subscriptions/);
+
+  // Time first, then the map (amendment decision 9), and the answer above both.
+  assert.deepEqual(
+    [...page.querySelectorAll('.hero, .chart-wrap, .treemap')].map((node) => node.className.split(' ')[0]),
+    ['hero', 'chart-wrap', 'treemap'],
+  );
+
+  // ONE CLICK to the why: the biggest block is the project the headline is
+  // mostly made of, and it opens that project rather than explaining itself.
+  const biggest = openableBlocksIn(page)[0];
+  const name = biggest.querySelector('.block-name-text').textContent.trim();
+  biggest.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  await waitFor(
+    () => page.querySelector('.crumbs [aria-current="page"]')?.textContent === name,
+    'the block to open its project',
+  );
+  // The drill wears the same hero, so the landing's own question is the tell.
+  assert.equal(
+    /Can I start heavy work now\?/.test(page.querySelector('.hero').textContent), false,
+    'the landing gave way to the drill',
+  );
+  assert.match(page.querySelector('.hero').textContent, /weekly subscriptions/,
+    'and the drill answers in the unit the block was sized in');
+
+  // …and one click back, from the crumb that was there the whole time.
+  const home = [...page.querySelectorAll('.crumbs button')]
+    .find((node) => node.textContent.trim() === 'Overview');
+  assert.ok(home, 'the drill keeps a crumb home');
+  home.dispatchEvent(new dom.window.MouseEvent('click', { bubbles: true }));
+  // The drill wears a .hero too, so waiting on one would resolve on the page
+  // being left and race the route update — wait on the position itself.
+  await waitFor(
+    () => page.querySelector('.crumbs [aria-current="page"]')?.textContent === 'Overview',
+    'the landing to come back',
+  );
+  assert.match(page.querySelector('.hero').textContent, /Can I start heavy work now\?/);
+});
 
 test('provider stack order survives the load → Codex → Combined round-trip', async (t) => {
   await landing(t);
@@ -503,6 +616,19 @@ function chosenDimension() {
   return on ? on.textContent.trim() : null;
 }
 
+/**
+ * The blocks card's own dimension switch. Scoped to that group on purpose: the
+ * header's unit lens carries a "Subscriptions" button too, so a document-wide
+ * label search would click the wrong control.
+ */
+async function clickDimension(label, what) {
+  const group = blocksCard().querySelector('[aria-label="Block dimension"]');
+  const target = [...group.querySelectorAll('button')].find((node) => node.textContent.trim() === label);
+  assert.ok(target, 'the block dimension switch offers ' + JSON.stringify(label));
+  target.click();
+  await waitFor(() => chosenDimension() === label, what || 'the ' + label + ' dimension');
+}
+
 /** The blocks card's own note — which says what the blocks are scoped to. */
 function blocksNote() {
   return blocksCard().querySelector('.card-note').textContent;
@@ -560,7 +686,7 @@ test('the blocks dimension switch: every dimension tiles, sums exactly, and surv
   }
 
   // Accounts: measured per account, the pool's own labels, same total.
-  await clickLabel('Accounts', () => chosenDimension() === 'Accounts', 'the accounts dimension');
+  await clickDimension('Subscriptions', 'the subscriptions dimension');
   assert.deepEqual(blockNames(), ['Placeholder Claude One', 'Placeholder Codex One']);
   const accounts = blockSum();
   assert.equal(accounts.total, first.total, 'the section total does not move with the dimension');
@@ -571,7 +697,7 @@ test('the blocks dimension switch: every dimension tiles, sums exactly, and surv
       + blockValue('Placeholder Claude One') + ' vs ' + claudeOnly + ')');
 
   // Providers: whatever the data carries, never a hard-coded pair.
-  await clickLabel('Providers', () => chosenDimension() === 'Providers', 'the providers dimension');
+  await clickDimension('Providers', 'the providers dimension');
   assert.deepEqual(blockNames(), ['Claude', 'Codex']);
   const providers = blockSum();
   assert.equal(providers.total, first.total, 'the section total does not move with the dimension');
@@ -583,8 +709,8 @@ test('the blocks dimension switch: every dimension tiles, sums exactly, and surv
 
   // Neither of the two carries a drill, so neither strands the reader: the
   // blocks are inert and every one of them says why on hover.
-  for (const dimension of ['Accounts', 'Providers']) {
-    await clickLabel(dimension, () => chosenDimension() === dimension);
+  for (const dimension of ['Subscriptions', 'Providers']) {
+    await clickDimension(dimension);
     const blocks = [...blocksCard().querySelectorAll('.treemap .block')];
     assert.ok(blocks.length > 0, dimension + ' draws blocks');
     for (const block of blocks) {
@@ -623,7 +749,7 @@ test('the blocks dimension switch: every dimension tiles, sums exactly, and surv
   assert.deepEqual(
     [...blocksCard().querySelectorAll('[aria-label="Block dimension"] button')]
       .map((node) => node.textContent.trim()),
-    ['Projects', 'Accounts', 'Providers'],
+    ['Projects', 'Subscriptions', 'Providers'],
     'all three positions are still offered',
   );
 });
@@ -666,7 +792,7 @@ test('folded alternate rows stay reachable and explain themselves', async (t) =>
   await waitFor(() => document.querySelector('.hero-figure'), 'the headline to load');
   await waitFor(() => seriesCount() > 0, 'the chart to draw');
 
-  await clickLabel('Accounts', () => chosenDimension() === 'Accounts');
+  await clickDimension('Subscriptions');
   // The fold announces itself either as the header chip or as the map's own
   // "+N more" block, depending on whether the block fits — open whichever.
   const opener = blocksCard().querySelector('.more-chip')

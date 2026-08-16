@@ -77,28 +77,28 @@ const TREEMAP_HEIGHT = 340;
  */
 const BLOCK_DIMENSIONS = [
   { value: 'projects', label: 'Projects' },
-  { value: 'accounts', label: 'Accounts' },
+  { value: 'accounts', label: 'Subscriptions' },
   { value: 'providers', label: 'Providers' },
 ];
 const BLOCK_DIMENSION_KEY = 'modeldeck.overview.blockDimension';
 const BLOCK_DIMENSION_VALUES = BLOCK_DIMENSIONS.map((entry) => entry.value);
 
-const DIMENSION_NOUN = { projects: 'project', accounts: 'account', providers: 'provider' };
+const DIMENSION_NOUN = { projects: 'project', accounts: 'subscription', providers: 'provider' };
 const DIMENSION_WHY = {
   projects: 'Blocks are sized by the figure shown on them. Project figures are the pool\'s measured burn apportioned by weighted token flow — they always sum to the measured total, including the untraceable remainder. Anything too small to draw at label size folds into one block rather than rendering half a label.',
-  accounts: 'Blocks are sized by the figure shown on them. An account\'s subscription burn is measured directly on that account\'s own usage levels; its $-equivalent is its provider\'s measured cost in the share of that provider\'s measured tokens the account sent. Either way the blocks sum to the same section total the other dimensions do.',
-  providers: 'Blocks are sized by the figure shown on them. Provider figures are measured directly — the pool\'s burn on that provider\'s accounts, or the warehouse\'s priced tokens on that provider — and every provider the data carries gets a block. They sum to the same section total the other dimensions do.',
+  accounts: 'Blocks are sized by the figure shown on them. A subscription\'s burn is measured directly on that subscription\'s own usage levels; its $-equivalent is its provider\'s measured cost in the share of that provider\'s measured tokens the subscription sent. Either way the blocks sum to the same section total the other dimensions do.',
+  providers: 'Blocks are sized by the figure shown on them. Provider figures are measured directly — the pool\'s burn on that provider\'s subscriptions, or the warehouse\'s priced tokens on that provider — and every provider the data carries gets a block. They sum to the same section total the other dimensions do.',
 };
 // No drill exists below these two yet, so their blocks are INERT and say why
 // rather than opening something that is not the level they name (#409).
 const DIMENSION_INERT = {
-  accounts: 'No level below an account yet — per-account limits are under Detail views → Headroom.',
+  accounts: 'No level below a subscription yet — per-subscription limits are under Detail views → Headroom.',
   providers: 'No level below a provider yet — the Provider filter above scopes the whole page to one.',
 };
 const DIMENSION_RESIDUAL = {
   accounts: {
-    name: 'Not traceable to an account',
-    title: 'Measured burn the pool records against no account this range still holds — most often requests whose source could not be resolved to an enabled account.',
+    name: 'Not traceable to a subscription',
+    title: 'Measured burn the pool records against no subscription this range still holds — most often requests whose source could not be resolved to an enabled subscription.',
   },
   providers: {
     name: 'Not traceable to a provider',
@@ -107,7 +107,7 @@ const DIMENSION_RESIDUAL = {
 };
 const DIMENSION_EMPTY = {
   projects: 'No project activity in this slice.',
-  accounts: 'No account burn in this slice.',
+  accounts: 'No subscription burn in this slice.',
   providers: 'No provider burn in this slice.',
 };
 
@@ -491,7 +491,7 @@ export default function Overview({ model, lens, selection, onSelect, onOpenProje
           <div className="hero-sub" style={{ marginTop: 4 }}>
             {hot.length} of {windows.length} subscriptions ≥ 80% used
             {worst ? ' · worst ' + worst.label + ' ' + Math.round(worst.binding.usedPercent) + '%' : ''}
-            <Why text={'Pool-level availability across every enabled account. Worst account resets '
+            <Why text={'Pool-level availability across every enabled subscription. Worst subscription resets '
               + (worst && worst.binding.resetsAt ? formatClock(worst.binding.resetsAt) : 'unknown') + '.'} />
           </div>
         </div>

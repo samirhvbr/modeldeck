@@ -38,10 +38,10 @@ public enum StatuslineCaptureControl {
     // never drift apart.
 
     /// Tooltip while capture is OFF (what enabling does).
-    public static let enableHelp = "Adds a small statusline step to this profile that records Claude's own rate-limit numbers whenever the account is in use — no credentials, no extra API calls. Any statusline you already use keeps working unchanged."
+    public static let enableHelp = "Adds a small statusline step to this profile that records Claude's own rate-limit numbers whenever the subscription is in use — no credentials, no extra API calls. Any statusline you already use keeps working unchanged."
 
     /// Tooltip while capture is ON (what's happening, how to undo).
-    public static let installedHelp = "ModelDeck updates this account's usage from Claude Code's statusline data whenever the profile is in use. Turning this off restores the profile's previous statusline configuration."
+    public static let installedHelp = "ModelDeck updates this subscription's usage from Claude Code's statusline data whenever the profile is in use. Turning this off restores the profile's previous statusline configuration."
 
     /// The ⋯ menu toggle's label (unchanged #174 wording; the menu entry
     /// stays as the second path, consistent with Edit/Remove).

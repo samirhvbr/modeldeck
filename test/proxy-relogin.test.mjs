@@ -603,26 +603,38 @@ test('two sign-ins for one account cannot run at once', async (t) => {
 // start round trip, so two starts racing inside that window both used to
 // reach the proxy — the first OAuth session was orphaned on the provider's
 // fixed callback port. The guard must hold WHILE a start is in flight.
-test('two concurrent starts inside the start round trip reach the proxy exactly once', async (t) => {
+test('TRIPWIRE proxy-relogin-start-round-trip-overlap — concurrent starts reach the proxy exactly once', async (t) => {
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
+  t.after(() => release());
+  let markEntered;
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  let authUrlCalls = 0;
   const inner = stubProxy();
   const fetcher = async (url) => {
-    if (url.pathname.endsWith('-auth-url')) await gate;
+    if (url.pathname.endsWith('-auth-url')) {
+      authUrlCalls += 1;
+      if (authUrlCalls === 1) {
+        markEntered();
+        await gate;
+      }
+    }
     return inner(url);
   };
   fetcher.state = inner.state;
   const data = await fixture(t, { proxyReloginFetch: fetcher });
 
   const first = data.service.startProxyRelogin(data.claude.id);
-  const second = data.service.startProxyRelogin(data.claude.id);
-  // The gate is released only after BOTH starts have been issued, so a
-  // regressed guard would let both into the round trip — and fail below.
-  release();
+  // Do not infer overlap from invocation order: each caller first awaits an
+  // independent management-key read. Wait until the first proxy request is
+  // verifiably held open, then issue the competing start inside that window.
+  await entered;
   await assert.rejects(
-    () => second,
+    () => data.service.startProxyRelogin(data.claude.id),
     (error) => error.statusCode === 409 && /already in progress/.test(error.message),
   );
+  assert.equal(authUrlCalls, 1);
+  release();
   assert.equal((await first).phase, 'awaiting-browser');
   assert.equal(inner.state.calls.filter((call) => call.includes('-auth-url')).length, 1);
 });

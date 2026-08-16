@@ -74,7 +74,7 @@ public final class AccountsSettingsModel: ObservableObject {
             return false
         }
         guard let edit = AccountEdit(account: account, label: trimmedLabel, purpose: purpose, color: color) else {
-            lastError = "This account can't be edited — the daemon didn't report its profile reference."
+            lastError = "This subscription can't be edited — the daemon didn't report its profile reference."
             return false
         }
         return await perform(accountID: account.id) {

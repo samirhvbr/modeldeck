@@ -7,10 +7,16 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ingestCodexRollouts, parseCodexRolloutFile } from '../src/codex-rollout-ingest.mjs';
 import { Store } from '../src/db.mjs';
+import { cacheHealth } from '../dashboard/src/detectors.js';
 import { parseArgs, usageText } from '../scripts/ingest-codex-rollouts.mjs';
 
 const fixtureRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'codex-profiles');
 const rolloutCaseRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), 'fixtures', 'codex-rollout-cases');
+
+function bumpMtime(file) {
+  const stat = fs.statSync(file);
+  fs.utimesSync(file, stat.atime, new Date(stat.mtimeMs + 2_000));
+}
 
 test('Codex rollout ingest streams nested sessions and flat archives into replay-safe warehouse rows', async (t) => {
   const store = new Store(':memory:');
@@ -27,6 +33,7 @@ test('Codex rollout ingest streams nested sessions and flat archives into replay
   assert.deepEqual(first, {
     profiles: 2,
     files: 2,
+    filesSkipped: 0,
     sessions: 2,
     turns: 3,
     sessionsInserted: 2,
@@ -142,9 +149,10 @@ test('Codex rollout ingest streams nested sessions and flat archives into replay
     machine: 'placeholder-machine',
   });
   assert.equal(second.sessionsInserted, 0);
-  assert.equal(second.sessionsUpdated, 2);
+  assert.equal(second.sessionsUpdated, 0);
   assert.equal(second.turnsInserted, 0);
-  assert.equal(second.turnsUpdated, 3);
+  assert.equal(second.turnsUpdated, 0);
+  assert.equal(second.filesSkipped, 2);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM codex_sessions').get().count, 2);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS count FROM codex_turns').get().count, 3);
 
@@ -161,6 +169,197 @@ test('Codex rollout ingest streams nested sessions and flat archives into replay
   ]) assert.equal(indexes.has(name), true);
 });
 
+test('TRIPWIRE #476: Codex rollout ingest skips unchanged files and re-parses only appended or shrunk files', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-incremental-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const activeFile = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-2026-08-09T10-00-00-11111111-1111-4111-8111-111111111111.jsonl',
+  );
+  const archivedFile = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'archived_sessions',
+    'archived-placeholder-session.jsonl',
+  );
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  await t.test('unchanged second pass performs zero parses and zero row updates', async () => {
+    const changesBefore = store.db.prepare('SELECT total_changes() AS count').get().count;
+    const summary = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.files, 2);
+    assert.equal(summary.filesSkipped, 2, 'every enumerated file is skipped before parsing');
+    assert.equal(summary.sessions, 0);
+    assert.equal(summary.sessionsUpdated, 0);
+    assert.equal(summary.turnsUpdated, 0);
+    assert.equal(store.db.prepare('SELECT total_changes() AS count').get().count, changesBefore);
+  });
+
+  await t.test('append plus mtime bump re-parses exactly one file and lands the new turn', async () => {
+    const appendedRecords = [
+      {
+        timestamp: '2026-08-09T10:02:00.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'active-turn-three-placeholder' },
+      },
+      {
+        timestamp: '2026-08-09T10:02:00.100Z',
+        type: 'turn_context',
+        payload: { turn_id: 'active-turn-three-placeholder' },
+      },
+      {
+        timestamp: '2026-08-09T10:02:01.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: { total_token_usage: {
+            input_tokens: 30,
+            cached_input_tokens: 10,
+            cache_write_input_tokens: 2,
+            output_tokens: 12,
+            reasoning_output_tokens: 5,
+            total_tokens: 42,
+          } },
+        },
+      },
+      {
+        timestamp: '2026-08-09T10:02:03.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'active-turn-three-placeholder' },
+      },
+    ];
+    fs.appendFileSync(activeFile, `${appendedRecords.map((record) => JSON.stringify(record)).join('\n')}\n`);
+    bumpMtime(activeFile);
+
+    const summary = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 1);
+    assert.equal(summary.sessions, 1);
+    assert.equal(summary.sessionsUpdated, 1);
+    assert.equal(summary.turnsInserted, 1);
+    assert.equal(summary.turnsUpdated, 0, 'unchanged turns are not rewritten during the full-file replay');
+    assert.equal(
+      store.db.prepare('SELECT total_tokens FROM codex_turns WHERE turn_id = ?')
+        .get('active-turn-three-placeholder').total_tokens,
+      13,
+    );
+  });
+
+  await t.test('shrunk file re-ingests from scratch without rewriting unchanged rows', async () => {
+    const lines = fs.readFileSync(archivedFile, 'utf8').trimEnd().split('\n');
+    fs.writeFileSync(archivedFile, `${lines.slice(0, -1).join('\n')}\n`);
+    bumpMtime(archivedFile);
+
+    const summary = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 1);
+    assert.equal(summary.sessions, 1, 'the shrunk file was parsed instead of skipped');
+    assert.equal(summary.turns, 1);
+    assert.equal(summary.sessionsUpdated, 0);
+    assert.equal(summary.turnsUpdated, 0);
+  });
+
+  await t.test('a same-size same-mtime replacement at the same path still re-ingests (inode changed)', async () => {
+    const stat = fs.statSync(archivedFile);
+    const replacement = `${archivedFile}.replacement`;
+    fs.writeFileSync(replacement, fs.readFileSync(archivedFile));
+    fs.utimesSync(replacement, stat.atime, stat.mtime);
+    fs.renameSync(replacement, archivedFile);
+    const replaced = fs.statSync(archivedFile);
+    assert.equal(replaced.size, stat.size);
+    assert.equal(replaced.mtimeMs, stat.mtimeMs);
+    assert.notEqual(replaced.ino, stat.ino, 'the rename produced a new inode');
+
+    const summary = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 1, 'only the untouched file is skipped');
+    assert.equal(summary.sessions, 1, 'the replaced file was parsed instead of skipped');
+  });
+});
+
+test('TRIPWIRE codex-cached-input-subset — rollout cache reads are split from input exactly once', async (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  await ingestCodexRollouts({
+    store,
+    profilesRoot: fixtureRoot,
+    machine: 'placeholder-machine',
+  });
+
+  const project = store.projectBurn({
+    provider: 'codex',
+    project: '/placeholder/projects/active-repo',
+  }).projects[0];
+  const expectedUncached = (150 - 90) + (60 - 27);
+  const expectedRead = 90 + 27;
+  const expectedWrite = 8 + 3;
+  const expectedInput = expectedUncached + expectedRead + expectedWrite;
+
+  assert.equal(project.inputUncached, expectedUncached);
+  assert.deepEqual(project.tokenFlows, {
+    inputUncached: expectedUncached,
+    inputCacheRead: expectedRead,
+    inputCacheWrite: expectedWrite,
+    outputTotal: 30 + 29,
+  });
+  assert.ok(expectedWrite > 0, 'the fixture carries a separate nonzero cache-write flow');
+  assert.equal(project.totalTokens, (150 + 60) + (30 + 29), 'Codex reported totals include input and output, not cache writes');
+  assert.equal(project.inputTokens, expectedInput);
+  assert.equal(cacheHealth({ requests: 25, flows: project.tokenFlows }).readShare, expectedRead / expectedInput);
+
+  const sessions = store.usageSessions({
+    provider: 'codex',
+    project: '/placeholder/projects/active-repo',
+  });
+  assert.equal(sessions.sessions[0].inputTokens, expectedInput);
+
+  const detail = store.usageSessionDetail({
+    sessionId: '11111111-1111-4111-8111-111111111111',
+    profile: 'profile-alpha',
+    provider: 'codex',
+  });
+  assert.deepEqual(detail.contextTrend.map((point) => point.inputTokens), [150 + 8, 60 + 3]);
+
+  const effort = store.modelEffortBurn({
+    provider: 'codex',
+    project: '/placeholder/projects/active-repo',
+  });
+  assert.equal(effort.totals.inputTokens, expectedInput);
+
+  const anatomy = store.sessionAnatomy({
+    sessionId: '11111111-1111-4111-8111-111111111111',
+    profile: 'profile-alpha',
+    provider: 'codex',
+  });
+  assert.equal(anatomy.totals.inputUncached, expectedUncached);
+  assert.equal(anatomy.totals.inputCacheRead, expectedRead);
+  assert.equal(anatomy.totals.inputCacheWrite, expectedWrite);
+  assert.equal(anatomy.totals.contextSum, expectedInput);
+});
+
 test('Codex external-import turns retain tokens without turn_context events', async () => {
   const parsed = await parseCodexRolloutFile({
     file: path.join(rolloutCaseRoot, 'external-import-placeholder.jsonl'),
@@ -173,12 +372,12 @@ test('Codex external-import turns retain tokens without turn_context events', as
     turnId: turn.turnId,
     totalTokens: turn.totalTokens,
   })), [
-    { turnId: 'external-import-turn-1', totalTokens: 50 },
+    { turnId: 'external-import-turn-1', totalTokens: 158 },
     { turnId: 'external-import-turn-2', totalTokens: 26 },
   ]);
 });
 
-test('Codex token_count prefers valid last usage and falls back to cumulative diffs', async () => {
+test('Codex token_count uses session-cumulative differences even when last usage disagrees', async () => {
   const parsed = await parseCodexRolloutFile({
     file: path.join(rolloutCaseRoot, 'external-import-placeholder.jsonl'),
     profileSlug: 'placeholder-profile',
@@ -193,9 +392,49 @@ test('Codex token_count prefers valid last usage and falls back to cumulative di
     reasoning: turn.reasoningOutputTokens,
     total: turn.totalTokens,
   })), [
-    { input: 40, cached: 21, cacheWrite: 3, output: 10, reasoning: 4, total: 50 },
+    { input: 130, cached: 75, cacheWrite: 7, output: 28, reasoning: 11, total: 158 },
     { input: 20, cached: 10, cacheWrite: 1, output: 6, reasoning: 2, total: 26 },
-  ], 'valid last usage wins over cumulative totals; absent or malformed last usage uses the cumulative difference');
+  ], 'cumulative totals win over contradictory last usage and are differenced across turns');
+});
+
+test('TRIPWIRE codex-rollout-session-cumulative-deltas — repeated multi-call counters count once per turn', async () => {
+  const parsed = await parseCodexRolloutFile({
+    file: path.join(rolloutCaseRoot, 'cumulative-multi-call-placeholder.jsonl'),
+    profileSlug: 'placeholder-profile',
+    machine: 'placeholder-machine',
+  });
+
+  assert.deepEqual(parsed.turns.map((turn) => ({
+    input: turn.inputTokens,
+    cached: turn.cachedInputTokens,
+    output: turn.outputTokens,
+    reasoning: turn.reasoningOutputTokens,
+    total: turn.totalTokens,
+  })), [
+    { input: 150, cached: 90, output: 30, reasoning: 10, total: 180 },
+    { input: 40, cached: 20, output: 20, reasoning: 10, total: 60 },
+  ], 'the unchanged middle emission contributes zero; turn totals are successive session-cumulative differences');
+});
+
+test('Codex token_count seeds cumulative differences from preceding fallback-only events', async () => {
+  const parsed = await parseCodexRolloutFile({
+    file: path.join(rolloutCaseRoot, 'fallback-before-cumulative-placeholder.jsonl'),
+    profileSlug: 'placeholder-profile',
+    machine: 'placeholder-machine',
+  });
+
+  assert.deepEqual(parsed.turns.map((turn) => ({
+    turnId: turn.turnId,
+    input: turn.inputTokens,
+    cached: turn.cachedInputTokens,
+    cacheWrite: turn.cacheWriteInputTokens,
+    output: turn.outputTokens,
+    reasoning: turn.reasoningOutputTokens,
+    total: turn.totalTokens,
+  })), [
+    { turnId: 'fallback-turn-1', input: 12, cached: 5, cacheWrite: 1, output: 3, reasoning: 1, total: 15 },
+    { turnId: 'fallback-turn-2', input: 4, cached: 1, cacheWrite: 0, output: 1, reasoning: 1, total: 5 },
+  ], 'the first cumulative observation contributes only usage after the estimated fallback baseline');
 });
 
 test('Codex token_count without any preceding turn uses one warned session catch-all', async () => {

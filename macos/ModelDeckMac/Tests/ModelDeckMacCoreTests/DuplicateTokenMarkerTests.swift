@@ -67,7 +67,7 @@ struct DuplicateTokenFlagTests {
         // resolves both. Placeholder labels only.
         #expect(DuplicateTokenMarker.reloginHint(label: "Work", providerName: "Codex")
             == "Re-log in opens Codex's own login for Work. "
-            + "Re-logging either duplicate under its correct account clears both.")
+            + "Re-logging either duplicate under its own login clears both.")
     }
 
     // MARK: - Deck card VoiceOver label (CodeRabbit on PR #79): the card

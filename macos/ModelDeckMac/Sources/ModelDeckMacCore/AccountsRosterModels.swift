@@ -125,7 +125,7 @@ public struct AccountsRosterSection: Equatable, Identifiable, Sendable {
     public var id: String { provider.rawValue }
     public var title: String { provider.displayName }
     public var countText: String {
-        accounts.count == 1 ? "1 account" : "\(accounts.count) accounts"
+        accounts.count == 1 ? "1 subscription" : "\(accounts.count) subscriptions"
     }
 
     public init(
@@ -277,7 +277,7 @@ public enum AccountsRoster {
             return ProviderActivationBanner(
                 provider: provider,
                 message: trouble.message
-                    + " (The account this concerns is no longer in the roster.)",
+                    + " (The subscription this concerns is no longer in the roster.)",
                 detail: detail,
                 retryRunsActivation: false,
                 affectedAccountID: nil,
@@ -346,7 +346,7 @@ public enum AccountsRoster {
     public static let duplicateTokenDetail =
         "These profiles appear to share the same provider login — the "
         + "evidence each one presents matches another profile's. Any usage "
-        + "shown reflects one shared account. The warning clears on its "
+        + "shown reflects one shared login. The warning clears on its "
         + "own after a fresh /login gives each profile its own credential. "
         + "Running sessions are never touched."
 
@@ -374,7 +374,7 @@ public enum AccountsRoster {
     /// The click-level next step for a blocked activation, appended to both
     /// the daemon's verbatim guidance and the state-derived blocked message.
     /// Post-#234 the radio click IS the working retry path, so the copy
-    /// points there (mirroring the "Pick an account below" pattern) instead
+    /// points there (mirroring the "Pick one below" pattern) instead
     /// of leaving the user to rediscover Retry. `afterDaemonGuidance` skips
     /// the move instruction the daemon's own text already gives.
     static func blockedResolutionSentence(
@@ -382,7 +382,7 @@ public enum AccountsRoster {
         afterDaemonGuidance: Bool = false
     ) -> String {
         let target = accountLabel.map { "click \($0)'s radio" }
-            ?? "pick an account below"
+            ?? "pick a subscription below"
         return afterDaemonGuidance
             ? "Once it's moved or renamed, \(target) to activate."
             : "Move or rename that directory, then \(target) to activate."
@@ -435,7 +435,7 @@ public enum AccountsRoster {
     /// The banner's honest nuance line (mock: "Usage tracking works; new
     /// sessions won't use Insight until activation completes.").
     static func detailText(for provider: DeckProvider, selectedLabel: String?) -> String {
-        let target = selectedLabel.map { "use \($0)" } ?? "switch accounts"
+        let target = selectedLabel.map { "use \($0)" } ?? "switch subscriptions"
         return "Usage tracking works; new \(provider.displayName) sessions won't "
             + "\(target) until activation completes. Running sessions are never touched."
     }
@@ -447,7 +447,7 @@ public enum AccountsRoster {
         provider: DeckProvider,
         selectedLabel: String?
     ) -> String? {
-        let selected = selectedLabel ?? "the selected account"
+        let selected = selectedLabel ?? "the selected subscription"
         switch state {
         case .effective, .unknown:
             return nil
@@ -472,8 +472,8 @@ public enum AccountsRoster {
             // dead end. The real next step is picking an account: its radio
             // runs the same activation.
             guard selectedLabel != nil else {
-                return "Activation ready — no \(provider.displayName) account is "
-                    + "active yet. Pick an account below to activate it."
+                return "Activation ready — no \(provider.displayName) subscription is "
+                    + "active yet. Pick one below to activate it."
             }
             return "Activation ready — no active link exists yet. "
                 + "Complete Activation on \(selected) finishes the switch."

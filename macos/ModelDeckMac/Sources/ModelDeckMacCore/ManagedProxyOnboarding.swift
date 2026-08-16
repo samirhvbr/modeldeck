@@ -412,12 +412,12 @@ public enum ManagedProxyOnboardingCopy {
     // Fresh-install consent
     public static let consentTitle = "Enable measured usage truth?"
     public static let consentBody =
-        "ModelDeck runs a managed proxy locally, on this Mac only. With it, your usage numbers are measured from real requests instead of estimated, and pooled accounts get per-account attribution. It listens on 127.0.0.1:\(ManagedProxyDefaults.port), stores its state in \(configDirectoryDisplay), and sends nothing anywhere else."
+        "ModelDeck runs a managed proxy locally, on this Mac only. With it, your usage numbers are measured from real requests instead of estimated, and pooled subscriptions get per-subscription attribution. It listens on 127.0.0.1:\(ManagedProxyDefaults.port), stores its state in \(configDirectoryDisplay), and sends nothing anywhere else."
     public static let consentEnableTitle = "Enable"
     public static let consentDeclineTitle = "Not Now"
     /// What declining honestly costs — no dark pattern, no nagging.
     public static let consentDeclinedReason =
-        "Usage comes from local logs and your plan's own quota windows — accurate for windows and limits, estimated for token counts, with no per-account attribution for pooled accounts. You can turn the managed proxy on any time in Settings → General."
+        "Usage comes from local logs and your plan's own quota windows — accurate for windows and limits, estimated for token counts, with no per-subscription attribution for pooled subscriptions. You can turn the managed proxy on any time in Settings → General."
 
     // Settings
     public static let settingsSectionTitle = "Managed proxy"

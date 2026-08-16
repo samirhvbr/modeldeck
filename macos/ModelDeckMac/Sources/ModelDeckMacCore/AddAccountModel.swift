@@ -163,8 +163,8 @@ public final class AddAccountModel: ObservableObject {
             priorActiveAccountID = nil
             return nil
         } catch {
-            return "The previously active account could not be restored — "
-                + "re-activate it from Settings → Accounts. "
+            return "The previously active subscription could not be restored — "
+                + "re-activate it from Settings → Subscriptions. "
                 + "(\(SettingsSyncModel.message(for: error)))"
         }
     }
@@ -229,9 +229,9 @@ public final class AddAccountModel: ObservableObject {
         // had nothing to work with — say so instead of leaving the switch
         // unannounced (never-silent, per this file's contract).
         if didActivateForLogin, priorActiveLookupFailed {
-            let warning = "ModelDeck couldn't read which account was active before this "
+            let warning = "ModelDeck couldn't read which subscription was active before this "
                 + "sign-in, so nothing was restored — this profile is now the active one. "
-                + "Re-activate another account from Settings → Accounts if needed."
+                + "Re-activate another subscription from Settings → Subscriptions if needed."
             completionWarning = [completionWarning, warning].compactMap { $0 }.joined(separator: " ")
         }
         await publishFreshState()
@@ -241,9 +241,9 @@ public final class AddAccountModel: ObservableObject {
     /// Honest, provider-neutral mismatch message (issue #99). Identities are
     /// shown in the UI only — never logged.
     static func identityMismatchMessage(_ mismatch: AccountVerification.IdentityMismatch) -> String {
-        let actual = mismatch.actual ?? "a different account"
-        let expected = mismatch.expected ?? "the intended account"
-        return "The sign-in landed as \(actual), but this account is \(expected). "
+        let actual = mismatch.actual ?? "a different identity"
+        let expected = mismatch.expected ?? "the intended identity"
+        return "The sign-in landed as \(actual), but this subscription expects \(expected). "
             + "Nothing was recorded. Run the login again and sign in as \(expected)."
     }
 

@@ -15,7 +15,7 @@ private func issue330Account(_ id: String) -> DeckAccount {
     DeckAccount(
         id: id,
         provider: "claude",
-        label: "Account \(id)",
+        label: "Subscription \(id)",
         identity: "\(id)@example.com",
         enabled: true,
         isDefault: false
@@ -337,7 +337,7 @@ struct Issue330IndependentCriteriaTests {
         #expect(filtered.rows.isEmpty,
                 "strict AND hides rows that pass only one of the two criteria")
         #expect(filtered.hiddenAccountCount == 2)
-        #expect(filtered.accountCountText == "2 accounts")
+        #expect(filtered.subscriptionCountText == "2 subscriptions")
         #expect(model.isHidingAnyRow(state: state, now: issue330Now),
                 "the footer eye remains the visible escape hatch")
         #expect(!model.eyeToggleChangesNothingVisible(state: state, now: issue330Now))
@@ -365,10 +365,10 @@ struct Issue330IndependentCriteriaTests {
             (
                 true,
                 true,
-                "No accounts are hidden by your 25% remaining and 6-day renewal filters."
+                "No subscriptions are hidden by your 25% remaining and 6-day renewal filters."
             ),
-            (true, false, "No accounts are hidden by your 25% remaining filter."),
-            (false, true, "No accounts are hidden by your 6-day renewal filter."),
+            (true, false, "No subscriptions are hidden by your 25% remaining filter."),
+            (false, true, "No subscriptions are hidden by your 6-day renewal filter."),
             (false, false, "No filters are active."),
         ]
 
@@ -398,20 +398,20 @@ struct Issue330IndependentCriteriaTests {
             (
                 true,
                 true,
-                "Accounts with 25% or more remaining AND renewing within 6 days stay visible.",
-                "Accounts with missing data stay visible."
+                "Subscriptions with 25% or more remaining AND renewing within 6 days stay visible.",
+                "Subscriptions with missing data stay visible."
             ),
             (
                 true,
                 false,
-                "Accounts with 25% or more remaining stay visible. Everything else is hidden.",
-                "Accounts with missing data stay visible."
+                "Subscriptions with 25% or more remaining stay visible. Everything else is hidden.",
+                "Subscriptions with missing data stay visible."
             ),
             (
                 false,
                 true,
-                "Accounts renewing within 6 days stay visible. Everything else is hidden.",
-                "Accounts with missing data stay visible."
+                "Subscriptions renewing within 6 days stay visible. Everything else is hidden.",
+                "Subscriptions with missing data stay visible."
             ),
             (false, false, "No filters active — nothing is hidden.", nil),
         ]
@@ -426,7 +426,7 @@ struct Issue330IndependentCriteriaTests {
 
     @Test func renewalCriterionCaptionNamesKnownResetsExactly() {
         #expect(DeckPopoverModel.byRemainingRenewalCriterionCaption
-            == "Hides accounts with a known reset outside the window.")
+            == "Hides subscriptions with a known reset outside the window.")
     }
 
     @Test func manualOverridesWinAcrossEveryCriteriaConfiguration() {

@@ -36,7 +36,7 @@ struct AddAccountSheet: View {
         .frame(width: 420)
         .onAppear { model.reset() }
         .confirmationDialog(
-            "Keep \(model.account?.label ?? "the new account")?",
+            "Keep \(model.account?.label ?? "the new subscription")?",
             isPresented: $confirmingCancel,
             titleVisibility: .visible
         ) {
@@ -86,7 +86,7 @@ struct AddAccountSheet: View {
                 ColorPicker("Color", selection: $color, supportsOpacity: false)
                     .onChange(of: color) { _, _ in colorEdited = true }
             }
-            Text("ModelDeck creates an isolated, owner-only profile home for this account. Sign-in happens next, in \(provider.displayName)'s own flow — ModelDeck never sees or stores credentials.")
+            Text("ModelDeck creates an isolated, owner-only profile home for this subscription. Sign-in happens next, in \(provider.displayName)'s own flow — ModelDeck never sees or stores credentials.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -103,7 +103,7 @@ struct AddAccountSheet: View {
                 // Issue #99: current Claude Code stores the credential in
                 // whichever profile is active, so the flow flipped
                 // activation to the new profile for this sign-in.
-                Text("ModelDeck activated this profile so the sign-in lands in the right account (required by current \(providerDisplayName) versions). If another profile was active, it's restored after verification.")
+                Text("ModelDeck activated this profile so the sign-in lands in the right subscription (required by current \(providerDisplayName) versions). If another profile was active, it's restored after verification.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -146,7 +146,7 @@ struct AddAccountSheet: View {
                     ?? "Signed in. (\(providerDisplayName) didn't report an identity.)")
                     .font(.system(size: 13, weight: .semibold))
             }
-            Text("\(model.account?.label ?? "The account") is in the deck. Its first usage snapshot has been requested; the popover updates as soon as it lands.")
+            Text("\(model.account?.label ?? "The subscription") is in the deck. Its first usage snapshot has been requested; the popover updates as soon as it lands.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -203,9 +203,9 @@ struct AddAccountSheet: View {
 
     private var title: String {
         switch model.step {
-        case .details: return "Add Account"
+        case .details: return "Add Subscription"
         case .signIn: return "Sign in to \(providerDisplayName)"
-        case .confirm: return "Account added"
+        case .confirm: return "Subscription added"
         }
     }
 

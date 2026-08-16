@@ -283,7 +283,7 @@ struct ExplainedStalenessFooterTests {
         ))
         let status = model.footerStatus(now: now)
         // Pinned EXACTLY (house rule): the neutral all-explained line.
-        #expect(status?.text == "Live accounts current · 3 idle")
+        #expect(status?.text == "Live subscriptions current · 3 idle")
         #expect(status?.isStale == false)
         #expect(status?.tooltip == MenuBarStatusModel.FooterStatus.explainedTooltip)
     }
@@ -303,7 +303,7 @@ struct ExplainedStalenessFooterTests {
             ]
         ))
         let status = model.footerStatus(now: now)
-        #expect(status?.text == "Live accounts current · 1 idle · 1 signed out")
+        #expect(status?.text == "Live subscriptions current · 1 idle · 1 signed out")
         #expect(status?.isStale == false)
     }
 
@@ -328,7 +328,7 @@ struct ExplainedStalenessFooterTests {
             usage: [snapshot("l", secondsAgo: 60), snapshot("k", secondsAgo: 57_600)]
         ))
         let status = model.footerStatus(now: now)
-        #expect(status?.text == "Live accounts current · 1 needs Keychain access")
+        #expect(status?.text == "Live subscriptions current · 1 needs Keychain access")
         #expect(status?.isStale == false)
     }
 
@@ -369,7 +369,7 @@ struct ExplainedStalenessFooterTests {
             ]
         ))
         let status = model.footerStatus(now: now)
-        #expect(status?.text == "Live accounts current · 1 idle")
+        #expect(status?.text == "Live subscriptions current · 1 idle")
         #expect(status?.isStale == false)
     }
 
@@ -388,13 +388,13 @@ struct ExplainedStalenessFooterTests {
 
     @Test func pinnedTooltipStrings() {
         #expect(MenuBarStatusModel.FooterStatus.freshTooltip
-            == "Age of the oldest account's newest provider-reported usage")
+            == "Age of the oldest subscription's newest provider-reported usage")
         #expect(MenuBarStatusModel.FooterStatus.staleTooltip
             == "Usage data is older than expected — Refresh forces a fresh provider poll.")
         // Deliberate pin update (PR #169 review): the tooltip must not
         // misdescribe Keychain-blocked accounts as idle or signed out.
         #expect(MenuBarStatusModel.FooterStatus.explainedTooltip
-            == "Idle, signed-out, or Keychain-blocked accounts pause their usage data; live accounts are up to date. Click for details.")
+            == "Idle, signed-out, or Keychain-blocked subscriptions pause their usage data; live subscriptions are up to date. Click for details.")
     }
 }
 
@@ -551,7 +551,7 @@ struct HeadlineWindowTests {
 
 // MARK: - lastRefreshError decode (issue #89)
 
-@Suite("Account refresh error decode (issue #89)")
+@Suite("Subscription refresh error decode (issue #89)")
 struct AccountRefreshErrorDecodeTests {
     private func decodeAccount(_ json: String) throws -> DeckAccount {
         let wrapped = #"{"accounts": [\#(json)], "usage": []}"#
@@ -620,7 +620,7 @@ struct KeychainAccessRecoveryTests {
         #expect(recovery?.text == "ModelDeck needs Keychain access")
         #expect(recovery?.tooltip.contains("Refresh") == true)
         #expect(recovery?.tooltip.contains("Always Allow") == true)
-        #expect(recovery?.tooltip.contains("one prompt per account") == true)
+        #expect(recovery?.tooltip.contains("one prompt per subscription") == true)
         #expect(recovery?.accessibilityLabel.contains("ModelDeck needs Keychain access") == true)
         #expect(recovery?.accessibilityLabel.contains("Always Allow") == true)
     }
@@ -711,7 +711,7 @@ struct SignInRecoveryTests {
     @Test func signinRequiredGetsTheRecoveryNotice() {
         let recovery = row(authState: "signin-required").signInRecovery
         #expect(recovery?.text == "Sign in needed")
-        #expect(recovery?.tooltip.contains("Settings → Accounts") == true)
+        #expect(recovery?.tooltip.contains("Settings → Subscriptions") == true)
         #expect(recovery?.accessibilityLabel.contains("Sign in needed") == true)
     }
 
@@ -720,13 +720,13 @@ struct SignInRecoveryTests {
         // ACTIVE account's stored sign-in, so non-active accounts expire
         // within hours. The card must say WHY, not just "sign in".
         let recovery = row(authState: "signin-required").signInRecovery
-        #expect(recovery?.tooltip.contains("only the active account's sign-in") == true)
+        #expect(recovery?.tooltip.contains("only the active subscription's sign-in") == true)
     }
 
     @Test func codexRowOmitsTheClaudeDetail() {
         let recovery = row(authState: "signin-required", provider: "codex").signInRecovery
         #expect(recovery != nil)
-        #expect(recovery?.tooltip.contains("active account's sign-in") == false)
+        #expect(recovery?.tooltip.contains("active subscription's sign-in") == false)
     }
 
     @Test func daemonErrorMessageRidesAlongInTheTooltip() {
@@ -797,9 +797,9 @@ struct SignInRecoveryTests {
         // The calm lead: paused data, automatic renewal on next use.
         #expect(recovery?.tooltip.contains("renews the sign-in automatically") == true)
         // The full #114 structural story stays in the explanation…
-        #expect(recovery?.tooltip.contains("only the active account's sign-in") == true)
+        #expect(recovery?.tooltip.contains("only the active subscription's sign-in") == true)
         // …and so does the #118 one-click path pointer.
-        #expect(recovery?.tooltip.contains("Settings → Accounts") == true)
+        #expect(recovery?.tooltip.contains("Settings → Subscriptions") == true)
         #expect(recovery?.accessibilityLabel.contains("Idle — renews on next use") == true)
     }
 
@@ -850,7 +850,7 @@ struct SignInRecoveryTests {
             authState: "signin-required", provider: "codex", signinReason: "expired"
         ).signInRecovery
         #expect(recovery?.tone == .idle)
-        #expect(recovery?.tooltip.contains("active account's sign-in") == false)
+        #expect(recovery?.tooltip.contains("active subscription's sign-in") == false)
     }
 
     @Test func idleNoticeKeepsTheSameSingleNoticeFootprint() {
@@ -888,7 +888,7 @@ struct SignInRecoveryTests {
         ).signInRecovery
         #expect(recovery?.tone == .signedOut)
         #expect(recovery?.text == "Sign in needed")
-        #expect(recovery?.tooltip.contains("Settings → Accounts") == true)
+        #expect(recovery?.tooltip.contains("Settings → Subscriptions") == true)
         // The daemon's classified error rides along so the card says WHY.
         #expect(recovery?.tooltip.contains("Last refresh failed:") == true)
         #expect(recovery?.tooltip.contains("token_invalidated") == true)

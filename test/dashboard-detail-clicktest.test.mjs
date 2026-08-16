@@ -81,6 +81,22 @@ import { createApp } from '../src/server.mjs';
 import { DASHBOARD_APP_HTML } from '../src/dashboard-app.mjs';
 import { bootPage, installDom, installFetch, loadModule, waitFor } from '../dashboard/test-support/index.mjs';
 
+// #450: these fixtures anchor "recent" events a couple of hours in the past
+// and their tests click the chart's last ("today") bar — between 00:00 and
+// 02:00 local the anchors crossed midnight, the last day emptied, and the
+// suite failed two hours every day. Pin the process to a DST-free
+// fixed-offset zone where it is currently early afternoon, so "a couple of
+// hours ago" is always today at any wall-clock time, without disturbing the
+// fixtures' hand-tuned burn/rounding numbers. (POSIX inverts the sign:
+// Etc/GMT-5 means UTC+5.) The spawned daemon inherits TZ from process.env.
+{
+  const utcHour = new Date().getUTCHours();
+  const offset = (((13 - utcHour) % 24) + 24) % 24;
+  process.env.TZ = offset === 0 ? 'Etc/GMT'
+    : offset <= 14 ? `Etc/GMT-${offset}` : `Etc/GMT+${24 - offset}`;
+}
+
+
 const PORT = 43388;
 const TOKEN = 'detail-clicktest-placeholder-token';
 const CLAUDE_PROJECT = '/placeholder/projects/alpha';
@@ -282,7 +298,7 @@ function seed(store, root) {
       turnId: 'turn-' + turnIndex,
       model: 'gpt-5.6-sol',
       reasoningEffort: 'medium',
-      inputTokens: 3000,
+      inputTokens: 9000,
       cachedInputTokens: 6000,
       cacheWriteInputTokens: 0,
       outputTokens: 900,
@@ -707,7 +723,7 @@ test('TRIPWIRE section-filters-narrow — each headroom section narrows by accou
   assert.equal(pressed('Provider scope'), 'Combined');
 
   // 2. BY ACCOUNT, narrowing further still.
-  await choose('By subscription account', 'Placeholder Claude Two',
+  await choose('By subscription filter', 'Placeholder Claude Two',
     () => subs().querySelectorAll('tbody tr').length === 1, 'the section to narrow to one subscription');
   assert.deepEqual(labelsIn(subs()), ['Placeholder Claude Two']);
   assert.match(noteIn(subs()), /1 of 3 subscriptions/);
@@ -715,14 +731,14 @@ test('TRIPWIRE section-filters-narrow — each headroom section narrows by accou
     'the one-row column is its own caption (' + sum(burnedIn(subs())) + ' vs ' + figureIn(subs()) + ')');
 
   // 3. …and back out: the section returns to exactly the page's own scope.
-  await choose('By subscription account', 'All subscriptions',
+  await choose('By subscription filter', 'All subscriptions',
     () => subs().querySelectorAll('tbody tr').length === 2, 'the account filter to clear');
   await narrow('By subscription provider', 'All',
     () => subs().querySelectorAll('tbody tr').length === 3, 'the provider filter to clear');
   assert.match(noteIn(subs()), /burned across the pool/);
 
   // 4. THE SECOND SECTION filters on its own, by account…
-  await choose('Every weekly limit account', 'Placeholder Claude One',
+  await choose('Every weekly limit subscription', 'Placeholder Claude One',
     () => limits().querySelectorAll('tbody tr').length < everyLimit, 'the limits to narrow to one account');
   assert.deepEqual(new Set(labelsIn(limits())), new Set(['Placeholder Claude One']));
   assert.match(noteIn(limits()), new RegExp(limits().querySelectorAll('tbody tr').length + ' of ' + everyLimit + ' limits'));
@@ -735,7 +751,7 @@ test('TRIPWIRE section-filters-narrow — each headroom section narrows by accou
     'the limits to narrow to Codex');
   assert.ok(limits().querySelectorAll('tbody tr').length >= 1, 'the Codex limit is listed');
   assert.equal(
-    document.querySelector('select[aria-label="Every weekly limit account"]'),
+    document.querySelector('select[aria-label="Every weekly limit subscription"]'),
     null,
     'a single remaining subscription draws no account picker',
   );

@@ -48,7 +48,7 @@ private var busyPresentation: AvailabilityHealthPresentation {
         // The long label sits on the account that holds the biggest reset,
         // so the relief row — the widest row the layout can produce — is
         // exercised at its worst case.
-        (id: "c1", label: "Client Overflow Account", tier: "max_20x", remaining: 30, resetHours: 20),
+        (id: "c1", label: "Client Overflow Subscription", tier: "max_20x", remaining: 30, resetHours: 20),
         (id: "c2", label: "Studio", tier: "max_5x", remaining: 8, resetHours: 140),
         // Below the 5% usable floor: points counted in the pool that cannot
         // host a session, which is what makes the Usable row render (#257).
@@ -130,7 +130,7 @@ struct HealthDetailStructureTests {
         // travels in its own field so the view can ellipsize that and only
         // that — the numbers are never allowed to lose a digit.
         let relief = busyPresentation.section("Week ahead")?.row("Next relief")
-        #expect(relief?.name == "Client Overflow Account")
+        #expect(relief?.name == "Client Overflow Subscription")
         #expect(relief?.value.hasPrefix("+") == true)
         #expect(relief?.value.contains("pts ·") == true)
         // Every other row is numbers only — nothing to truncate.
@@ -230,7 +230,7 @@ struct HealthDetailAccessibilityTests {
               let relief = week.row("Next relief") else {
             Issue.record("the relief row renders in this fixture"); return
         }
-        #expect(relief.spokenValue.hasPrefix("Client Overflow Account +"))
-        #expect(week.accessibilityLabel.contains("Client Overflow Account"))
+        #expect(relief.spokenValue.hasPrefix("Client Overflow Subscription +"))
+        #expect(week.accessibilityLabel.contains("Client Overflow Subscription"))
     }
 }

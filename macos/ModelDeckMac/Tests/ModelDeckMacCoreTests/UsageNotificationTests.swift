@@ -71,7 +71,7 @@ struct UsageAlertPlannerTests {
         let alert = UsageAlertPlanner.alert(
             previous: .none, worst: worst(5, accountId: "gone"), state: state, thresholds: thresholds
         )
-        #expect(alert?.title == "An account is critically low")
+        #expect(alert?.title == "A subscription is critically low")
     }
 }
 

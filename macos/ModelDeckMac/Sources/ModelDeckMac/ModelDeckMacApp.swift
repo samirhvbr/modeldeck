@@ -40,6 +40,8 @@ struct ModelDeckMacApp: App {
     /// holds it weakly on purpose — the seam must never own Sparkle).
     private let sparkleDriver: SparkleUpdateDriver?
     @StateObject private var notifications: UsageNotificationCoordinator
+    /// Issue #377: mid-session model drops post through the same banner seam.
+    @StateObject private var modelDropNotifications: ModelDropNotificationCoordinator
     /// Issue #96: bundled-daemon lifecycle — first-run consent, SMAppService
     /// registration, Keychain token, drift re-register, legacy takeover.
     @StateObject private var daemonSetupModel: DaemonSetupModel
@@ -185,6 +187,7 @@ struct ModelDeckMacApp: App {
             Task { await AppUpdateStagedNotificationPoster().post(notification) }
         }
         let notifications = UsageNotificationCoordinator(poster: UserNotificationCenterPoster())
+        let modelDropNotifications = ModelDropNotificationCoordinator(poster: UserNotificationCenterPoster())
         // Issue #96: all seams live (SMAppService agent, Keychain, launchctl,
         // /api/health probe); in dev builds without a bundled daemon manifest
         // the whole surface stays quiet.
@@ -282,9 +285,14 @@ struct ModelDeckMacApp: App {
             }
         }
         // Every fresh daemon state feeds the notification transition check.
-        statusModel.onStateUpdate = { [weak notifications, weak statusModel, weak deckModel, weak daemonSetupModel, weak appUpdateStagedPrompt] worst, state in
+        statusModel.onStateUpdate = { [weak notifications, weak modelDropNotifications, weak statusModel, weak deckModel, weak daemonSetupModel, weak appUpdateStagedPrompt] worst, state in
             Task { @MainActor [weak notifications] in
                 await notifications?.evaluate(worst: worst, state: state)
+            }
+            // Issue #377: same hook, no new polling — the drop is already in
+            // the state the deck just read.
+            Task { @MainActor [weak modelDropNotifications] in
+                await modelDropNotifications?.evaluate(state: state)
             }
             // Issue #113 (CodeRabbit): SwiftUI never resets a popover's
             // isPresented binding when its anchor leaves the hierarchy, so
@@ -553,6 +561,7 @@ struct ModelDeckMacApp: App {
         _appUpdateStagedPrompt = StateObject(wrappedValue: appUpdateStagedPrompt)
         self.sparkleDriver = sparkleDriver
         _notifications = StateObject(wrappedValue: notifications)
+        _modelDropNotifications = StateObject(wrappedValue: modelDropNotifications)
         _daemonSetupModel = StateObject(wrappedValue: daemonSetupModel)
         _managedProxyModel = StateObject(wrappedValue: managedProxyModel)
         _proxyOnboardingModel = StateObject(wrappedValue: proxyOnboardingModel)

@@ -61,15 +61,32 @@ git -C "$REPO_ROOT" archive HEAD | tar -x -C "$SNAPSHOT"
 
 # This list is intentionally duplicated in docs/RELEASE.md for operator
 # visibility. Keep both locations synchronized.
-rm -rf \
-  "$SNAPSHOT/.claude" \
-  "$SNAPSHOT/docs/HANDOFF.md" \
-  "$SNAPSHOT/docs/ACCOUNT_ONBOARDING.md" \
-  "$SNAPSHOT/docs/lane-routing-policy.md" \
-  "$SNAPSHOT/docs/incidents" \
-  "$SNAPSHOT/scripts/lane-codex.sh" \
-  "$SNAPSHOT/scripts/lane-watch.mjs" \
-  "$SNAPSHOT/design/mac-app-roadmap.md"
+STRIPPED_PATHS=(
+  ".claude"
+  "docs/HANDOFF.md"
+  "docs/ACCOUNT_ONBOARDING.md"
+  "docs/lane-routing-policy.md"
+  "docs/incidents"
+  "scripts/lane-codex.sh"
+  "scripts/lane-watch.mjs"
+  "test/lane-codex-args.test.mjs"
+  "design/mac-app-roadmap.md"
+)
+for stripped_path in "${STRIPPED_PATHS[@]}"; do
+  rm -rf -- "$SNAPSHOT/$stripped_path"
+done
+
+# TRIPWIRE stripped-test-subjects: a test that directly resolves a stripped
+# repo path cannot survive in the mirror without its subject.
+for stripped_path in "${STRIPPED_PATHS[@]}"; do
+  while IFS= read -r -d '' test_file; do
+    if grep -F -- "../$stripped_path" "$test_file" \
+      | grep -E '^[[:space:]]*(const|let|var)[[:space:]]+[^=]+=[[:space:]]*new[[:space:]]+URL[[:space:]]*\(' \
+      >/dev/null; then
+      fail "surviving test ${test_file#"$SNAPSHOT/"} references stripped path $stripped_path"
+    fi
+  done < <(find "$SNAPSHOT/test" -type f -name '*.test.mjs' -print0 2>/dev/null)
+done
 
 # A repository-local pattern file may contain private terms. Remove that exact
 # file from the snapshot before staging; external pattern files need no action.

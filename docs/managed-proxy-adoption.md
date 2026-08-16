@@ -85,8 +85,14 @@ and the same sign-ins. Nothing is copied or moved.
 Declining adoption records **coexist**: ModelDeck keeps reading from the proxy
 you run, exactly as before, and says why the managed-only features are off —
 starting, restarting after a crash, and version pinning stay off while you
-manage it yourself. That reason appears in Settings and on the deck's external
-proxy line.
+manage it yourself.
+
+That reason lives in **Settings → General → Managed proxy**, in full. On the
+deck it is a single quiet glyph in the header's control row, whose tooltip
+carries the same sentence — never a row of its own. Tim's ruling (#445,
+2026-08-15) amends the surface, not the principle: coexistence is still never
+silent, it just does not tax the deck. `ProxyCoexistNotice` owns that decision
+and TRIPWIRE `coexist-costs-no-deck-row` holds it.
 
 ## User-run ops are tolerated (#401a)
 

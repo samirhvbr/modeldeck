@@ -74,7 +74,7 @@ private func capturedFieldState() -> DeckState {
     ]
     return DeckState(
         accounts: roster.map {
-            member($0.id, label: "Account \($0.id)", weight: $0.weight, fableExcluded: $0.fableExcluded)
+            member($0.id, label: "Subscription \($0.id)", weight: $0.weight, fableExcluded: $0.fableExcluded)
         },
         usage: roster.flatMap {
             [
@@ -118,7 +118,7 @@ struct Issue317ZeroWeightFilterFieldTests {
             .first { $0.provider == .claude }!
         #expect(claude.rows.map(\.id) == ["p5"])
         #expect(claude.hiddenAccountCount == 6)
-        #expect(claude.accountCountText == "7 accounts")
+        #expect(claude.subscriptionCountText == "7 subscriptions")
     }
 
     @Test func fullClickPathModePersistsAndRederives() {
@@ -131,7 +131,7 @@ struct Issue317ZeroWeightFilterFieldTests {
         let model = DeckPopoverModel(defaults: defaults)
         #expect(model.columns(for: state, now: now)
             .first { $0.provider == .claude }!.rows.count == 7,
-            "the By-account default hides nothing on this deck")
+            "the By-subscription default hides nothing on this deck")
         model.hideMode = .byZeroWeightings
         #expect(defaults.string(forKey: DeckPopoverModel.hideShowModeDefaultsKey)
             == DeckPopoverModel.DeckHideMode.byZeroWeightings.rawValue)

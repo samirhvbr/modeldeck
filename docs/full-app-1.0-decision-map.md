@@ -63,9 +63,12 @@ UI components.
   pre-selected (honoring tier-3-default), decline lands tiers 1–2 with the
   upgrade visible in settings. Never silent-on (the #401 field-trust rule).
   Rides build slice D.
-- Whether the interim ops jobs (rebalance cron, launchd ingest) fold into the
-  managed daemon at 1.0 — sharpens once #397 (buildout scope) and #400 (queue
-  consumer) land. (#388 already retires the interim ingest job at 0.4.6.)
+- ~~Whether the interim ops jobs (rebalance cron, launchd ingest) fold into the
+  managed daemon at 1.0~~ — RULED (Tim, 2026-08-15): the launchd ingest was
+  already retired (#388); the rebalance cron FOLDS INTO the managed daemon
+  post-1.0, ticketed as [Managed daemon owns pace-based pool rebalancing
+  (#470)](https://github.com/timharris707/modeldeck-private/issues/470) —
+  managed mode only; coexist keeps the user-run cron per decision 0010.
 - ~~Windows/Linux story, if any~~ — RULED OUT at #405 (2026-08-14): not a 1.0 goal.
 
 ## Out of scope (ruled past the destination, with rulings)
@@ -89,4 +92,5 @@ UI components.
 - 2026-08-14 · #402 — loopback WKWebView (scoped ATS), route-object deep links, one window + route restore, daemon token in-window (security lens at build review). No prototype graduated.
 - 2026-08-14 · #403 — pin rides app releases; build-from-source, no re-signing; entitlements-from-none; pin-bump compat tripwire with live-endpoint capture; CVE-only expedite; upstream watch in RELEASE.md. Closes #399's open decisions.
 - 2026-08-14 · #405 — 1.0 label defined; #395/#396 promoted to 1.0-mandatory; quality bar = 0.4.6 protocol; mirror per #404; 0.4.x → 1.0.0; Windows/Linux + iOS OUT. **Map closed — gate released: cut the 1.0 build tickets.**
+- 2026-08-15 · ops-jobs ledger entry — rebalance cron folds into the managed daemon post-1.0 (ticket #470); ingest half was already retired (#388). **Both ledgers now clear — map fully closed, parent #378 closed.**
 - 2026-08-14 · onboarding consent (post-map addendum, ruled during to-tickets) — one first-launch surface, two branches: adoption offer (#401) when :8317 answers; fresh-install consent screen with Enable pre-selected (tier-3 default), decline = tiers 1–2. Never silent-on. Rides build slice D.

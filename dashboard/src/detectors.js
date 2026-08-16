@@ -130,12 +130,15 @@ export function movers({ rows, sliceDays, baseline }) {
 // SELECTED, by the largest term in the session's own token classes, so it can
 // never flatter the data or say the same thing about every session.
 //
-// The four token classes partition the session total exactly:
+// The four normalized token classes are disjoint and partition the measured
+// token flow exactly. Claude records these as separate fields. Codex reports
+// cached_input_tokens as a subset of input_tokens, so the backend maps fresh
+// input to input_tokens - cached_input_tokens and keeps cache writes additive:
 //
-//   contextRead   cache_read_input_tokens      context re-processed
-//   contextWrite  cache_creation_input_tokens  context written into cache
-//   freshInput    input_tokens                 context never cached at all
-//   output        output_tokens                what the model generated
+//   contextRead   cached input                 context re-processed
+//   contextWrite  cache-write input            context written into cache
+//   freshInput    input excluding cache reads  context never cached at all
+//   output        output                       what the model generated
 //
 // so the largest is a fact about where the tokens went, not a judgement. Two
 // facts travel with it and are what make the sentence actionable rather than

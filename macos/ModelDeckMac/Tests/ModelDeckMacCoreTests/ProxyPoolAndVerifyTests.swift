@@ -348,7 +348,7 @@ struct ProxyPoolModelTests {
 
     @Test func aRefusedRoutingWriteRendersTheRefusal() async {
         let manager = ProxyManagerStub(routing: .failure(DaemonClientError.daemonError(
-            message: "a renewal is in flight for this account", status: 409
+            message: "a renewal is in flight for this subscription", status: 409
         )))
         let model = ProxyPoolModel(manager: manager, stateProvider: StateStub())
         let a = account(proxyPool: "member", proxyRouted: false)
@@ -356,7 +356,7 @@ struct ProxyPoolModelTests {
         await model.setRouting(account: a, enabled: true)
 
         #expect(model.presentation(for: a)?.display
-            == .error("a renewal is in flight for this account"))
+            == .error("a renewal is in flight for this subscription"))
         // And the armed action is NOT re-offered over an unread refusal.
         #expect(model.presentation(for: a)?.display != .action(.route))
     }
@@ -512,7 +512,7 @@ struct IdentityVerifyCopyTests {
         // Adversarial review MINOR-e: the roster's identity notice exists
         // only for the provider's ACTIVE account, so the line never points
         // at it — it names the identities itself.
-        #expect(mismatch == "The provider is signed in as other@example.test, not this account's saved identity.")
+        #expect(mismatch == "The provider is signed in as other@example.test, not this subscription's saved identity.")
         #expect(IdentityVerify.failureText(
             for: IdentityVerification(outcome: "mismatch", reported: "other@example.test"),
             expected: "placeholder@example.test"
@@ -661,13 +661,13 @@ struct IdentityVerifyModelTests {
     @Test func aBusyAccountIsRefusedVerbatim() async {
         let model = IdentityVerifyModel(
             verifier: VerifyStub(result: .failure(DaemonClientError.daemonError(
-                message: "a renewal is in flight for this account", status: 409
+                message: "a renewal is in flight for this subscription", status: 409
             ))),
             stateProvider: StateStub()
         )
         await model.verify(account: seeded)
         #expect(model.presentation(for: seeded)?.display
-            == .failure("a renewal is in flight for this account"))
+            == .failure("a renewal is in flight for this subscription"))
     }
 }
 

@@ -139,7 +139,7 @@ function seed(store) {
     },
     [{
       turnIndex: 0, turnId: 'turn-0', model: 'gpt-placeholder-sol', reasoningEffort: 'medium',
-      inputTokens: 300, cachedInputTokens: 700, cacheWriteInputTokens: 0,
+      inputTokens: 1000, cachedInputTokens: 700, cacheWriteInputTokens: 0,
       outputTokens: 150, reasoningOutputTokens: 90, totalTokens: 1150,
       timestamp: '2026-08-01T13:10:00.000Z',
     }],
@@ -273,6 +273,67 @@ test('burn is grouped by project across both providers, with git branch as detai
   assert.equal(claudeSide.accountLabel, 'Placeholder Claude One');
   assert.equal(codexSide.accountId, null);
   assert.equal(codexSide.accountLabel, null);
+});
+
+test('TRIPWIRE tracked-project-path-rollup — nested tracked paths aggregate into the outermost ancestor without prefix collisions', (t) => {
+  const { store, root } = fixture(t);
+  const workspace = path.join(root, 'tracked');
+  const rawOuterPath = path.join(workspace, 'project');
+  const rawPaths = [
+    rawOuterPath,
+    path.join(rawOuterPath, 'packages'),
+    path.join(rawOuterPath, 'packages', 'app'),
+    path.join(workspace, 'sibling'),
+    path.join(workspace, 'project-other'),
+  ];
+  for (const projectPath of rawPaths) {
+    fs.mkdirSync(projectPath, { recursive: true });
+  }
+  const [outerPath, middlePath, nestedPath, siblingPath, nearMissPath] = rawPaths
+    .map((projectPath) => store.saveProject({ path: projectPath }).path);
+
+  const sessions = [
+    ['outer', outerPath, 100],
+    ['middle', middlePath, 200],
+    ['nested', nestedPath, 300],
+    ['sibling', siblingPath, 400],
+    ['near-miss', nearMissPath, 500],
+  ];
+  store.ingestTranscriptBatch({
+    sessions: sessions.map(([name, cwd], index) => ({
+      sessionId: `sess-${name}`,
+      profileSlug: 'profile-one',
+      machine: 'placeholder-machine',
+      cwd,
+      gitBranch: 'main',
+      firstAt: `2026-08-01T10:0${index}:00.000Z`,
+      lastAt: `2026-08-01T10:1${index}:00.000Z`,
+    })),
+    requests: sessions.map(([name, , tokens], index) => transcriptRequest({
+      key: `request-${name}`,
+      sessionId: `sess-${name}`,
+      observedAt: `2026-08-01T10:0${index}:30.000Z`,
+      input: tokens,
+    })),
+  });
+
+  const burn = store.projectBurn({ ...RANGE, bucket: 'hour' });
+  const projects = keyed(burn);
+  assert.deepEqual([...projects.keys()].sort(), [outerPath, siblingPath, nearMissPath].sort());
+  assert.equal(projects.get(outerPath).totalTokens, 100 + 200 + 300);
+  assert.equal(projects.get(siblingPath).totalTokens, 400);
+  assert.equal(projects.get(nearMissPath).totalTokens, 500);
+  assert.deepEqual(
+    [...new Set(burn.series.map((point) => point.key))].sort(),
+    [outerPath, siblingPath, nearMissPath].sort(),
+  );
+
+  const drill = store.projectBurn({ ...RANGE, project: outerPath });
+  assert.equal(drill.projects[0].totalTokens, 100 + 200 + 300);
+  assert.deepEqual(
+    drill.sessions.sessions.map((session) => session.cwd).sort(),
+    [outerPath, middlePath, nestedPath].sort(),
+  );
 });
 
 test('an exact worktree cwd folds into its parent project and keeps the worktree as detail', (t) => {

@@ -11,8 +11,12 @@ struct UserNotificationCenterPoster: UserNotificationPosting {
     func post(_ alert: UsageAlert) async {
         await deliverBanner(
             // One identifier per level: a newer banner for the same level
-            // replaces the old one instead of stacking.
-            identifier: "modeldeck.usage.level-\(alert.level.rawValue)",
+            // replaces the old one instead of stacking. An alert that carries
+            // its own identity key (issue #377's model drops — several can be
+            // live at once, all .critical) coalesces on that instead, so it
+            // neither replaces nor is replaced by a usage banner.
+            identifier: alert.identityKey.map { "modeldeck.\($0)" }
+                ?? "modeldeck.usage.level-\(alert.level.rawValue)",
             title: alert.title,
             body: alert.body,
             sound: alert.level == .critical ? .default : nil

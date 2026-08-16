@@ -251,7 +251,7 @@ struct MenuBarIconStateTests {
     }
 }
 
-@Suite("Pinned menu-bar account (account percentage picker)")
+@Suite("Pinned menu-bar subscription (subscription percentage picker)")
 struct PinnedMenuBarAccountTests {
     private let accounts = [
         DeckAccount(id: "acct-a", provider: "claude", label: "Deck A"),

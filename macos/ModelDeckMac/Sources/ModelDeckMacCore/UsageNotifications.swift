@@ -31,11 +31,19 @@ public struct UsageAlert: Equatable, Sendable {
     public var level: UsageAlertLevel
     public var title: String
     public var body: String
+    /// Notification-coalescing key (CodeRabbit, PR #472). The poster derived
+    /// its identifier from the LEVEL alone, which is right for usage alerts —
+    /// one banner per level, a newer one replacing the stale one — but wrong
+    /// for any alert class where two can be live at once. Nil preserves
+    /// exactly that historical behaviour; a non-nil key gives the alert its
+    /// own coalescing space.
+    public var identityKey: String?
 
-    public init(level: UsageAlertLevel, title: String, body: String) {
+    public init(level: UsageAlertLevel, title: String, body: String, identityKey: String? = nil) {
         self.level = level
         self.title = title
         self.body = body
+        self.identityKey = identityKey
     }
 }
 
@@ -76,12 +84,101 @@ public enum UsageAlertPlanner {
 
     static func accountLabel(for accountId: String, in state: DeckState?) -> String {
         guard let account = state?.accounts.first(where: { $0.id == accountId }) else {
-            return "An account"
+            return "A subscription"
         }
         if let provider = DeckProvider.from(account.provider) {
             return "\(account.label) (\(provider.displayName))"
         }
         return account.label
+    }
+}
+
+// Issue #377 — a mid-session model drop is loud, not just visible.
+//
+// A deck banner only exists while the popover is open, and the whole point of
+// this issue is that the drop went UNNOTICED for the rest of a session. So the
+// same macOS banner path the usage alerts use posts once per drop, at the
+// moment it lands, and once more when the model becomes available again.
+// Reuses the #7 poster seam untouched: no second notification stack.
+
+/// Pure transition logic over successive `/api/state.modelDrop` reads.
+/// Testable without UserNotifications.
+public enum ModelDropAlertPlanner {
+    /// What the coordinator has already announced about one session.
+    public enum Announced: Equatable, Sendable {
+        case dropped
+        case available
+    }
+
+    /// The banner due for one drop given what was already announced about it,
+    /// or nil when there is nothing new to say. Deliberately at most two
+    /// banners per drop — the deck header carries the standing state.
+    ///
+    /// Each drop carries its own identity key (CodeRabbit, PR #472): two
+    /// sessions dropping in the same pass are both .critical, so keying on
+    /// level alone lost one of them, and a drop banner and a usage banner
+    /// clobbered each other. Keyed by the drop's id, a session's later
+    /// available-again banner replaces its OWN drop banner and nothing else.
+    public static func alert(drop: ModelDropAlert, announced: Announced?) -> UsageAlert? {
+        let identityKey = "modeldrop.\(drop.id)"
+        switch (announced, drop.available) {
+        case (nil, _):
+            return UsageAlert(
+                level: .critical,
+                title: "Model dropped: \(drop.fromName) → \(drop.toName)",
+                body: "\(drop.explanation) \(drop.remedy)",
+                identityKey: identityKey
+            )
+        case (.dropped, true):
+            return UsageAlert(
+                level: .warning,
+                title: "\(drop.fromName) is available again",
+                body: drop.remedy,
+                identityKey: identityKey
+            )
+        default:
+            return nil
+        }
+    }
+
+    public static func announced(for drop: ModelDropAlert) -> Announced {
+        drop.available ? .available : .dropped
+    }
+}
+
+/// Posts a banner the first time a session's drop is seen, and again when the
+/// dropped model comes back. Keyed by the alert's identity, so a drop that
+/// clears and later recurs announces again — that is a new event.
+@MainActor
+public final class ModelDropNotificationCoordinator: ObservableObject {
+    @Published public private(set) var announced: [String: ModelDropAlertPlanner.Announced] = [:]
+
+    private let poster: any UserNotificationPosting
+
+    public init(poster: any UserNotificationPosting) {
+        self.poster = poster
+    }
+
+    /// Feed every fresh daemon state through here — the same hook the usage
+    /// notifications use. A state with no `modelDrop` block (older daemon)
+    /// leaves the memory untouched rather than forgetting live drops.
+    public func evaluate(state: DeckState?) async {
+        guard let drops = state?.modelDrop?.drops else { return }
+        var pending: [UsageAlert] = []
+        var next: [String: ModelDropAlertPlanner.Announced] = [:]
+        for drop in drops {
+            let previous = announced[drop.id]
+            if let alert = ModelDropAlertPlanner.alert(drop: drop, announced: previous) {
+                pending.append(alert)
+            }
+            next[drop.id] = ModelDropAlertPlanner.announced(for: drop)
+        }
+        // Drops absent from this state have cleared; drop their memory so a
+        // later recurrence is announced as the new event it is.
+        announced = next
+        for alert in pending {
+            await poster.post(alert)
+        }
     }
 }
 

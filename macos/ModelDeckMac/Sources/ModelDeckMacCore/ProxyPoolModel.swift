@@ -92,7 +92,7 @@ public enum ProxyPool {
     /// browser sign-in explicitly — the surprising step is the disclosure.
     public static func joinConfirmation(label: String) -> String {
         "A browser sign-in for \(label) will open so the proxy can add this "
-            + "account to its pool. Nothing changes until that sign-in completes."
+            + "subscription to its pool. Nothing changes until that sign-in completes."
     }
 
     public static func routeConfirmation(label: String) -> String {
@@ -102,7 +102,7 @@ public enum ProxyPool {
 
     public static func unrouteConfirmation(label: String) -> String {
         "New \(label) sessions will stop going through the local proxy and use "
-            + "the account directly again. Running sessions are never touched."
+            + "the subscription directly again. Running sessions are never touched."
     }
 
     // MARK: - Progress + outcome copy
@@ -119,7 +119,7 @@ public enum ProxyPool {
         "Stop waiting here. A sign-in you finish in the browser still lands on its own."
 
     public static let joinWaitStoppedText =
-        "Stopped waiting. If you finished the sign-in, the account joins the pool on its own."
+        "Stopped waiting. If you finished the sign-in, the subscription joins the pool on its own."
 
     /// Adversarial review M7: the mandatory post-mutation re-read failed, so
     /// the row may keep rendering pre-mutation state. Said out loud on the

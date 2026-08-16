@@ -26,7 +26,11 @@ function initRepository(root) {
   git(root, 'config', 'commit.gpgsign', 'false');
 }
 
-function fixture(t, { plantedHit = false } = {}) {
+function fixture(t, {
+  plantedHit = false,
+  omitLaneTestStripEntry = false,
+  checkerFixtureData = false,
+} = {}) {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-sync-mirror-'));
   t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
   const source = path.join(temporary, 'source');
@@ -34,6 +38,13 @@ function fixture(t, { plantedHit = false } = {}) {
   fs.mkdirSync(path.join(source, 'scripts'), { recursive: true });
   fs.copyFileSync(syncScript, path.join(source, 'scripts', 'sync-mirror.sh'));
   fs.chmodSync(path.join(source, 'scripts', 'sync-mirror.sh'), 0o755);
+  if (omitLaneTestStripEntry) {
+    const copiedScript = path.join(source, 'scripts', 'sync-mirror.sh');
+    const contents = fs.readFileSync(copiedScript, 'utf8');
+    const stripEntry = '  "test/lane-codex-args.test.mjs"\n';
+    assert.ok(contents.includes(stripEntry));
+    fs.writeFileSync(copiedScript, contents.replace(stripEntry, ''));
+  }
 
   write(source, 'public/readme.md', 'safe mirror content\n');
   write(source, '.claude/settings.json');
@@ -43,6 +54,20 @@ function fixture(t, { plantedHit = false } = {}) {
   write(source, 'docs/incidents/example.md');
   write(source, 'scripts/lane-codex.sh');
   write(source, 'scripts/lane-watch.mjs');
+  const laneScriptReference = ['..', 'scripts', 'lane-codex.sh'].join('/');
+  const laneTestSource = `const sourceScript = new URL('${laneScriptReference}', import.meta.url);\n`;
+  write(
+    source,
+    'test/lane-codex-args.test.mjs',
+    laneTestSource,
+  );
+  if (checkerFixtureData) {
+    write(
+      source,
+      'test/sync-mirror.test.mjs',
+      `write(source, 'test/lane-codex-args.test.mjs', ${JSON.stringify(laneTestSource)});\n`,
+    );
+  }
   write(source, 'design/mac-app-roadmap.md');
   write(source, 'scripts/private-scrub-patterns', '^FORBIDDEN_[0-9]+$\n');
   if (plantedHit) write(source, 'public/hit.txt', 'FORBIDDEN_123\n');
@@ -90,6 +115,7 @@ test('strip list is absent from the committed mirror staging tree', (t) => {
     'docs/incidents',
     'scripts/lane-codex.sh',
     'scripts/lane-watch.mjs',
+    'test/lane-codex-args.test.mjs',
     'design/mac-app-roadmap.md',
     'scripts/private-scrub-patterns',
   ];
@@ -116,6 +142,23 @@ test('scrub gate passes a clean staged snapshot', (t) => {
   const result = runSync(data, '--check-only');
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /scrub gate passed/);
+});
+
+test('tripwire ignores stripped paths carried only as fixture data', (t) => {
+  const data = fixture(t, { checkerFixtureData: true });
+  const result = runSync(data, '--check-only');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /check-only complete/);
+});
+
+test('stripped-test-subjects tripwire rejects an orphaned test', (t) => {
+  const data = fixture(t, { omitLaneTestStripEntry: true });
+  const result = runSync(data, '--check-only');
+  assert.notEqual(result.status, 0);
+  assert.match(
+    result.stderr,
+    /surviving test test\/lane-codex-args\.test\.mjs references stripped path scripts\/lane-codex\.sh/,
+  );
 });
 
 test('--check-only does not touch or create the mirror clone', (t) => {

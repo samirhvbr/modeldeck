@@ -32,6 +32,11 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
 
     private let model: DashboardWindowModel
     private let presenter = DashboardWindowPresenter()
+    /// Issue #444: while this window is open the app runs `.regular` — Dock
+    /// icon and the standard app menu, like any app with a full-size window
+    /// — and drops back to the menu-bar-agent `.accessory` when it closes.
+    /// The decision is Core's (tested both directions); this only applies it.
+    private var activationPolicy = AppActivationPolicyControl()
     private var cancellables: Set<AnyCancellable> = []
     /// Issue #424 (#402(d)): the daemon's own session token, fetched the same
     /// way every other client fetches it (`GET /api/session`). Nil when the
@@ -82,12 +87,29 @@ final class DashboardWindowController: NSObject, NSWindowDelegate {
         window.contentMinSize = NSSize(width: 720, height: 480)
         window.setFrameAutosaveName(Self.frameAutosaveName)
         window.delegate = self
+        // Issue #444: flip BEFORE the presenter fronts the window, so the
+        // activation that follows lands with the app already regular and the
+        // app menu takes the top-left slot on the first click.
+        apply(activationPolicy.windowOpened(ObjectIdentifier(window)))
         return window
     }
 
     func windowWillClose(_ notification: Notification) {
-        (notification.object as? NSWindow)?.delegate = nil
+        guard let window = notification.object as? NSWindow else { return }
+        window.delegate = nil
         presenter.windowDidClose()
+        apply(activationPolicy.windowClosed(ObjectIdentifier(window)))
+    }
+
+    /// Applies a policy change, and only a change — `nil` means the app is
+    /// already where it should be (re-fronting the one window), and
+    /// re-issuing `setActivationPolicy` would churn activation for nothing.
+    private func apply(_ policy: AppActivationPolicy?) {
+        switch policy {
+        case .regular: NSApp.setActivationPolicy(.regular)
+        case .accessory: NSApp.setActivationPolicy(.accessory)
+        case nil: break
+        }
     }
 }
 

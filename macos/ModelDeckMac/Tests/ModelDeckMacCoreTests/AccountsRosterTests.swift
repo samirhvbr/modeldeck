@@ -6,7 +6,7 @@ import Testing
 // provider banner. All placeholder identities (user@example.com) — never
 // real account data.
 
-@Suite("Accounts roster sections (Direction A)")
+@Suite("Subscriptions roster sections (Direction A)")
 struct AccountsRosterSectionTests {
     private func account(
         id: String,
@@ -41,7 +41,7 @@ struct AccountsRosterSectionTests {
         #expect(sections.map(\.provider) == [.claude, .codex])
         #expect(sections[0].accounts.map(\.id) == ["a1", "a2"])
         #expect(sections[1].accounts.map(\.id) == ["c1", "c2"])
-        #expect(sections[0].countText == "2 accounts")
+        #expect(sections[0].countText == "2 subscriptions")
     }
 
     @Test func providerWithNoAccountsYieldsNoSection() {
@@ -49,7 +49,7 @@ struct AccountsRosterSectionTests {
         let sections = AccountsRoster.sections(state: state)
         #expect(sections.count == 1)
         #expect(sections[0].provider == .claude)
-        #expect(sections[0].countText == "1 account")
+        #expect(sections[0].countText == "1 subscription")
     }
 
     @Test func unknownProviderAccountsAreDropped() {
@@ -123,7 +123,7 @@ struct AccountsRosterSectionTests {
         ])
         let banner = AccountsRoster.sections(state: s)[0].banner
         #expect(banner != nil)
-        #expect(banner?.message.contains("Pick an account below") == true)
+        #expect(banner?.message.contains("Pick one below to activate it") == true)
         #expect(banner?.message.contains("Complete Activation") != true)
         #expect(banner?.retryRunsActivation == false)
         #expect(banner?.affectedAccountID == nil)
@@ -282,7 +282,7 @@ struct AccountsRosterSectionTests {
             account(id: "a1", label: "Work"),
         ])
         let banner = AccountsRoster.sections(state: s)[0].banner
-        #expect(banner?.message.contains("pick an account below") == true)
+        #expect(banner?.message.contains("pick a subscription below") == true)
         #expect(banner?.offersRetry == false)
         #expect(banner?.blockedPath == "~/.claude")
     }

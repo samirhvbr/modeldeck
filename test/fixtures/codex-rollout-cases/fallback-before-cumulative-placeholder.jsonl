@@ -1,0 +1,10 @@
+{"timestamp":"2026-08-09T15:00:00.000Z","type":"session_meta","payload":{"id":"55555555-5555-4555-8555-555555555555","timestamp":"2026-08-09T15:00:00.000Z","cwd":"/placeholder/projects/fallback-before-cumulative"}}
+{"timestamp":"2026-08-09T15:00:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"fallback-turn-1","started_at":"2026-08-09T15:00:01.000Z"}}
+{"timestamp":"2026-08-09T15:00:01.100Z","type":"turn_context","payload":{"turn_id":"fallback-turn-1","model":"gpt-placeholder","effort":"high"}}
+{"timestamp":"2026-08-09T15:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":8,"cached_input_tokens":3,"cache_write_input_tokens":1,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":10}}}}
+{"timestamp":"2026-08-09T15:00:03.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":4,"cached_input_tokens":2,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":5}}}}
+{"timestamp":"2026-08-09T15:00:04.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"fallback-turn-1","started_at":"2026-08-09T15:00:01.000Z","completed_at":"2026-08-09T15:00:04.000Z"}}
+{"timestamp":"2026-08-09T15:01:01.000Z","type":"event_msg","payload":{"type":"task_started","turn_id":"fallback-turn-2","started_at":"2026-08-09T15:01:01.000Z"}}
+{"timestamp":"2026-08-09T15:01:01.100Z","type":"turn_context","payload":{"turn_id":"fallback-turn-2","model":"gpt-placeholder","effort":"high"}}
+{"timestamp":"2026-08-09T15:01:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":16,"cached_input_tokens":6,"cache_write_input_tokens":1,"output_tokens":4,"reasoning_output_tokens":2,"total_tokens":20}}}}
+{"timestamp":"2026-08-09T15:01:03.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"fallback-turn-2","started_at":"2026-08-09T15:01:01.000Z","completed_at":"2026-08-09T15:01:03.000Z"}}
