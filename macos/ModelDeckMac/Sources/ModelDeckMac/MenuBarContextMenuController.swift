@@ -20,6 +20,14 @@ final class MenuBarContextMenuController: NSObject {
     private let installModel: AppUpdateInstallModel
     private var monitor: Any?
 
+    /// Issue #482: the stored `menuBarAccountId` feeding the flip item, and
+    /// the write path back through the daemon-backed settings sync — the
+    /// same setting the Settings picker and the cards' pin menu write. Both
+    /// set after construction (the settings sync outlives this controller),
+    /// and a nil either way simply renders no flip item.
+    var menuBarSetting: (() -> String?)?
+    var onSetMenuBarSetting: ((String) -> Void)?
+
     init(appUpdateModel: AppUpdateModel, installModel: AppUpdateInstallModel) {
         self.appUpdateModel = appUpdateModel
         self.installModel = installModel
@@ -61,7 +69,11 @@ final class MenuBarContextMenuController: NSObject {
         guard let view = event.window?.contentView else { return }
         let menu = NSMenu()
         menu.autoenablesItems = false
-        for item in MenuBarContextMenu.items(isCheckingForUpdates: appUpdateModel.isChecking) {
+        let items = MenuBarContextMenu.items(
+            isCheckingForUpdates: appUpdateModel.isChecking,
+            menuBarSetting: menuBarSetting?()
+        )
+        for item in items {
             if item.action == .quit, !menu.items.isEmpty {
                 menu.addItem(.separator())
             }
@@ -75,6 +87,16 @@ final class MenuBarContextMenuController: NSObject {
                 menuItem.action = #selector(checkForAppUpdates)
             case .quit:
                 menuItem.action = #selector(quit)
+            case .setMenuBarSetting(let value):
+                // Issue #482: the flip carries its target value on the
+                // menu item, so one selector serves any future variant.
+                menuItem.action = #selector(setMenuBarSetting(_:))
+                menuItem.representedObject = value
+                // A separator between the mode item and the app rows keeps
+                // the flip visually tied to the icon it changes.
+                menu.addItem(menuItem)
+                menu.addItem(.separator())
+                continue
             }
             menu.addItem(menuItem)
         }
@@ -108,5 +130,13 @@ final class MenuBarContextMenuController: NSObject {
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    /// Issue #482: writes the flipped total-format value through the same
+    /// daemon-backed setting as the Settings picker; the confirmed
+    /// document flows back through settings sync and the icon updates.
+    @objc private func setMenuBarSetting(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String else { return }
+        onSetMenuBarSetting?(value)
     }
 }

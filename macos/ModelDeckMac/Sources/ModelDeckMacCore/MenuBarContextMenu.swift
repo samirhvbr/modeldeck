@@ -9,6 +9,10 @@ public enum MenuBarContextMenu {
         case about
         case checkForAppUpdates
         case quit
+        /// Issue #482: flip a total display mode between its sum ("474%")
+        /// and share-of-capacity ("68%") formats — the payload is the full
+        /// stored `menuBarAccountId` value to write.
+        case setMenuBarSetting(String)
     }
 
     public struct Item: Equatable, Sendable {
@@ -30,8 +34,30 @@ public enum MenuBarContextMenu {
     /// digging into the gear menu; disabled while a check is already in
     /// flight) above Quit ModelDeck. Update wording matches the gear menu
     /// exactly — same shared AppUpdateModel behind both.
-    public static func items(isCheckingForUpdates: Bool) -> [Item] {
-        [
+    /// Issue #482: while a total display mode is active, the menu leads
+    /// with the flip Tim asked for — "flip back and forth between 474% and
+    /// 68%" — one click on the icon's right-click menu, no Settings trip.
+    /// `menuBarSetting` is the stored `menuBarAccountId`; nil or any
+    /// non-total value adds nothing.
+    public static func items(
+        isCheckingForUpdates: Bool,
+        menuBarSetting: String? = nil
+    ) -> [Item] {
+        var items: [Item] = []
+        if let stored = menuBarSetting,
+           let provider = MenuBarPinResolver.totalProvider(stored) {
+            let flipped: MenuBarPinResolver.TotalFormat =
+                MenuBarPinResolver.totalFormat(stored) == .share ? .sum : .share
+            items.append(Item(
+                title: flipped == .share
+                    ? "Show \(provider.displayName) Total as Share of Capacity"
+                    : "Show \(provider.displayName) Total as Sum",
+                action: .setMenuBarSetting(
+                    MenuBarPinResolver.totalValue(provider: provider, format: flipped)
+                )
+            ))
+        }
+        items.append(contentsOf: [
             Item(title: "About ModelDeck", action: .about),
             Item(
                 title: "Check for App Updates…",
@@ -39,7 +65,8 @@ public enum MenuBarContextMenu {
                 isEnabled: !isCheckingForUpdates
             ),
             Item(title: "Quit ModelDeck", action: .quit),
-        ]
+        ])
+        return items
     }
 
     /// Whether a mouse event on the status item should open the context

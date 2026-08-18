@@ -142,6 +142,12 @@ public final class MenuBarStatusModel: ObservableObject {
         case .loading, .plain, .health:
             return nil
         }
+        // Issue #482: total mode shows a pool sum — no single window feeds
+        // it, so there is no WorstRemaining source; the source line comes
+        // from `menuBarNumberSourceLine`'s totals branch instead.
+        if let pinnedAccountId, MenuBarPinResolver.isTotal(pinnedAccountId) {
+            return nil
+        }
         if let state = deckState, let resolved = resolvedPinnedAccountId {
             return pinnedWorstRemaining(state: state, resolved: resolved)
         }
@@ -168,6 +174,19 @@ public final class MenuBarStatusModel: ObservableObject {
     /// Studio · 5-hour limit" plus the mode's rule as hover copy); nil
     /// whenever the menu bar shows no percent.
     public var menuBarNumberSourceLine: MenuBarSourceResolver.NumberSourceLine? {
+        // Issue #482: a displayed pool total gets the pool-and-coverage
+        // line; hidden (quiet mode, no countable data) means no line, the
+        // same "a hidden number needs no explaining" rule as every mode.
+        if case .pinned = iconState,
+           let pinnedAccountId,
+           let totalProvider = MenuBarPinResolver.totalProvider(pinnedAccountId),
+           let display = providerTotal(for: totalProvider) {
+            return MenuBarSourceResolver.totalNumberSourceLine(
+                provider: totalProvider,
+                display: display,
+                format: MenuBarPinResolver.totalFormat(pinnedAccountId)
+            )
+        }
         guard let source = menuBarPercentSource else { return nil }
         return MenuBarSourceResolver.numberSourceLine(
             source: source,
@@ -175,6 +194,25 @@ public final class MenuBarStatusModel: ObservableObject {
             pinnedSetting: pinnedAccountId,
             resolvedPinnedAccountID: resolvedPinnedAccountId
         )
+    }
+
+    /// Issue #482: computes the provider pool totals the "total:" display
+    /// modes show — wired by the app to the SAME column construction the
+    /// popover header uses (#458: activation override, hide/show filter,
+    /// general-weekly focus, per-row staleness), so the menu bar and the
+    /// header can never disagree. Nil (tests, unwired hosts) disables
+    /// total modes: they render the plain glyph rather than fabricate a
+    /// number from a different pipeline.
+    public var providerTotalsSource: ((DeckState) -> [DeckProvider: DeckColumnUsageHeadline.Display])? {
+        didSet { recomputeIconState() }
+    }
+
+    /// The current #458 headline for a provider pool via
+    /// `providerTotalsSource`; nil while unwired, before the first state,
+    /// or when the pool has no countable subscription.
+    public func providerTotal(for provider: DeckProvider) -> DeckColumnUsageHeadline.Display? {
+        guard let state = deckState else { return nil }
+        return providerTotalsSource?(state)[provider]
     }
 
     /// True once any state has landed (refresh success or `apply`); gates
@@ -233,6 +271,32 @@ public final class MenuBarStatusModel: ObservableObject {
         }
         guard hasLoadedOnce else {
             iconState = .loading
+            return
+        }
+        // Issue #482: the provider pool total modes — the #458 column
+        // headline in the menu bar, as the raw sum ("474%") or the share
+        // of counted capacity ("68%"). Neutral pinned rendering by design:
+        // a pool total is not a severity signal. No countable data (empty
+        // pool, everything stale/hidden, unwired source) renders the plain
+        // glyph — a number is never fabricated. Quiet mode's 1–99
+        // threshold gates on the SHARE percent in both formats, since it
+        // cannot meaningfully gate a 474. Display-only like every mode
+        // here: `worstRemaining` and `onStateUpdate` are untouched, so
+        // notifications keep watching every account.
+        if let pinnedAccountId,
+           let totalProvider = MenuBarPinResolver.totalProvider(pinnedAccountId) {
+            guard let display = providerTotal(for: totalProvider) else {
+                iconState = .plain
+                return
+            }
+            guard MenuBarShowWhen.parse(showWhen).showsPercent(Double(display.sharePercent)) else {
+                iconState = .plain
+                return
+            }
+            let format = MenuBarPinResolver.totalFormat(pinnedAccountId)
+            iconState = .pinned(
+                percentRemaining: format == .share ? display.sharePercent : display.points
+            )
             return
         }
         // Pinned mode is client-side by design: the daemon's

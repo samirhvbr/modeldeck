@@ -1788,11 +1788,21 @@ struct GeneralSettingsPane: View {
                         .tag(MenuBarPinResolver.healthSentinel(for: .claude))
                     Text("Codex availability health")
                         .tag(MenuBarPinResolver.healthSentinel(for: .codex))
+                    // Issue #482 (Tim's request): the provider pool totals
+                    // — the deck column header's #458 aggregate ("474%
+                    // left") in the menu bar. Same free-string setting,
+                    // "total:…" sentinels, same downgrade contract as the
+                    // health sentinels. The "Total shown as" picker below
+                    // chooses sum vs share of capacity.
+                    Text("Claude total % left")
+                        .tag(MenuBarPinResolver.totalSentinel(for: .claude))
+                    Text("Codex total % left")
+                        .tag(MenuBarPinResolver.totalSentinel(for: .codex))
                     ForEach(menuBarAccountOptions, id: \.id) { option in
                         Text(option.title).tag(option.id)
                     }
                 }
-                .help("A pinned subscription shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. The Pinned window control below can show a specific window (like the Fable weekly) instead of the lowest. \"Active … subscription\" follows whichever subscription is currently active for that provider. \"Lowest across all subscriptions\" shows a percentage only when some subscription drops below the warning threshold. \"… availability health\" shows that provider's Availability Health verdict as a colored status dot beside the icon (green circle, yellow triangle, red octagon — the deck column chip's 7-day runway simulation) instead of a percentage. \"None — icon only\" never shows a percentage; notifications still watch every subscription.")
+                .help("A pinned subscription shows its lowest non-spend usage window in the menu bar continuously when one is available — normal color while healthy, gold at warning, red at critical; without a usable window the plain glyph is shown. The Pinned window control below can show a specific window (like the Fable weekly) instead of the lowest. \"Active … subscription\" follows whichever subscription is currently active for that provider. \"Lowest across all subscriptions\" shows a percentage only when some subscription drops below the warning threshold. \"… availability health\" shows that provider's Availability Health verdict as a colored status dot beside the icon (green circle, yellow triangle, red octagon — the deck column chip's 7-day runway simulation) instead of a percentage. \"… total % left\" shows that provider's pool total — the deck column header's summed % left, or its share of capacity via the Total shown as picker below. \"None — icon only\" never shows a percentage; notifications still watch every subscription.")
                 // Issue #292 (Tim's field report): pinning Click AI to
                 // watch the Fable weekly showed the 5-hour window instead —
                 // the pin always displayed the account's lowest window.
@@ -1800,6 +1810,20 @@ struct GeneralSettingsPane: View {
                 // window" is the unchanged default, and a chosen class the
                 // account doesn't report falls back to the lowest window
                 // (the popover source line says so).
+                // Issue #482: the total modes' format choice — Tim's "flip
+                // back and forth between 474% and 68%". Sum is the header's
+                // own number; share divides it by the counted
+                // subscriptions' combined capacity. Also flippable from the
+                // menu bar icon's right-click menu.
+                if let totalProvider = MenuBarPinResolver.totalProvider(
+                    settingsSync.settings.menuBarAccountId
+                ) {
+                    Picker("Total shown as", selection: totalFormatBinding(provider: totalProvider)) {
+                        Text("Sum — e.g. 474%").tag(MenuBarPinResolver.TotalFormat.sum)
+                        Text("Share of capacity — e.g. 68%").tag(MenuBarPinResolver.TotalFormat.share)
+                    }
+                    .help("\"Sum\" shows the same aggregate as the deck's column header — every counted subscription's % left added together, so 7 subscriptions can read 474%. \"Share of capacity\" divides that sum by the counted subscriptions' combined capacity (100% each): 474% of 700% shows as 68%. Right-clicking the menu bar icon flips between the two. Subscriptions that are hidden, stale, or without a current reading stay out of both numbers.")
+                }
                 if let pinnedBase = pinnedAccountBase {
                     // Only window classes the account actually reports are
                     // offered (CodeRabbit, this PR) — plus a ghost row for
@@ -2254,10 +2278,25 @@ struct GeneralSettingsPane: View {
         if !current.isEmpty && !current.hasPrefix("active:")
             && !MenuBarPinResolver.isNone(current)
             && !MenuBarPinResolver.isHealth(current)
+            && !MenuBarPinResolver.isTotal(current)
             && !options.contains(where: { $0.id == current }) {
             options.append((id: current, title: "Removed subscription"))
         }
         return options
+    }
+
+    /// Issue #482: the Total shown as selection — reads the stored
+    /// format suffix, writes the recomposed full value so the provider
+    /// and its format travel as one setting (the #292 pattern).
+    private func totalFormatBinding(provider: DeckProvider) -> Binding<MenuBarPinResolver.TotalFormat> {
+        binding(
+            get: { MenuBarPinResolver.totalFormat($0.menuBarAccountId) },
+            set: { model, format in
+                await model.setMenuBarAccount(
+                    id: MenuBarPinResolver.totalValue(provider: provider, format: format)
+                )
+            }
+        )
     }
 
     /// Issue #292: the pinned account id when the current selection is a
@@ -2268,7 +2307,8 @@ struct GeneralSettingsPane: View {
         guard !base.isEmpty,
               !base.hasPrefix("active:"),
               !MenuBarPinResolver.isNone(base),
-              !MenuBarPinResolver.isHealth(base)
+              !MenuBarPinResolver.isHealth(base),
+              !MenuBarPinResolver.isTotal(base)
         else { return nil }
         return base
     }
@@ -2402,6 +2442,18 @@ struct GeneralSettingsPane: View {
             case .always, .belowPercent:
                 return "The menu bar shows \(provider.displayName)'s availability health as a colored status dot — green circle, yellow triangle, or red octagon from the 7-day runway simulation — instead of a percentage. Notifications still watch every subscription."
             }
+        }
+        // Issue #482: the total modes name their number's construction —
+        // a sum can read above 100%, and the quiet threshold gates on the
+        // share form in either format (a 1–99 gate can't judge a 474).
+        if let provider = MenuBarPinResolver.totalProvider(current) {
+            let base = MenuBarPinResolver.totalFormat(current) == .share
+                ? "The menu bar shows \(provider.displayName)'s pool total as a share of capacity — the summed % left divided by the counted subscriptions' combined capacity (100% each)."
+                : "The menu bar shows the total % left summed across \(provider.displayName) subscriptions — the deck column header's number, so it can read above 100%."
+            if let threshold = quietPercentThreshold {
+                return base + " It appears only while the share of capacity is below \(threshold)% — otherwise just the icon. Display only: notifications still watch every subscription."
+            }
+            return base + " Notifications still watch every subscription."
         }
         if let threshold = quietPercentThreshold {
             if current.isEmpty {

@@ -130,6 +130,18 @@ Bound 2026-08-14 (full-binding re-run).
   CodeRabbit triage, per the orchestrate fork
   (`.claude/skills/orchestrate/SKILL.md`) and the routing policy's launch
   discipline.
+- **Standing merge authorization** (Tim, 2026-08-16, recorded from chat —
+  "my explicit permission for the agent's ability to merge when appropriate
+  on this session and all sessions going further, unless I change the rule
+  explicitly"): agent sessions may merge PRs without a fresh per-session
+  ask. This authorizes the merge CLICK, not a lower bar — "when
+  appropriate" keeps every existing gate: the repo's verify commands green
+  on the exact head being merged, review findings triaged and
+  dispositioned (a zero-finding incremental CodeRabbit pass counts as the
+  completed review), and the never-compromise rules — auth-touching
+  changes still get the security lens and a full review first. Revoked
+  only by Tim's explicit say-so; supersedes any older handoff note that
+  merge authorization was session-only.
 
 ## Glossary & non-negotiables (dispositions)
 

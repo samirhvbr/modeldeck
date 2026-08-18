@@ -44,6 +44,17 @@ public enum DeckColumnUsageHeadline {
         /// left would falsify).
         public var tooltip: String
         public var accessibilityLabel: String
+
+        /// Issue #482: the sum as a share of the counted pool's capacity —
+        /// points ÷ (countedAccounts × 100), as a whole percentage. 474
+        /// points across 7 counted subscriptions → 68. Equivalently the
+        /// mean % left across the counted subscriptions; the denominator is
+        /// the COUNTED accounts, matching the sum's own coverage, so a
+        /// partial pool never fabricates capacity it didn't measure.
+        public var sharePercent: Int {
+            guard countedAccounts > 0 else { return 0 }
+            return Int((Double(points) / Double(countedAccounts)).rounded())
+        }
     }
 
     /// The column header's whole aggregate-usage decision.

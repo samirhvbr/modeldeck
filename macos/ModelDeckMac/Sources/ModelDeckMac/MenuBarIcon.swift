@@ -56,6 +56,18 @@ struct MenuBarIconView: View {
         case .plain:
             return "ModelDeck"
         case .pinned(let percent):
+            // Issue #482: a pool total speaks the pool and format, not an
+            // account — "474 percent left in total across Claude
+            // subscriptions" / "68 percent of Claude capacity left".
+            if let stored = statusModel.pinnedAccountId,
+               let provider = MenuBarPinResolver.totalProvider(stored) {
+                switch MenuBarPinResolver.totalFormat(stored) {
+                case .sum:
+                    return "ModelDeck: \(percent) percent left in total across \(provider.displayName) subscriptions"
+                case .share:
+                    return "ModelDeck: \(percent) percent of \(provider.displayName) capacity left"
+                }
+            }
             if let source = percentSourceText {
                 return "ModelDeck: \(percent) percent left on \(source)"
             }

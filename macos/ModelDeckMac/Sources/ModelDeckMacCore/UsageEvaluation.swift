@@ -168,6 +168,63 @@ public enum MenuBarPinResolver {
         stored == noneSentinel
     }
 
+    // MARK: - Provider pool totals (issue #482)
+
+    /// Issue #482 (Tim's request): the menu bar can show a provider POOL's
+    /// total % left — the #458 column headline ("474% left") — instead of
+    /// one account's window. Same free-string setting, "total:…" sentinels,
+    /// same downgrade contract as #229/#235: an older build reads the whole
+    /// value as an unresolvable account pin and falls back to
+    /// lowest-across — degraded, never a crash.
+    public static func totalSentinel(for provider: DeckProvider) -> String {
+        "total:\(provider.rawValue)"
+    }
+
+    /// The provider a stored total sentinel names, or nil when the value
+    /// isn't a recognizable total sentinel (including "total:" values for
+    /// providers this build doesn't know — those fall back to the
+    /// unresolvable-pin behavior, like any unknown sentinel).
+    public static func totalProvider(_ stored: String) -> DeckProvider? {
+        let base = pinBase(stored)
+        guard base.hasPrefix("total:") else { return nil }
+        return DeckProvider(rawValue: String(base.dropFirst("total:".count)))
+    }
+
+    /// Whether a stored value selects the issue #482 total display mode.
+    public static func isTotal(_ stored: String) -> Bool {
+        totalProvider(stored) != nil
+    }
+
+    /// Issue #482: how a total is displayed — the raw sum ("474%", the
+    /// #458 header number) or the pool's share of capacity ("68%": sum ÷
+    /// counted subscriptions × 100, i.e. the mean % left across them).
+    /// Tim's ruling: both are honest; he flips between them.
+    public enum TotalFormat: String, CaseIterable, Sendable {
+        case sum
+        case share
+    }
+
+    /// The suffix separator carrying a total sentinel's display format.
+    private static let formatSeparator = "|fmt:"
+
+    /// The stored value for a total mode with a display format. The sum
+    /// default stores the bare sentinel — the same no-suffix-for-default
+    /// discipline as #292's window choice.
+    public static func totalValue(provider: DeckProvider, format: TotalFormat) -> String {
+        guard format != .sum else { return totalSentinel(for: provider) }
+        return totalSentinel(for: provider) + formatSeparator + format.rawValue
+    }
+
+    /// The total sentinel's display format; `.sum` for the bare grammar
+    /// and any unrecognized future key — degrading to the header's own
+    /// number rather than failing the mode.
+    public static func totalFormat(_ stored: String) -> TotalFormat {
+        guard let range = stored.range(of: formatSeparator),
+              let format = TotalFormat(rawValue: String(stored[range.upperBound...]))
+        else { return .sum }
+        return format
+    }
+
     // MARK: - Pinned window choice (issue #292)
 
     /// Issue #292 (Tim's field report): a pinned account always displayed
@@ -225,11 +282,14 @@ public enum MenuBarPinResolver {
         return accountId + windowSeparator + window.rawValue
     }
 
-    /// The stored value with any window-choice suffix removed — what
-    /// account resolution and every base-equality check runs on.
+    /// The stored value with any suffix removed ("|win:" window choice,
+    /// "|fmt:" total format) — what account resolution and every
+    /// base-equality check runs on. Account ids are store-generated and
+    /// never contain "|", so splitting on the first pipe is safe for the
+    /// plain grammar and every sentinel.
     public static func pinBase(_ stored: String) -> String {
-        guard let range = stored.range(of: windowSeparator) else { return stored }
-        return String(stored[..<range.lowerBound])
+        guard let index = stored.firstIndex(of: "|") else { return stored }
+        return String(stored[..<index])
     }
 
     /// The pin's window choice; nil for the plain grammar, every
@@ -254,6 +314,9 @@ public enum MenuBarPinResolver {
         // display-mode sentinel, never an account pin — the prefix guard
         // covers unknown future providers too.
         guard !stored.hasPrefix("health:") else { return nil }
+        // Issue #482: same for "total:" — a pool-total display mode, never
+        // an account pin.
+        guard !stored.hasPrefix("total:") else { return nil }
         if stored.hasPrefix("active:") {
             guard let provider = DeckProvider(rawValue: String(stored.dropFirst("active:".count))) else {
                 return nil
@@ -396,6 +459,14 @@ public enum MenuBarSourceResolver {
         if let pinnedSetting, MenuBarPinResolver.isHealth(pinnedSetting) {
             return nil
         }
+        // Issue #482: total mode shows a pool sum, not one account's
+        // window — no single account feeds the menu bar, so no card gets
+        // the checkmark. Recognized sentinels only, mirroring #235's
+        // forward-compatibility contract: an unknown "total:<future>"
+        // value falls through to the unresolvable-pin fallback.
+        if let pinnedSetting, MenuBarPinResolver.isTotal(pinnedSetting) {
+            return nil
+        }
         if let pinnedSetting, let state,
            let resolved = MenuBarPinResolver.resolve(pinnedSetting, in: state) {
             return resolved
@@ -527,6 +598,30 @@ public enum MenuBarSourceResolver {
                 + "Right-click its card to unpin."
         }
         return NumberSourceLine(text: text, tooltip: tooltip)
+    }
+
+    /// Issue #482: the source line for a provider pool total — no single
+    /// window feeds the number, so the line names the pool and its
+    /// coverage instead ("Menu bar 474% — Claude total · 7 subscriptions",
+    /// or "… · 5 of 7 subscriptions" when the sum is partial), and the
+    /// tooltip carries the #458 headline's own honesty copy plus the
+    /// active format's rule.
+    public static func totalNumberSourceLine(
+        provider: DeckProvider,
+        display: DeckColumnUsageHeadline.Display,
+        format: MenuBarPinResolver.TotalFormat
+    ) -> NumberSourceLine {
+        let percent = format == .share ? display.sharePercent : display.points
+        let pool = display.totalAccounts == 1
+            ? "1 subscription" : "\(display.totalAccounts) subscriptions"
+        let coverage = display.isComplete
+            ? pool : "\(display.countedAccounts) of \(pool)"
+        let text = "Menu bar \(percent)% — \(provider.displayName) total · \(coverage)"
+        let rule = format == .share
+            ? "Share of capacity: the pool's summed % left divided by the counted "
+                + "subscriptions' combined 100%-each capacity. "
+            : ""
+        return NumberSourceLine(text: text, tooltip: rule + display.tooltip)
     }
 }
 

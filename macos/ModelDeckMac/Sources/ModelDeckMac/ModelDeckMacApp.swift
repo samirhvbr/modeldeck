@@ -268,6 +268,31 @@ struct ModelDeckMacApp: App {
         deckModel.onGeneralWeeklyFocusChange = { [weak statusModel] focused in
             statusModel?.focusGeneralWeekly = focused
         }
+        // Issue #482: the menu bar's "total:" modes read the SAME column
+        // construction and per-row staleness seam as the popover header's
+        // #458 headline (activation override, hide/show filter,
+        // general-weekly focus), so the two numbers can never disagree.
+        statusModel.providerTotalsSource = { [weak statusModel, weak deckModel] state in
+            guard let statusModel, let deckModel else { return [:] }
+            var totals: [DeckProvider: DeckColumnUsageHeadline.Display] = [:]
+            for column in deckModel.columns(for: state) {
+                totals[column.provider] = DeckColumnUsageHeadline.display(
+                    for: column,
+                    isStale: { statusModel.cardStaleness(for: $0) != nil }
+                )
+            }
+            return totals
+        }
+        // Issue #482: the context menu's sum ↔ share flip writes through
+        // the same daemon-backed setting as the Settings picker.
+        contextMenuController.menuBarSetting = { [weak settingsSync] in
+            settingsSync?.settings.menuBarAccountId
+        }
+        contextMenuController.onSetMenuBarSetting = { [weak settingsSync] value in
+            Task { @MainActor [weak settingsSync] in
+                await settingsSync?.setMenuBarAccount(id: value)
+            }
+        }
         // A card's right-click pin goes through the same daemon-backed
         // setting as the Settings picker; the confirmed document then flows
         // back through onApply above (icon + mirror update together).
