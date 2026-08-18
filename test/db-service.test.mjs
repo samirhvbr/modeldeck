@@ -464,6 +464,23 @@ test('menuBarShowWhen accepts short strings and rejects everything else', () => 
   } finally { store.close(); }
 });
 
+// Issue #488 shared pool-total format: same free-string discipline — the app
+// owns the grammar ('' = nothing chosen, comma-joined '<provider>:<sum|share>'
+// entries), the store validates only string/length so old and new builds
+// round-trip each other's values.
+test('poolTotalFormat accepts short strings and rejects everything else', () => {
+  const store = new Store(':memory:');
+  try {
+    assert.equal(store.getSettings().poolTotalFormat, '');
+    assert.equal(store.saveSettings({ poolTotalFormat: 'claude:share' }).poolTotalFormat, 'claude:share');
+    assert.equal(store.saveSettings({ poolTotalFormat: 'claude:sum,codex:share' }).poolTotalFormat, 'claude:sum,codex:share');
+    assert.equal(store.saveSettings({ poolTotalFormat: '' }).poolTotalFormat, '');
+    assert.throws(() => store.saveSettings({ poolTotalFormat: 42 }), /poolTotalFormat/);
+    assert.throws(() => store.saveSettings({ poolTotalFormat: null }), /poolTotalFormat/);
+    assert.throws(() => store.saveSettings({ poolTotalFormat: 'x'.repeat(65) }), /poolTotalFormat/);
+  } finally { store.close(); }
+});
+
 // Issue #242 deck chip labels: same free-string discipline again — the app
 // owns the grammar ('' = dot only, 'show' = dot + verdict word), the store
 // validates only string/length so old and new builds round-trip each

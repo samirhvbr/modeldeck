@@ -335,10 +335,21 @@ To refresh the screenshots for a release:
 
 2. **Build and launch the app against it** (`build_app.sh` stamps the repo
    `VERSION` into the dev bundle so the popover footer shows the real
-   version):
+   version). **Strip the bundled daemon first**: if a stale `dist/daemon/`
+   exists at the repo root, `build_app.sh` stages it into the dev bundle,
+   and on 2026-08-17 that made the ad-hoc-signed demo app treat the live
+   registration as drift and re-register `ai.hermes.modeldeck` — stamping a
+   launch constraint from the DEV signature that made launchd SIGKILL the
+   production daemon ("Launch Constraint Violation", exit 78) until a manual
+   `launchctl bootout` (issue #486). The app now stands down on any
+   non-production signature, but the screenshot bundle should not carry a
+   daemon at all; re-sign after the removal so the bundle seal stays valid:
 
    ```sh
    macos/ModelDeckMac/Scripts/build_app.sh --release
+   rm -rf macos/ModelDeckMac/dist/ModelDeck.app/Contents/Resources/daemon \
+          macos/ModelDeckMac/dist/ModelDeck.app/Contents/Library/LaunchAgents
+   codesign --force --sign - macos/ModelDeckMac/dist/ModelDeck.app
    MODELDECK_PORT=4867 \
      macos/ModelDeckMac/dist/ModelDeck.app/Contents/MacOS/ModelDeckMac
    ```

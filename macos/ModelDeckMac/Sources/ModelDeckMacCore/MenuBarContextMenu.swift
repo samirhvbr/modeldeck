@@ -10,9 +10,11 @@ public enum MenuBarContextMenu {
         case checkForAppUpdates
         case quit
         /// Issue #482: flip a total display mode between its sum ("474%")
-        /// and share-of-capacity ("68%") formats — the payload is the full
-        /// stored `menuBarAccountId` value to write.
-        case setMenuBarSetting(String)
+        /// and share-of-capacity ("68%") formats. Issue #488: the payload
+        /// is the provider + target format — the write goes through the
+        /// SHARED `poolTotalFormat` setting (plus the pin's 1.0.2 suffix),
+        /// so the deck header flips with the menu bar.
+        case setTotalFormat(provider: DeckProvider, format: MenuBarPinResolver.TotalFormat)
     }
 
     public struct Item: Equatable, Sendable {
@@ -41,20 +43,24 @@ public enum MenuBarContextMenu {
     /// non-total value adds nothing.
     public static func items(
         isCheckingForUpdates: Bool,
-        menuBarSetting: String? = nil
+        menuBarSetting: String? = nil,
+        poolTotalFormat: String = ""
     ) -> [Item] {
         var items: [Item] = []
         if let stored = menuBarSetting,
            let provider = MenuBarPinResolver.totalProvider(stored) {
+            // Issue #488: the current format is the SHARED resolution (the
+            // pool key first, the pin's 1.0.2 suffix as fallback), so the
+            // flip's direction always matches what both surfaces render.
             let flipped: MenuBarPinResolver.TotalFormat =
-                MenuBarPinResolver.totalFormat(stored) == .share ? .sum : .share
+                MenuBarPinResolver.resolvedTotalFormat(
+                    provider: provider, poolFormats: poolTotalFormat, menuBarSetting: stored
+                ) == .share ? .sum : .share
             items.append(Item(
                 title: flipped == .share
                     ? "Show \(provider.displayName) Total as Share of Capacity"
                     : "Show \(provider.displayName) Total as Sum",
-                action: .setMenuBarSetting(
-                    MenuBarPinResolver.totalValue(provider: provider, format: flipped)
-                )
+                action: .setTotalFormat(provider: provider, format: flipped)
             ))
         }
         items.append(contentsOf: [

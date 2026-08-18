@@ -255,13 +255,14 @@ struct MenuBarTotalContextMenuTests {
         )
         let flip = try #require(items.first)
         #expect(flip.title == "Show Claude Total as Share of Capacity")
-        #expect(flip.action == .setMenuBarSetting("total:claude|fmt:share"))
-        // Flipping back writes the bare sum sentinel.
+        // Issue #488: the flip writes the SHARED pool-total format.
+        #expect(flip.action == .setTotalFormat(provider: .claude, format: .share))
+        // Flipping back targets the sum.
         let back = MenuBarContextMenu.items(
             isCheckingForUpdates: false, menuBarSetting: "total:claude|fmt:share"
         )
         #expect(back.first?.title == "Show Claude Total as Sum")
-        #expect(back.first?.action == .setMenuBarSetting("total:claude"))
+        #expect(back.first?.action == .setTotalFormat(provider: .claude, format: .sum))
     }
 
     @Test func nonTotalModesKeepTheFixedMenu() {

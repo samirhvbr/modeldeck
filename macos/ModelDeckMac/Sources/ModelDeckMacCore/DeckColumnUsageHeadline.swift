@@ -55,6 +55,26 @@ public enum DeckColumnUsageHeadline {
             guard countedAccounts > 0 else { return 0 }
             return Int((Double(points) / Double(countedAccounts)).rounded())
         }
+
+        /// Issue #488: the header rendered in the pool's chosen format —
+        /// same "% left" words in both, the tooltip carries the math.
+        public func text(_ format: MenuBarPinResolver.TotalFormat) -> String {
+            format == .share ? "\(sharePercent)% left" : text
+        }
+
+        /// Issue #488: the share form's hover copy — the sum tooltip's
+        /// honesty rules (counted denominator, lower-bound phrasing) with
+        /// the share arithmetic spelled out.
+        public var shareTooltip: String
+        public var shareAccessibilityLabel: String
+
+        public func tooltip(_ format: MenuBarPinResolver.TotalFormat) -> String {
+            format == .share ? shareTooltip : tooltip
+        }
+
+        public func accessibilityLabel(_ format: MenuBarPinResolver.TotalFormat) -> String {
+            format == .share ? shareAccessibilityLabel : accessibilityLabel
+        }
     }
 
     /// The column header's whole aggregate-usage decision.
@@ -114,6 +134,7 @@ public enum DeckColumnUsageHeadline {
         let text = "\(points)% left"
         let isComplete = counted == total
 
+        let share = counted > 0 ? Int((Double(points) / Double(counted)).rounded()) : 0
         return Display(
             text: text,
             points: points,
@@ -131,7 +152,20 @@ public enum DeckColumnUsageHeadline {
             ),
             accessibilityLabel: isComplete
                 ? "\(points) percent left across \(subscriptionsPhrase(total))"
-                : "\(points) percent left across \(counted) of \(subscriptionsPhrase(total))"
+                : "\(points) percent left across \(counted) of \(subscriptionsPhrase(total))",
+            shareTooltip: shareTooltip(
+                share: share,
+                points: points,
+                provider: column.title,
+                counted: counted,
+                total: total,
+                hidden: hidden,
+                stale: stale,
+                unknown: unknown
+            ),
+            shareAccessibilityLabel: isComplete
+                ? "\(share) percent of capacity left across \(subscriptionsPhrase(total))"
+                : "\(share) percent of capacity left across \(counted) of \(subscriptionsPhrase(total))"
         )
     }
 
@@ -159,6 +193,34 @@ public enum DeckColumnUsageHeadline {
         // support — the same honesty this whole type exists for.
         return "\(text) — the sum of \(counted) of this column's \(subscriptionsPhrase(total)).\(left)"
             + " The pool's real total is at least this. \(tiers)"
+    }
+
+    /// Issue #488: the share form's tooltip — the same coverage honesty as
+    /// the sum's, with the capacity arithmetic stated so "61% left" can
+    /// never read as one subscription's number.
+    private static func shareTooltip(
+        share: Int,
+        points: Int,
+        provider: String,
+        counted: Int,
+        total: Int,
+        hidden: Int,
+        stale: Int,
+        unknown: Int
+    ) -> String {
+        let math = "the summed % left (\(points)%) divided by the counted"
+            + " \(subscriptionsPhrase(counted))' combined capacity (\(counted * 100)%)."
+        let tiers = "Plan tiers aren't weighted — every subscription counts as 100% of capacity."
+        guard counted < total else {
+            return "\(share)% left — every \(provider) subscription's share of the pool's capacity: \(math) \(tiers)"
+        }
+        var reasons: [String] = []
+        if hidden > 0 { reasons.append("\(hidden) hidden") }
+        if stale > 0 { reasons.append("\(stale) with data too old to count") }
+        if unknown > 0 { reasons.append("\(unknown) with no current reading") }
+        let left = reasons.isEmpty ? "" : " Left out: \(reasons.joined(separator: ", "))."
+        return "\(share)% left — \(counted) of this column's \(subscriptionsPhrase(total))"
+            + " as a share of their capacity: \(math)\(left) \(tiers)"
     }
 
     private static func subscriptionsPhrase(_ count: Int) -> String {

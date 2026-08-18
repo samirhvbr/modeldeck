@@ -245,6 +245,11 @@ struct ModelDeckMacApp: App {
                 // display-only; notifications keep watching every account.
                 statusModel?.showWhen = settings.menuBarShowWhen
                 deckModel?.menuBarPinnedSetting = settings.menuBarAccountId
+                // Issue #488: the shared per-provider sum ↔ share choice —
+                // one confirmed value feeds the deck header and the menu
+                // bar's total modes, so the two can never disagree.
+                statusModel?.poolTotalFormat = settings.poolTotalFormat
+                deckModel?.poolTotalFormatSetting = settings.poolTotalFormat
                 // Issue #242: deck chip verdict labels (Accessibility
                 // toggle) — display-only; unknown stored values read as
                 // the dot-only default.
@@ -283,14 +288,24 @@ struct ModelDeckMacApp: App {
             }
             return totals
         }
-        // Issue #482: the context menu's sum ↔ share flip writes through
-        // the same daemon-backed setting as the Settings picker.
+        // Issue #482/#488: the context menu's sum ↔ share flip writes the
+        // SHARED pool-total format — the same daemon-backed write as the
+        // Settings picker and the deck header's click.
         contextMenuController.menuBarSetting = { [weak settingsSync] in
             settingsSync?.settings.menuBarAccountId
         }
-        contextMenuController.onSetMenuBarSetting = { [weak settingsSync] value in
+        contextMenuController.poolTotalFormat = { [weak settingsSync] in
+            settingsSync?.settings.poolTotalFormat
+        }
+        contextMenuController.onSetTotalFormat = { [weak settingsSync] provider, format in
             Task { @MainActor [weak settingsSync] in
-                await settingsSync?.setMenuBarAccount(id: value)
+                await settingsSync?.setPoolTotalFormat(provider: provider, format: format)
+            }
+        }
+        // Issue #488: the deck header's click on the aggregate — same write.
+        deckModel.onSetPoolTotalFormat = { [weak settingsSync] provider, format in
+            Task { @MainActor [weak settingsSync] in
+                await settingsSync?.setPoolTotalFormat(provider: provider, format: format)
             }
         }
         // A card's right-click pin goes through the same daemon-backed

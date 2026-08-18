@@ -20,13 +20,15 @@ final class MenuBarContextMenuController: NSObject {
     private let installModel: AppUpdateInstallModel
     private var monitor: Any?
 
-    /// Issue #482: the stored `menuBarAccountId` feeding the flip item, and
-    /// the write path back through the daemon-backed settings sync — the
-    /// same setting the Settings picker and the cards' pin menu write. Both
-    /// set after construction (the settings sync outlives this controller),
-    /// and a nil either way simply renders no flip item.
+    /// Issue #482/#488: the stored `menuBarAccountId` + `poolTotalFormat`
+    /// feeding the flip item, and the write path back through the
+    /// daemon-backed settings sync — the same shared-format write the
+    /// Settings picker and the deck header's click use. All set after
+    /// construction (the settings sync outlives this controller), and a nil
+    /// either way simply renders no flip item.
     var menuBarSetting: (() -> String?)?
-    var onSetMenuBarSetting: ((String) -> Void)?
+    var poolTotalFormat: (() -> String?)?
+    var onSetTotalFormat: ((DeckProvider, MenuBarPinResolver.TotalFormat) -> Void)?
 
     init(appUpdateModel: AppUpdateModel, installModel: AppUpdateInstallModel) {
         self.appUpdateModel = appUpdateModel
@@ -71,7 +73,8 @@ final class MenuBarContextMenuController: NSObject {
         menu.autoenablesItems = false
         let items = MenuBarContextMenu.items(
             isCheckingForUpdates: appUpdateModel.isChecking,
-            menuBarSetting: menuBarSetting?()
+            menuBarSetting: menuBarSetting?(),
+            poolTotalFormat: poolTotalFormat?() ?? ""
         )
         for item in items {
             if item.action == .quit, !menu.items.isEmpty {
@@ -87,11 +90,11 @@ final class MenuBarContextMenuController: NSObject {
                 menuItem.action = #selector(checkForAppUpdates)
             case .quit:
                 menuItem.action = #selector(quit)
-            case .setMenuBarSetting(let value):
-                // Issue #482: the flip carries its target value on the
-                // menu item, so one selector serves any future variant.
-                menuItem.action = #selector(setMenuBarSetting(_:))
-                menuItem.representedObject = value
+            case .setTotalFormat(let provider, let format):
+                // Issue #482/#488: the flip carries its provider + target
+                // format on the menu item ("claude|share").
+                menuItem.action = #selector(setTotalFormat(_:))
+                menuItem.representedObject = "\(provider.rawValue)|\(format.rawValue)"
                 // A separator between the mode item and the app rows keeps
                 // the flip visually tied to the icon it changes.
                 menu.addItem(menuItem)
@@ -132,11 +135,17 @@ final class MenuBarContextMenuController: NSObject {
         NSApp.terminate(nil)
     }
 
-    /// Issue #482: writes the flipped total-format value through the same
-    /// daemon-backed setting as the Settings picker; the confirmed
-    /// document flows back through settings sync and the icon updates.
-    @objc private func setMenuBarSetting(_ sender: NSMenuItem) {
+    /// Issue #482/#488: writes the flipped format through the SHARED
+    /// pool-total setting (same write as the Settings picker and the deck
+    /// header's click); the confirmed document flows back through settings
+    /// sync and both surfaces update together.
+    @objc private func setTotalFormat(_ sender: NSMenuItem) {
         guard let value = sender.representedObject as? String else { return }
-        onSetMenuBarSetting?(value)
+        let parts = value.split(separator: "|", maxSplits: 1)
+        guard parts.count == 2,
+              let provider = DeckProvider(rawValue: String(parts[0])),
+              let format = MenuBarPinResolver.TotalFormat(rawValue: String(parts[1]))
+        else { return }
+        onSetTotalFormat?(provider, format)
     }
 }

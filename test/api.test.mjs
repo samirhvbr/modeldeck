@@ -497,6 +497,8 @@ test('settings API validates partial updates and drives worst-capacity threshold
     menuBarStyle: 'icon-only',
     menuBarAccountId: '',
     menuBarShowWhen: '',
+    // Issue #488: shared pool-total format — '' = nothing chosen (sum).
+    poolTotalFormat: '',
     // Issue #242: deck chip labels — '' = dot only (default).
     deckHealthLabels: '',
     // TRIPWIRE (#388): 0.4.6 defaults the dashboard ON for a new database.

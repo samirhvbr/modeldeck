@@ -87,6 +87,15 @@ public final class MenuBarStatusModel: ObservableObject {
         didSet { recomputeIconState() }
     }
 
+    /// Issue #488: the stored `poolTotalFormat` value — the ONE sum ↔ share
+    /// choice per provider that the deck header shares with the total
+    /// display modes here. An explicit entry outranks a 1.0.2 `|fmt:`
+    /// suffix on the pin (`MenuBarPinResolver.resolvedTotalFormat`), so the
+    /// two surfaces can never disagree on the chosen format.
+    @Published public var poolTotalFormat: String = "" {
+        didSet { recomputeIconState() }
+    }
+
     /// Issue #297: the deck's #254 general-weekly focus toggle, mirrored in
     /// from `DeckPopoverModel` (it is an app-local popover preference, not a
     /// daemon setting, so it never arrives through the settings document
@@ -184,7 +193,11 @@ public final class MenuBarStatusModel: ObservableObject {
             return MenuBarSourceResolver.totalNumberSourceLine(
                 provider: totalProvider,
                 display: display,
-                format: MenuBarPinResolver.totalFormat(pinnedAccountId)
+                format: MenuBarPinResolver.resolvedTotalFormat(
+                    provider: totalProvider,
+                    poolFormats: poolTotalFormat,
+                    menuBarSetting: pinnedAccountId
+                )
             )
         }
         guard let source = menuBarPercentSource else { return nil }
@@ -293,7 +306,11 @@ public final class MenuBarStatusModel: ObservableObject {
                 iconState = .plain
                 return
             }
-            let format = MenuBarPinResolver.totalFormat(pinnedAccountId)
+            let format = MenuBarPinResolver.resolvedTotalFormat(
+                provider: totalProvider,
+                poolFormats: poolTotalFormat,
+                menuBarSetting: pinnedAccountId
+            )
             iconState = .pinned(
                 percentRemaining: format == .share ? display.sharePercent : display.points
             )

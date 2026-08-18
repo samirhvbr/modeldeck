@@ -119,6 +119,7 @@ final class DaemonSetupDecisionTests: XCTestCase {
     /// Baseline call with the non-pathological extras: service present in
     /// launchd, probe snapshot assembled from reachable + runningCommit.
     private func decide(
+        hostSignatureTrusted: Bool = true,
         reachable: Bool,
         runningCommit: String? = nil,
         registration: ServiceRegistrationStatus,
@@ -128,6 +129,7 @@ final class DaemonSetupDecisionTests: XCTestCase {
         bundledCommit: String?
     ) -> DaemonSetupDecision {
         decideDaemonSetup(
+            hostSignatureAllowsServiceManagement: hostSignatureTrusted,
             probe: reachable ? DaemonProbeSnapshot(runningCommit: runningCommit) : nil,
             registration: registration, launchdService: launchdService,
             legacyPresent: legacyPresent,
@@ -378,7 +380,10 @@ final class DaemonSetupModelTests: XCTestCase {
         launchd = FakeLaunchdControl()
     }
 
-    private func makeModel(bundledCommit: String? = "new") -> DaemonSetupModel {
+    private func makeModel(
+        bundledCommit: String? = "new",
+        hostSignatureTrusted: Bool = true
+    ) -> DaemonSetupModel {
         DaemonSetupModel(
             dependencies: .init(
                 registrar: registrar,
@@ -387,7 +392,8 @@ final class DaemonSetupModelTests: XCTestCase {
                 marker: marker,
                 probe: probe,
                 launchdControl: launchd,
-                bundledCommit: bundledCommit
+                bundledCommit: bundledCommit,
+                hostSignatureAllowsServiceManagement: hostSignatureTrusted
             ),
             startupProbeAttempts: 3,
             startupProbeDelay: {} // instant in tests
@@ -927,7 +933,8 @@ final class KeychainPromptCoachingTests: XCTestCase {
                 marker: marker,
                 probe: probe,
                 launchdControl: launchd,
-                bundledCommit: bundledCommit
+                bundledCommit: bundledCommit,
+                hostSignatureAllowsServiceManagement: true
             ),
             startupProbeAttempts: 3,
             startupProbeDelay: {}

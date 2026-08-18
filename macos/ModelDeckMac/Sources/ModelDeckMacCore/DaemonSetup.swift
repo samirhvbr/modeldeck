@@ -163,6 +163,14 @@ public struct DaemonBundleManifest: Codable, Equatable, Sendable {
 /// What a launch evaluation concluded. Pure output of `decideDaemonSetup` —
 /// the model maps it onto phases and performs the side effects.
 public enum DaemonSetupDecision: Equatable, Sendable {
+    /// The RUNNING app is not signed like the production app (ad-hoc dev
+    /// signature, unsigned, or no Team ID). It must never touch the
+    /// SMAppService registration: (re-)registering from such a build stamps
+    /// a launch constraint derived from ITS signature onto the service, and
+    /// launchd then SIGKILLs the production daemon on every spawn ("Launch
+    /// Constraint Violation", CODESIGNING exit 78 — the 2026-08-17 incident,
+    /// issue #486). Outranks every other rule, including drift.
+    case hostSignatureStandDown
     /// No bundled daemon in this build (swift run / build_app.sh dev bundle).
     /// The existing "Daemon unreachable" banner covers the dev workflow;
     /// first-run UI stays out of the way.
@@ -197,6 +205,9 @@ public enum DaemonSetupDecision: Equatable, Sendable {
 }
 
 /// The launch-time decision, kept pure for tests. Precedence:
+/// 0. host not production-signed → stand down (issue #486: an ad-hoc dev
+///    bundle re-registering the service launch-constrains the production
+///    daemon to the DEV signature);
 /// 1. no bundled daemon → dev build, stand down;
 /// 2. registered + commit drift → re-register (even while running: the
 ///    running daemon is the OLD build);
@@ -210,6 +221,7 @@ public enum DaemonSetupDecision: Equatable, Sendable {
 /// 6. legacy plist present → never install over it;
 /// 7. registration status → approval / retry / first-run consent.
 public func decideDaemonSetup(
+    hostSignatureAllowsServiceManagement: Bool,
     probe: DaemonProbeSnapshot?,
     registration: ServiceRegistrationStatus,
     launchdService: LaunchdServiceProbe,
@@ -217,6 +229,9 @@ public func decideDaemonSetup(
     recordedCommit: String?,
     bundledCommit: String?
 ) -> DaemonSetupDecision {
+    guard hostSignatureAllowsServiceManagement else {
+        return .hostSignatureStandDown
+    }
     guard let bundledCommit, !bundledCommit.isEmpty else {
         return .bundledServiceUnavailable
     }
@@ -329,6 +344,12 @@ public final class DaemonSetupModel: ObservableObject {
         public var launchdControl: any LaunchdServiceControlling
         /// MDGitCommit from the bundle's daemon manifest; nil in dev builds.
         public var bundledCommit: String?
+        /// Issue #486: whether the running app's code signature qualifies it
+        /// to manage the service (production-style signature — never ad-hoc,
+        /// has a Team ID). False turns the whole feature off, exactly like a
+        /// missing bundled daemon. No default on purpose: every wiring must
+        /// decide, and the live one asks `HostCodeSignature`.
+        public var hostSignatureAllowsServiceManagement: Bool
 
         public init(
             registrar: any DaemonServiceRegistrar,
@@ -337,7 +358,8 @@ public final class DaemonSetupModel: ObservableObject {
             marker: any RegistrationMarkerStore,
             probe: any DaemonReachabilityProbing,
             launchdControl: any LaunchdServiceControlling,
-            bundledCommit: String?
+            bundledCommit: String?,
+            hostSignatureAllowsServiceManagement: Bool
         ) {
             self.registrar = registrar
             self.tokenStore = tokenStore
@@ -346,14 +368,16 @@ public final class DaemonSetupModel: ObservableObject {
             self.probe = probe
             self.launchdControl = launchdControl
             self.bundledCommit = bundledCommit
+            self.hostSignatureAllowsServiceManagement = hostSignatureAllowsServiceManagement
         }
     }
 
     @Published public private(set) var phase: Phase = .idle
-    /// False in dev builds without a bundled daemon manifest — the entire
-    /// surface (popover card + Settings section) stays hidden.
+    /// False in dev builds — no bundled daemon manifest, or a host signature
+    /// that may not manage the service (#486) — so the entire surface
+    /// (popover card + Settings section) stays hidden.
     public var bundledServiceAvailable: Bool {
-        deps.bundledCommit?.isEmpty == false
+        deps.hostSignatureAllowsServiceManagement && deps.bundledCommit?.isEmpty == false
     }
     /// Drives the Settings takeover section — independent of `phase`, since
     /// the legacy agent can be present while its daemon is happily running.
@@ -407,6 +431,7 @@ public final class DaemonSetupModel: ObservableObject {
         legacyAgentPresent = deps.legacyAgent.isLegacyAgentPresent()
         let registration = deps.registrar.status
         let decision = decideDaemonSetup(
+            hostSignatureAllowsServiceManagement: deps.hostSignatureAllowsServiceManagement,
             // ONE health round-trip answers both reachability and staleness.
             probe: await deps.probe.probeDaemon(),
             registration: registration,
@@ -419,7 +444,7 @@ public final class DaemonSetupModel: ObservableObject {
             bundledCommit: deps.bundledCommit
         )
         switch decision {
-        case .bundledServiceUnavailable, .running:
+        case .hostSignatureStandDown, .bundledServiceUnavailable, .running:
             phase = .quiet
         case .needsConsent:
             phase = .consentNeeded
@@ -478,7 +503,8 @@ public final class DaemonSetupModel: ObservableObject {
     /// without any user action.
     @discardableResult
     public func repairMissingDaemonBinary() async -> Bool {
-        guard !didAttemptMissingBinaryRepair,
+        guard deps.hostSignatureAllowsServiceManagement,
+              !didAttemptMissingBinaryRepair,
               phase == .quiet,
               let bundledCommit = deps.bundledCommit, !bundledCommit.isEmpty
         else { return false }
@@ -492,6 +518,10 @@ public final class DaemonSetupModel: ObservableObject {
     /// Adopt the bundled service: boot out + delete the legacy LaunchAgent,
     /// then run the normal install. Never called automatically.
     public func adoptBundledService() async {
+        guard deps.hostSignatureAllowsServiceManagement else {
+            phase = .quiet
+            return
+        }
         phase = .installing
         do {
             try deps.legacyAgent.removeLegacyAgent()
@@ -506,6 +536,12 @@ public final class DaemonSetupModel: ObservableObject {
     // MARK: Internals
 
     private func install() async {
+        // #486 belt-and-braces: the consent surface never shows for an
+        // untrusted host signature, but no code path may register anyway.
+        guard deps.hostSignatureAllowsServiceManagement else {
+            phase = .quiet
+            return
+        }
         phase = .installing
         // Issue #98: from here on, the daemon's first refresh will hit the
         // per-account Keychain prompts — keep the coaching visible through
@@ -542,6 +578,10 @@ public final class DaemonSetupModel: ObservableObject {
     }
 
     private func reregister(bundledCommit: String) async {
+        guard deps.hostSignatureAllowsServiceManagement else {
+            phase = .quiet
+            return
+        }
         // Replace the registration so launchd picks up the new bundle's
         // service definition, then record the new commit.
         try? deps.registrar.unregister()
@@ -612,6 +652,10 @@ public final class DaemonSetupModel: ObservableObject {
     /// registers this bundle instead of no-opping (the manual recovery
     /// sequence from the 2026-08-02 incident, automated).
     private func forceRestartService(bundledCommit: String) async {
+        guard deps.hostSignatureAllowsServiceManagement else {
+            phase = .quiet
+            return
+        }
         didForceRestartService = true
         await deps.launchdControl.bootOutService()
         try? deps.registrar.unregister()

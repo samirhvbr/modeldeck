@@ -354,19 +354,29 @@ function poolWeights(estimate) {
 
 // ---- time buckets ----------------------------------------------------------
 
+/*
+ * Bounds are HALF-OPEN [since, until) — boundsFor's own contract. Issue #491:
+ * walking `cursor <= end` included the bucket AT `until`, so every day scope
+ * ending on a midnight ("Yesterday", any past day) gained the next day's
+ * 00:00 bucket — which put the calendar back on every tick of a one-day axis
+ * (#447's labeler honestly saw two dates) and drew a phantom zero at the
+ * chart's right edge. A range ending mid-bucket ("Today" ends at now) still
+ * includes the in-progress bucket: the cursor sits on the bucket's START,
+ * which is strictly before an `until` inside it.
+ */
 export function enumerateBuckets(since, until, resolution) {
   const keys = [];
   const start = new Date(since);
   const end = new Date(until);
   if (resolution === 'hour') {
     const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate(), start.getHours());
-    while (cursor <= end) {
+    while (cursor < end) {
       keys.push(localHourKey(cursor));
       cursor.setHours(cursor.getHours() + 1);
     }
   } else {
     const cursor = new Date(start.getFullYear(), start.getMonth(), start.getDate());
-    while (cursor <= end) {
+    while (cursor < end) {
       keys.push(localDayKey(cursor));
       cursor.setDate(cursor.getDate() + 1);
     }

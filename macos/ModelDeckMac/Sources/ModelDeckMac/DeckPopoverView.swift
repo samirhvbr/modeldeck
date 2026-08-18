@@ -1305,10 +1305,15 @@ struct DeckColumnView: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                     if let usage = columnUsageHeadline {
+                        // Issue #488 (Tim's field report): the aggregate
+                        // renders in the pool's chosen format — the SAME
+                        // per-provider sum ↔ share choice the menu bar's
+                        // total mode reads — and clicking it flips both.
+                        let format = deckModel.poolTotalFormat(for: column.provider)
                         Text(" · ")
                             .font(DeckType.tier)
                             .foregroundStyle(.secondary)
-                        Text(usage.text)
+                        Text(usage.text(format))
                             // The row's "% left" treatment, minus the
                             // severity color: a sum crosses no threshold
                             // (341% is not "healthy"), so coloring it would
@@ -1316,8 +1321,22 @@ struct DeckColumnView: View {
                             .font(DeckType.value)
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
-                            .help(usage.tooltip)
-                            .accessibilityLabel(usage.accessibilityLabel)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                deckModel.flipPoolTotalFormat(for: column.provider)
+                            }
+                            .help(usage.tooltip(format) + (format == .share
+                                ? " Click to show the sum instead."
+                                : " Click to show the share of capacity instead."))
+                            .accessibilityLabel(usage.accessibilityLabel(format))
+                            .accessibilityAddTraits(.isButton)
+                            .accessibilityHint("Switches between the summed % left and its share of the pool's capacity.")
+                            // A tap gesture alone isn't activatable by
+                            // VoiceOver (CodeRabbit, this PR) — mirror it
+                            // as the element's accessibility action.
+                            .accessibilityAction {
+                                deckModel.flipPoolTotalFormat(for: column.provider)
+                            }
                     }
                 }
             }

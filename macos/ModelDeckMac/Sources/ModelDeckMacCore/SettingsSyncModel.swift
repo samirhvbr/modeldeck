@@ -117,6 +117,15 @@ public final class SettingsSyncModel: ObservableObject {
             { $0.deckHealthLabels != nil },
             { $0.deckHealthLabels = nil }
         ),
+        // Issue #488: pre-#488 daemons don't know the shared pool-total
+        // format key. Stripping it keeps the same patch's menu-bar suffix
+        // write, so a 1.0.2-era daemon still round-trips the chosen format
+        // through the pin grammar both surfaces read as the fallback.
+        (
+            "poolTotalFormat",
+            { $0.poolTotalFormat != nil },
+            { $0.poolTotalFormat = nil }
+        ),
         // Issue #343: pre-analytics daemons don't know the feature flag —
         // and have no dashboard route the flag could open.
         (
@@ -219,6 +228,31 @@ public final class SettingsSyncModel: ObservableObject {
     public func setMenuBarAccount(id: String) async {
         guard id != settings.menuBarAccountId else { return }
         await update(DaemonSettingsPatch(menuBarAccountId: id))
+    }
+
+    /// Issue #488: the ONE sum ↔ share choice for a provider's pool total,
+    /// written by every flip surface (deck header click, Settings picker,
+    /// menu bar right-click). One patch updates the shared `poolTotalFormat`
+    /// key and — while the menu bar is showing this pool's total — rewrites
+    /// the pin's 1.0.2 `|fmt:` suffix to match, so a downgraded build and
+    /// the two surfaces can never disagree on the chosen format.
+    public func setPoolTotalFormat(
+        provider: DeckProvider, format: MenuBarPinResolver.TotalFormat
+    ) async {
+        var patch = DaemonSettingsPatch()
+        let stored = MenuBarPinResolver.updatingPoolFormats(
+            settings.poolTotalFormat, provider: provider, format: format
+        )
+        if stored != settings.poolTotalFormat {
+            patch.poolTotalFormat = stored
+        }
+        if MenuBarPinResolver.totalProvider(settings.menuBarAccountId) == provider {
+            let pin = MenuBarPinResolver.totalValue(provider: provider, format: format)
+            if pin != settings.menuBarAccountId {
+                patch.menuBarAccountId = pin
+            }
+        }
+        await update(patch)
     }
 
     /// Issue #238: WHEN the menu bar shows its indicator ("Show it" —

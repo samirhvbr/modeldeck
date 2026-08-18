@@ -43,6 +43,14 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
     /// gates nothing, and a pre-#238 build simply ignores the key.
     /// Display-only: notifications keep watching every account.
     public var menuBarShowWhen: String
+    /// Issue #488: the per-provider pool-total display format shared by the
+    /// deck header and the menu bar's total modes — comma-joined
+    /// "<provider>:<sum|share>" entries (e.g. "claude:share"), "" = nothing
+    /// chosen (sum, with a 1.0.2 `|fmt:` menu-bar suffix honored as the
+    /// migration read). Same free-string discipline as `menuBarShowWhen`:
+    /// the daemon validates only string/length, unknown entries parse as
+    /// unset, and a pre-#488 build simply ignores the key.
+    public var poolTotalFormat: String
     /// Issue #242 deck chip labels: whether the deck's Availability Health
     /// chips render the verdict word beside the shape-coded dot. Grammar
     /// (see `DeckHealthLabels`): "" = dot only (default — the dot's shape
@@ -88,6 +96,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         menuBarStyle: "icon-only",
         menuBarAccountId: "",
         menuBarShowWhen: "",
+        poolTotalFormat: "",
         deckHealthLabels: "",
         autoRenewEnabled: true,
         otelReceiverEnabled: false,
@@ -106,6 +115,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         menuBarStyle: String,
         menuBarAccountId: String = "",
         menuBarShowWhen: String = "",
+        poolTotalFormat: String = "",
         deckHealthLabels: String = "",
         autoRenewEnabled: Bool = true,
         otelReceiverEnabled: Bool = false,
@@ -122,6 +132,7 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         self.menuBarStyle = menuBarStyle
         self.menuBarAccountId = menuBarAccountId
         self.menuBarShowWhen = menuBarShowWhen
+        self.poolTotalFormat = poolTotalFormat
         self.deckHealthLabels = deckHealthLabels
         self.autoRenewEnabled = autoRenewEnabled
         self.otelReceiverEnabled = otelReceiverEnabled
@@ -150,6 +161,9 @@ public struct DaemonSettings: Codable, Equatable, Sendable {
         // Issue #238: absent on pre-#238 daemons → always shown (default).
         menuBarShowWhen = try container.decodeIfPresent(String.self, forKey: .menuBarShowWhen)
             ?? defaults.menuBarShowWhen
+        // Issue #488: absent on pre-#488 daemons → nothing chosen.
+        poolTotalFormat = try container.decodeIfPresent(String.self, forKey: .poolTotalFormat)
+            ?? defaults.poolTotalFormat
         // Issue #242: absent on pre-#242 daemons → dot only (default).
         deckHealthLabels = try container.decodeIfPresent(String.self, forKey: .deckHealthLabels)
             ?? defaults.deckHealthLabels
@@ -266,6 +280,11 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     /// field and retries when that happens (the #90/#123/#176 tolerance
     /// path).
     public var menuBarShowWhen: String?
+    /// Issue #488: the shared pool-total format value. Pre-#488 daemons
+    /// reject unknown keys — SettingsSyncModel strips this field and
+    /// retries when that happens (the same tolerance path as every newer
+    /// settings key).
+    public var poolTotalFormat: String?
     /// Issue #242: the deck chip labels value (`DeckHealthLabels` grammar).
     /// Pre-#242 daemons reject unknown keys — SettingsSyncModel strips this
     /// field and retries when that happens (the #90/#123/#176/#238
@@ -292,6 +311,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         menuBarStyle: String? = nil,
         menuBarAccountId: String? = nil,
         menuBarShowWhen: String? = nil,
+        poolTotalFormat: String? = nil,
         deckHealthLabels: String? = nil,
         autoRenewEnabled: Bool? = nil,
         usageAnalyticsEnabled: Bool? = nil
@@ -306,6 +326,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         self.menuBarStyle = menuBarStyle
         self.menuBarAccountId = menuBarAccountId
         self.menuBarShowWhen = menuBarShowWhen
+        self.poolTotalFormat = poolTotalFormat
         self.deckHealthLabels = deckHealthLabels
         self.autoRenewEnabled = autoRenewEnabled
         self.usageAnalyticsEnabled = usageAnalyticsEnabled
@@ -325,6 +346,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             menuBarStyle: other.menuBarStyle ?? menuBarStyle,
             menuBarAccountId: other.menuBarAccountId ?? menuBarAccountId,
             menuBarShowWhen: other.menuBarShowWhen ?? menuBarShowWhen,
+            poolTotalFormat: other.poolTotalFormat ?? poolTotalFormat,
             deckHealthLabels: other.deckHealthLabels ?? deckHealthLabels,
             autoRenewEnabled: other.autoRenewEnabled ?? autoRenewEnabled,
             usageAnalyticsEnabled: other.usageAnalyticsEnabled ?? usageAnalyticsEnabled
@@ -343,6 +365,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
         try container.encodeIfPresent(menuBarStyle, forKey: .menuBarStyle)
         try container.encodeIfPresent(menuBarAccountId, forKey: .menuBarAccountId)
         try container.encodeIfPresent(menuBarShowWhen, forKey: .menuBarShowWhen)
+        try container.encodeIfPresent(poolTotalFormat, forKey: .poolTotalFormat)
         try container.encodeIfPresent(deckHealthLabels, forKey: .deckHealthLabels)
         try container.encodeIfPresent(autoRenewEnabled, forKey: .autoRenewEnabled)
         try container.encodeIfPresent(usageAnalyticsEnabled, forKey: .usageAnalyticsEnabled)
@@ -351,7 +374,7 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case autoRefreshEnabled, autoRefreshIntervalSeconds, autoRefreshIntervalCustomized, pauseWhileActive
         case layout, defaultSort, notificationThresholdPercent, menuBarStyle, menuBarAccountId
-        case menuBarShowWhen, deckHealthLabels, autoRenewEnabled, usageAnalyticsEnabled
+        case menuBarShowWhen, poolTotalFormat, deckHealthLabels, autoRenewEnabled, usageAnalyticsEnabled
     }
 
     public var isEmpty: Bool {
@@ -359,7 +382,8 @@ public struct DaemonSettingsPatch: Encodable, Equatable, Sendable {
             && autoRefreshIntervalCustomized == nil && pauseWhileActive == nil
             && layout == nil && defaultSort == nil && notificationThresholdPercent == nil
             && menuBarStyle == nil && menuBarAccountId == nil
-            && menuBarShowWhen == nil && deckHealthLabels == nil && autoRenewEnabled == nil
+            && menuBarShowWhen == nil && poolTotalFormat == nil
+            && deckHealthLabels == nil && autoRenewEnabled == nil
             && usageAnalyticsEnabled == nil
     }
 }

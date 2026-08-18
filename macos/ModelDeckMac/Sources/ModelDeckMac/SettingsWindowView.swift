@@ -1822,7 +1822,7 @@ struct GeneralSettingsPane: View {
                         Text("Sum — e.g. 474%").tag(MenuBarPinResolver.TotalFormat.sum)
                         Text("Share of capacity — e.g. 68%").tag(MenuBarPinResolver.TotalFormat.share)
                     }
-                    .help("\"Sum\" shows the same aggregate as the deck's column header — every counted subscription's % left added together, so 7 subscriptions can read 474%. \"Share of capacity\" divides that sum by the counted subscriptions' combined capacity (100% each): 474% of 700% shows as 68%. Right-clicking the menu bar icon flips between the two. Subscriptions that are hidden, stale, or without a current reading stay out of both numbers.")
+                    .help("\"Sum\" shows every counted subscription's % left added together, so 7 subscriptions can read 474%. \"Share of capacity\" divides that sum by the counted subscriptions' combined capacity (100% each): 474% of 700% shows as 68%. One choice per provider: the deck's column header shows the same format, and clicking the header's number or right-clicking the menu bar icon flips both. Subscriptions that are hidden, stale, or without a current reading stay out of both numbers.")
                 }
                 if let pinnedBase = pinnedAccountBase {
                     // Only window classes the account actually reports are
@@ -2285,16 +2285,22 @@ struct GeneralSettingsPane: View {
         return options
     }
 
-    /// Issue #482: the Total shown as selection — reads the stored
-    /// format suffix, writes the recomposed full value so the provider
-    /// and its format travel as one setting (the #292 pattern).
+    /// Issue #482/#488: the Total shown as selection — the SHARED
+    /// per-provider format (`poolTotalFormat` first, the pin's 1.0.2
+    /// `|fmt:` suffix as the migration read). Writes go through
+    /// `setPoolTotalFormat`, which updates the shared key and keeps the
+    /// pin suffix in agreement — the deck header flips with it.
     private func totalFormatBinding(provider: DeckProvider) -> Binding<MenuBarPinResolver.TotalFormat> {
         binding(
-            get: { MenuBarPinResolver.totalFormat($0.menuBarAccountId) },
-            set: { model, format in
-                await model.setMenuBarAccount(
-                    id: MenuBarPinResolver.totalValue(provider: provider, format: format)
+            get: {
+                MenuBarPinResolver.resolvedTotalFormat(
+                    provider: provider,
+                    poolFormats: $0.poolTotalFormat,
+                    menuBarSetting: $0.menuBarAccountId
                 )
+            },
+            set: { model, format in
+                await model.setPoolTotalFormat(provider: provider, format: format)
             }
         )
     }
@@ -2447,7 +2453,11 @@ struct GeneralSettingsPane: View {
         // a sum can read above 100%, and the quiet threshold gates on the
         // share form in either format (a 1–99 gate can't judge a 474).
         if let provider = MenuBarPinResolver.totalProvider(current) {
-            let base = MenuBarPinResolver.totalFormat(current) == .share
+            let base = MenuBarPinResolver.resolvedTotalFormat(
+                provider: provider,
+                poolFormats: settingsSync.settings.poolTotalFormat,
+                menuBarSetting: current
+            ) == .share
                 ? "The menu bar shows \(provider.displayName)'s pool total as a share of capacity — the summed % left divided by the counted subscriptions' combined capacity (100% each)."
                 : "The menu bar shows the total % left summed across \(provider.displayName) subscriptions — the deck column header's number, so it can read above 100%."
             if let threshold = quietPercentThreshold {

@@ -317,6 +317,60 @@ public struct LaunchctlDaemonServiceController: LaunchdServiceControlling {
     }
 }
 
+// MARK: - Host code signature (issue #486)
+
+/// Whether the RUNNING app's code signature qualifies it to manage the
+/// SMAppService background service. The 2026-08-17 incident: an ad-hoc
+/// dev bundle (build_app.sh) re-registered `ai.hermes.modeldeck`, and the
+/// registration stamped a launch constraint derived from the DEV signature —
+/// launchd then SIGKILLed the production daemon ("Launch Constraint
+/// Violation", CODESIGNING exit 78) on every spawn until a manual bootout.
+///
+/// The bar: a VALID signature, not ad-hoc, and the production Team
+/// Identifier (ad-hoc and unsigned code have no team; a build signed with
+/// any OTHER real identity is still not the production app and would stamp
+/// a wrong-team constraint — CodeRabbit, PR #487). Fail-closed on purpose —
+/// any probe failure reads as "may not manage", which only costs a dev
+/// build its hand-test convenience, never the production daemon.
+public enum HostCodeSignature {
+    /// The Team ID of the Developer ID identity release-dmg.sh signs with
+    /// (`MD_SIGN_IDENTITY`; see docs/RELEASE.md provisioning). Not a secret —
+    /// it is in every shipped binary's signature.
+    public static let productionTeamIdentifier = "F66FM4V88Q"
+
+    /// The classification, kept pure for tests: code-directory flags (the
+    /// `flags=0x2(adhoc)` field codesign prints) + team identifier.
+    public static func allowsServiceManagement(flags: UInt32, teamIdentifier: String?) -> Bool {
+        guard flags & SecCodeSignatureFlags.adhoc.rawValue == 0 else { return false }
+        return teamIdentifier == productionTeamIdentifier
+    }
+
+    /// Asks Security for the current process's signing information and
+    /// classifies it. Any failure along the way is "no".
+    public static func currentProcessAllowsServiceManagement() -> Bool {
+        var codeRef: SecCode?
+        guard SecCodeCopySelf([], &codeRef) == errSecSuccess, let code = codeRef
+        else { return false }
+        var staticRef: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticRef) == errSecSuccess,
+              let staticCode = staticRef
+        else { return false }
+        // Signing metadata is only trustworthy for a signature that still
+        // validates against the code on disk (CodeRabbit, PR #487).
+        guard SecStaticCodeCheckValidity(staticCode, [], nil) == errSecSuccess
+        else { return false }
+        var infoRef: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &infoRef
+        ) == errSecSuccess, let info = infoRef as? [String: Any]
+        else { return false }
+        return allowsServiceManagement(
+            flags: (info[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0,
+            teamIdentifier: info[kSecCodeInfoTeamIdentifier as String] as? String
+        )
+    }
+}
+
 // MARK: - Assembly
 
 extension DaemonSetupModel.Dependencies {
@@ -331,7 +385,9 @@ extension DaemonSetupModel.Dependencies {
             marker: UserDefaultsRegistrationMarker(),
             probe: client,
             launchdControl: LaunchctlDaemonServiceController(),
-            bundledCommit: DaemonBundleManifest.load(from: bundle)?.MDGitCommit
+            bundledCommit: DaemonBundleManifest.load(from: bundle)?.MDGitCommit,
+            hostSignatureAllowsServiceManagement:
+                HostCodeSignature.currentProcessAllowsServiceManagement()
         )
     }
 }

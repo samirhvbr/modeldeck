@@ -67,6 +67,60 @@ test('single-day scope labels its x-axis with hours only, never a date', () => {
   assert.deepEqual(labels(hoursOf('2026-08-14', 9, 11), 'hour'), ['9 AM', '10 AM', '11 AM']);
 });
 
+/*
+ * Issue #491 — THE NAMED TRIPWIRE: a day scope's bucket enumeration never
+ * leaves the day the bounds name. The #447 tests above hold the labeler over
+ * hand-built one-day bucket arrays; the shipped bug lived a step earlier —
+ * boundsFor's half-open [since, until) ends "Yesterday" on the NEXT midnight,
+ * and enumerateBuckets walked `cursor <= end`, appending that next day's
+ * 00:00 bucket. The labeler then honestly saw two calendar days and put the
+ * date back on every tick. This holds the REAL pipeline end to end, so a
+ * bucket leak on either side of the seam trips it.
+ */
+test('#491: the Yesterday scope enumerates one calendar day and labels hours only', async () => {
+  const { boundsFor } = await loadModule('src/api.js');
+  const { enumerateBuckets } = await loadModule('src/model.js');
+  const { since, until } = boundsFor('yesterday');
+  const buckets = enumerateBuckets(since, until, 'hour');
+  assert.equal(buckets.length, 24);
+  assert.equal(
+    new Set(buckets.map((bucket) => bucket.slice(0, 10))).size, 1,
+    'yesterday\'s buckets must all sit on one calendar day, got ' + JSON.stringify([buckets[0], buckets[buckets.length - 1]]),
+  );
+  for (const tick of labels(buckets, 'hour')) {
+    assert.ok(
+      !DATE_SHAPED.test(tick) && HOUR_ONLY.test(tick),
+      'a Yesterday tick must be an hour alone, got ' + JSON.stringify(tick),
+    );
+  }
+});
+
+test('#491: the Today scope still includes the in-progress hour and labels hours only', async () => {
+  const { boundsFor } = await loadModule('src/api.js');
+  const { enumerateBuckets } = await loadModule('src/model.js');
+  const { since, until } = boundsFor('today');
+  const buckets = enumerateBuckets(since, until, 'hour');
+  // In the millisecond where `now` IS midnight the half-open range is
+  // honestly empty (CodeRabbit, this PR); any other instant includes the
+  // in-progress hour: the cursor sits on the bucket's start, strictly
+  // before an `until` inside it.
+  if (new Date(until).getTime() === new Date(since).getTime()) {
+    assert.equal(buckets.length, 0);
+    return;
+  }
+  assert.ok(buckets.length >= 1);
+  assert.equal(
+    buckets[buckets.length - 1].slice(11, 13),
+    String(new Date(until).getHours()).padStart(2, '0'),
+  );
+  for (const tick of labels(buckets, 'hour')) {
+    assert.ok(
+      !DATE_SHAPED.test(tick) && HOUR_ONLY.test(tick),
+      'a Today tick must be an hour alone, got ' + JSON.stringify(tick),
+    );
+  }
+});
+
 test('#369: an hourly span that crosses midnight keeps the date on its ticks', () => {
   const buckets = [...hoursOf('2026-08-13', 18), ...hoursOf('2026-08-14', 0, 12)];
   const ticks = labels(buckets, 'hour');

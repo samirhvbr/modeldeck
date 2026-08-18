@@ -83,6 +83,13 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // doesn't recognize as '' (always), so old and new builds round-trip
   // each other's values safely. Display-only: notifications are unaffected.
   menuBarShowWhen: '',
+  // Issue #488: per-provider pool-total display format shared by the deck
+  // header and the menu bar's total modes — comma-joined
+  // '<provider>:<sum|share>' entries (e.g. 'claude:share'); '' = nothing
+  // chosen. Free string like menuBarShowWhen — the app owns the grammar and
+  // ignores entries it doesn't recognize, so old and new builds round-trip
+  // each other's values safely. Display-only.
+  poolTotalFormat: '',
   // Issue #242 deck chip labels: '' = dot only (the default — the dot is
   // shape-coded green circle / yellow triangle / red octagon / hollow
   // no-data ring, so color is never the only signal); 'show' = dot +
@@ -126,6 +133,9 @@ function validateSetting(key, value) {
   }
   if (key === 'deckHealthLabels' && (typeof value !== 'string' || value.length > 64)) {
     throw new Error('deckHealthLabels must be a string of at most 64 characters');
+  }
+  if (key === 'poolTotalFormat' && (typeof value !== 'string' || value.length > 64)) {
+    throw new Error('poolTotalFormat must be a string of at most 64 characters');
   }
 }
 

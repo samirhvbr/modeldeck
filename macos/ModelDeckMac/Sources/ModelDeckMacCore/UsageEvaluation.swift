@@ -225,6 +225,54 @@ public enum MenuBarPinResolver {
         return format
     }
 
+    // MARK: - Shared pool-total format (issue #488)
+
+    /// Issue #488 (Tim's field report): he expected the #482 sum ↔ share
+    /// flip on the deck header too. The format choice is now ONE
+    /// per-provider preference both surfaces read — stored in the daemon
+    /// settings key `poolTotalFormat` as comma-joined
+    /// "<provider>:<sum|share>" entries (e.g. "claude:share"). Lenient like
+    /// every settings grammar here: unknown providers, unknown formats, and
+    /// junk entries are ignored, so old and new builds round-trip each
+    /// other's values safely.
+    public static func poolFormat(for provider: DeckProvider, in stored: String) -> TotalFormat? {
+        for entry in stored.split(separator: ",") {
+            let parts = entry.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, parts[0] == Substring(provider.rawValue) else { continue }
+            return TotalFormat(rawValue: String(parts[1]))
+        }
+        return nil
+    }
+
+    /// The stored `poolTotalFormat` value with this provider's entry set,
+    /// other providers' entries preserved, and unrecognizable entries
+    /// dropped only if they collide with this provider. Sorted for
+    /// deterministic round-trips.
+    public static func updatingPoolFormats(
+        _ stored: String, provider: DeckProvider, format: TotalFormat
+    ) -> String {
+        var entries = stored.split(separator: ",").map(String.init)
+            .filter { !$0.hasPrefix(provider.rawValue + ":") }
+        entries.append("\(provider.rawValue):\(format.rawValue)")
+        return entries.sorted().joined(separator: ",")
+    }
+
+    /// The one format decision both surfaces render: an explicit
+    /// `poolTotalFormat` entry wins; with none stored, a 1.0.2 menu-bar
+    /// total sentinel for the SAME provider donates its `|fmt:` suffix (the
+    /// migration read — a user who chose share on 1.0.2 keeps it on both
+    /// surfaces without re-choosing); otherwise the sum, the header's own
+    /// number.
+    public static func resolvedTotalFormat(
+        provider: DeckProvider, poolFormats: String, menuBarSetting: String?
+    ) -> TotalFormat {
+        if let format = poolFormat(for: provider, in: poolFormats) { return format }
+        if let menuBarSetting, totalProvider(menuBarSetting) == provider {
+            return totalFormat(menuBarSetting)
+        }
+        return .sum
+    }
+
     // MARK: - Pinned window choice (issue #292)
 
     /// Issue #292 (Tim's field report): a pinned account always displayed

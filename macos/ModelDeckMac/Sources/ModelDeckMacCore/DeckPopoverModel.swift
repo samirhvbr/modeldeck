@@ -1642,6 +1642,40 @@ public final class DeckPopoverModel: ObservableObject {
     /// flows back into `menuBarPinnedSetting` via the settings apply.
     public var onPinMenuBarAccount: ((String) -> Void)?
 
+    /// Issue #488: the daemon-confirmed `poolTotalFormat` mirrored here
+    /// (same no-echo contract as `menuBarPinnedSetting`) so the column
+    /// header can render its aggregate in the pool's chosen format.
+    @Published public var poolTotalFormatSetting: String = ""
+
+    /// Fired when the header's aggregate is clicked to flip sum ↔ share.
+    /// The app wires it to `SettingsSyncModel.setPoolTotalFormat`, whose
+    /// confirmed document then flows back into `poolTotalFormatSetting`
+    /// via the settings apply — the same write the Settings picker and the
+    /// menu bar's right-click flip use.
+    public var onSetPoolTotalFormat: ((DeckProvider, MenuBarPinResolver.TotalFormat) -> Void)?
+
+    /// Issue #488: the format the header renders a provider's aggregate in
+    /// — the shared resolution (explicit `poolTotalFormat` entry, then a
+    /// 1.0.2 menu-bar suffix for the same provider, then sum).
+    public func poolTotalFormat(for provider: DeckProvider) -> MenuBarPinResolver.TotalFormat {
+        MenuBarPinResolver.resolvedTotalFormat(
+            provider: provider,
+            poolFormats: poolTotalFormatSetting,
+            menuBarSetting: menuBarPinnedSetting
+        )
+    }
+
+    /// Issue #488: flip a provider pool's total between sum and share of
+    /// capacity — Tim's header click. The new value round-trips through the
+    /// daemon like every settings write; the header re-renders on the
+    /// confirmed document.
+    public func flipPoolTotalFormat(for provider: DeckProvider) {
+        onSetPoolTotalFormat?(
+            provider,
+            poolTotalFormat(for: provider) == .share ? .sum : .share
+        )
+    }
+
     /// Whether this exact account id is the stored pin (follow-active
     /// sentinels deliberately don't match: the context menu shows the
     /// follow-active checkmark on its own item instead). Issue #292:
