@@ -4,6 +4,8 @@ import readline from 'node:readline';
 
 const DEFAULT_BATCH_LINES = 1_000;
 const COMMAND_NAME_PATTERN = /<command-name>\s*([^<]+?)\s*<\/command-name>/gu;
+const TRANSCRIPT_PARSER = 'claude-transcript';
+const TRANSCRIPT_PARSER_VERSION = 1;
 
 function object(value) {
   return value != null && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -506,7 +508,10 @@ export async function ingestTranscriptArchive({
     const finalStat = fs.statSync(file.path);
     if (finalStat.size === fileStat.size && finalStat.mtimeMs === fileStat.mtimeMs
       && finalStat.ino === fileStat.ino) {
-      store.recordIngestFileState(file.path, finalStat);
+      store.recordIngestFileState(file.path, finalStat, {
+        parser: TRANSCRIPT_PARSER,
+        parserVersion: TRANSCRIPT_PARSER_VERSION,
+      });
     }
   }
   flushBatch(store, batch, summary);

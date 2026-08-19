@@ -186,37 +186,112 @@ struct ManagedProxyAuthTripwireTests {
         "OutputStream(",
         "fopen(",
         "setAttributes(",
+        // Issue #521 extension: the consented write path publishes through the
+        // C calls, so the sweep has to know them too or a new writer could sit
+        // outside the guarded types unnoticed.
+        "mkstemp(",
+        "renamex_np(",
+        "rename(",
+        "chmod(",
+        "unlink(",
     ]
 
-    /// The type allowed to contain write calls — and the only one.
-    private static let guardedWriterType = "ManagedProxyConfigFileWriter"
+    /// The types allowed to contain write calls — and the only ones.
+    /// Issue #521 adds the consented config write path's three: the editor's
+    /// publisher and the two writers that call it.
+    private static let guardedWriterTypes = [
+        "ManagedProxyConfigFileWriter",
+        "ConsentedConfigWriter",
+        "ConfigBackupStore",
+        "OwnerOnlyPublisher",
+    ]
 
-    private static func lifecycleSource(_ name: String) throws -> String {
-        let sources = URL(fileURLWithPath: #filePath)
+    /// The named lifecycle sources. Everything else is DISCOVERED, below.
+    private static let lifecycleSources = ["ManagedProxy.swift", "ManagedProxyLive.swift"]
+
+    /// A sweep that found nothing to scan — a moved directory would otherwise
+    /// leave the tripwire passing on an empty walk.
+    private struct EmptySweep: Error, CustomStringConvertible {
+        let found: [String]
+        var description: String {
+            "TRIPWIRE managed-proxy-never-writes-auth swept \(found.count) file(s): "
+                + "the sweep must fail closed rather than pass on nothing."
+        }
+    }
+
+    /// Every source the sweep covers: the two lifecycle files plus EVERY
+    /// `ConsentedConfig*.swift`, discovered by glob rather than listed
+    /// (security review of PR #531, should-fix 3 — same fix shape as #520's
+    /// globbed SecItem ban). A hardcoded list makes the next file in this
+    /// feature invisible to the sweep, which is exactly the file most likely
+    /// to carry a new write.
+    private static func sweptSources() throws -> [String] {
+        let discovered = try FileManager.default
+            .contentsOfDirectory(atPath: sourceDirectory().path)
+            .filter { $0.hasPrefix("ConsentedConfig") && $0.hasSuffix(".swift") }
+            .sorted()
+        let all = lifecycleSources + discovered
+        guard discovered.count >= 3, all.count >= 5 else { throw EmptySweep(found: all) }
+        return all
+    }
+
+    private static func sourceDirectory() -> URL {
+        URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()   // .../Tests/ModelDeckMacCoreTests
             .deletingLastPathComponent()   // .../Tests
             .deletingLastPathComponent()   // .../ModelDeckMac (package root)
             .appendingPathComponent("Sources/ModelDeckMacCore")
-        return try String(contentsOf: sources.appendingPathComponent(name), encoding: .utf8)
     }
 
-    /// Lines of `source` outside the guarded writer type's body, with comment
+    private static func lifecycleSource(_ name: String) throws -> String {
+        try String(contentsOf: sourceDirectory().appendingPathComponent(name), encoding: .utf8)
+    }
+
+    /// True iff `line` declares exactly `token` — the type name must END there.
+    ///
+    /// A `contains` check was evasion, mutation-verified in review (PR #531,
+    /// should-fix 2): `struct ConsentedConfigWriterEvil` contains
+    /// `struct ConsentedConfigWriter`, so it opened a "guarded" region and
+    /// every write inside it went unseen. The character after the name must
+    /// therefore be one that cannot continue an identifier.
+    static func declares(_ token: String, in rawLine: String) -> Bool {
+        var searchStart = rawLine.startIndex
+        while let found = rawLine.range(of: token, range: searchStart..<rawLine.endIndex) {
+            let next = found.upperBound
+            if next == rawLine.endIndex { return true }
+            let character = rawLine[next]
+            if !(character.isLetter || character.isNumber || character == "_") { return true }
+            searchStart = next
+        }
+        return false
+    }
+
+    /// Lines of `source` outside the guarded writer types' bodies, with comment
     /// lines dropped (prose about writes is not a write).
+    private static func openingToken(in rawLine: String) -> String? {
+        for type in guardedWriterTypes {
+            for keyword in ["struct", "enum"] where declares("\(keyword) \(type)", in: rawLine) {
+                return "\(keyword) \(type)"
+            }
+        }
+        return nil
+    }
+
     private static func linesOutsideGuardedWriter(_ source: String) -> [(Int, String)] {
-        var insideWriter = false
+        var openedBy: String?
         var depth = 0
         var result: [(Int, String)] = []
         for (index, rawLine) in source.components(separatedBy: "\n").enumerated() {
             let line = rawLine.trimmingCharacters(in: .whitespaces)
-            if !insideWriter, rawLine.contains("struct \(guardedWriterType)") {
-                insideWriter = true
+            if openedBy == nil, !line.hasPrefix("//"), let token = openingToken(in: rawLine) {
+                openedBy = token
                 depth = 0
             }
-            if insideWriter {
+            if let token = openedBy {
                 depth += rawLine.filter { $0 == "{" }.count
                 depth -= rawLine.filter { $0 == "}" }.count
-                if depth <= 0, rawLine.contains("}"), !rawLine.contains("struct \(guardedWriterType)") {
-                    insideWriter = false
+                if depth <= 0, rawLine.contains("}"), !rawLine.contains(token) {
+                    openedBy = nil
                 }
                 continue
             }
@@ -228,14 +303,14 @@ struct ManagedProxyAuthTripwireTests {
 
     @Test("the managed-proxy lifecycle sources contain no unguarded filesystem write")
     func lifecycleHasNoAuthWritePath() throws {
-        for name in ["ManagedProxy.swift", "ManagedProxyLive.swift"] {
+        for name in try Self.sweptSources() {
             let source = try Self.lifecycleSource(name)
             for (number, line) in Self.linesOutsideGuardedWriter(source) {
                 for api in Self.writeAPIs where line.contains(api) {
                     Issue.record("""
                         TRIPWIRE managed-proxy-never-writes-auth: \(name):\(number) \
                         uses the filesystem write API `\(api)` outside \
-                        \(Self.guardedWriterType). ModelDeck manages the proxy's config \
+                        \(Self.guardedWriterTypes.joined(separator: "/")). ModelDeck manages the proxy's config \
                         and process only (#398) — every write must go through the \
                         guarded writer, which admits config.yaml and .mgmt-key (#431) \
                         and nothing else.
@@ -264,13 +339,66 @@ struct ManagedProxyAuthTripwireTests {
     /// The auth directory is never mentioned as a write destination anywhere
     /// in the lifecycle — it appears only as the thing being refused and as
     /// the value seeded into the proxy's own config.
-    @Test("no lifecycle source writes to the auth directory")
+    /// The sweep's own evasion test (PR #531, should-fix 2). A type whose name
+    /// merely STARTS with a guarded writer's name must not open a guarded
+    /// region — otherwise `struct ConsentedConfigWriterEvil { ... }` is a
+    /// blanket exemption anyone can declare.
+    @Test("a look-alike type name does not open a guarded region")
+    func lookAlikeTypeNamesAreNotGuarded() {
+        let evil = """
+        struct ConsentedConfigWriterEvil {
+            func sneak(_ url: URL) throws {
+                try Data().write(to: url)
+            }
+        }
+        """
+        let visible = Self.linesOutsideGuardedWriter(evil)
+        #expect(
+            visible.contains { $0.1.contains(".write(to:") },
+            """
+            TRIPWIRE managed-proxy-never-writes-auth: a type named like a guarded \
+            writer but not equal to one opened a guarded region, hiding every write \
+            inside it from the sweep.
+            """
+        )
+        // The real declarations still open their regions.
+        let genuine = "public struct ConsentedConfigWriter: Sendable {\n    try Data().write(to: url)\n}"
+        #expect(!Self.linesOutsideGuardedWriter(genuine).contains { $0.1.contains(".write(to:") })
+        #expect(Self.declares("struct ConsentedConfigWriter", in: "public struct ConsentedConfigWriter: Sendable {"))
+        #expect(!Self.declares("struct ConsentedConfigWriter", in: "struct ConsentedConfigWriterEvil {"))
+        #expect(!Self.declares("struct ConsentedConfigWriter", in: "struct ConsentedConfigWriter2 {"))
+        #expect(!Self.declares("struct ConsentedConfigWriter", in: "struct ConsentedConfigWriter_ {"))
+    }
+
+    /// The auth-directory sweep covers EVERY line, guarded writers included
+    /// (CodeRabbit on PR #531).
+    ///
+    /// The guarded-writer exclusion exists so the one type allowed to write
+    /// files can write them. It was never a licence to write AUTH files — but
+    /// because this scan reused the same exclusion, an auth-dir write placed
+    /// inside a guarded writer passed both sweeps: invisible here because it
+    /// was excluded, invisible to the general scan for the same reason. That is
+    /// exactly where such a write would be written, since that is where the
+    /// file-writing code already lives. Decision 0006 has no exceptions, so
+    /// neither does this scan.
+    @Test("no lifecycle source writes to the auth directory, guarded writers included")
     func noAuthDirectoryWrites() throws {
-        for name in ["ManagedProxy.swift", "ManagedProxyLive.swift"] {
+        let authTokens = ["authdirectory", "auth-dir", "authdir"]
+        for name in try Self.sweptSources() {
             let source = try Self.lifecycleSource(name)
-            for (number, line) in Self.linesOutsideGuardedWriter(source) where line.contains("authDirectory") {
-                for api in Self.writeAPIs where line.contains(api) {
-                    Issue.record("TRIPWIRE managed-proxy-never-writes-auth: \(name):\(number) writes to the auth directory via `\(api)`")
+            for (index, rawLine) in source.components(separatedBy: "\n").enumerated() {
+                let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.hasPrefix("//") else { continue }
+                let lowered = rawLine.lowercased()
+                guard authTokens.contains(where: { lowered.contains($0) }) else { continue }
+                for api in Self.writeAPIs where rawLine.contains(api) {
+                    Issue.record("""
+                        TRIPWIRE managed-proxy-never-writes-auth: \(name):\(index + 1) writes to \
+                        the auth directory via `\(api)`. CLIProxyAPI is the sole writer of \
+                        everything under auth-dir (#398, decision 0006) — being inside a \
+                        guarded writer is not an exemption from that.
+                        \(trimmed)
+                        """)
                 }
             }
         }

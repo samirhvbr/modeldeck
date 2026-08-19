@@ -63,6 +63,48 @@ public enum ProxyRelogin {
         account.proxyCredential?.lowercased() == "error"
     }
 
+    // MARK: - Wire evidence (issue #515)
+    //
+    // Tim, 2026-08-18: the deck said "Insight: 7 routed requests failed in a
+    // row (HTTP 401). Sign in again to restore proxy routing." while Settings
+    // showed the same account green with the repair hidden in the hover-only
+    // ⋯ menu. The banner reads MEASURED request outcomes (#395's blackout
+    // alert); the promotion read the RECORDED credential the proxy had not
+    // yet marked broken. Doctrine 0034 settles the tie: the measured
+    // request-path signal is the truth, so it promotes the repair too. Both
+    // surfaces now derive from these functions, which is why they cannot
+    // disagree again.
+
+    /// This account's live routed-failure streak, if the daemon reports one.
+    /// A daemon that omits `memberBlackout` (skew) returns nil and nothing
+    /// changes — the #149/#174 discipline.
+    public static func routedFailures(
+        for account: DeckAccount,
+        in state: DeckState?
+    ) -> MemberBlackoutAlert? {
+        state?.memberBlackout?.alerts.first { $0.accountId == account.id }
+    }
+
+    /// The streak in the row's own voice — the reason the repair is promoted,
+    /// stated where the repair is offered.
+    public static func routedFailureText(_ alert: MemberBlackoutAlert) -> String {
+        let request = alert.consecutiveFailures == 1 ? "request" : "requests"
+        let status = alert.statusCode.map { " (HTTP \($0))" } ?? ""
+        return "\(alert.consecutiveFailures) routed \(request) failed in a row\(status)"
+    }
+
+    /// Wire evidence outranks the recorded credential — with one exception: a
+    /// BENCHED member is not broken, and signing in again would not un-bench
+    /// it (the same reason `credentialText` refuses to dress it up).
+    public static func credentialIsBroken(
+        _ account: DeckAccount,
+        routedFailures alert: MemberBlackoutAlert?
+    ) -> Bool {
+        if credentialIsBroken(account) { return true }
+        guard alert != nil else { return false }
+        return account.proxyCredential?.lowercased() != "disabled"
+    }
+
     /// The row's honest one-liner about a non-ok credential, or nil.
     public static func credentialText(for account: DeckAccount) -> String? {
         switch account.proxyCredential?.lowercased() {
@@ -78,6 +120,18 @@ public enum ProxyRelogin {
         default:
             return nil
         }
+    }
+
+    /// What the row says about the credential once wire evidence is allowed
+    /// to speak: the proxy's own sentence when it has one, otherwise the
+    /// streak that the deck is already shouting about.
+    public static func credentialText(
+        for account: DeckAccount,
+        routedFailures alert: MemberBlackoutAlert?
+    ) -> String? {
+        if let recorded = credentialText(for: account) { return recorded }
+        guard let alert, credentialIsBroken(account, routedFailures: alert) else { return nil }
+        return routedFailureText(alert)
     }
 
     /// Whether the repair is reachable at all for this account. Reachable
@@ -164,10 +218,16 @@ public struct ProxyReloginRowPresentation: Equatable, Sendable {
     /// The credential one-liner beside the pool's own status text, or nil.
     public var credentialText: String?
     public var display: Display
+    /// Issue #515: whether this member's sign-in is broken by EITHER measure —
+    /// the recorded credential or the measured routed-failure streak. The row
+    /// reads this instead of re-deriving from the account, so the deck banner
+    /// and the Settings row can never reach opposite conclusions.
+    public var credentialIsBroken: Bool
 
-    public init(credentialText: String?, display: Display) {
+    public init(credentialText: String?, display: Display, credentialIsBroken: Bool = false) {
         self.credentialText = credentialText
         self.display = display
+        self.credentialIsBroken = credentialIsBroken
     }
 }
 
@@ -212,11 +272,21 @@ public final class ProxyReloginModel: ObservableObject {
 
     /// The row's complete repair rendering, or nil when nothing about this
     /// account's repair should appear anywhere.
-    public func presentation(for account: DeckAccount) -> ProxyReloginRowPresentation? {
+    ///
+    /// Issue #515: `routedFailures` is the deck's own #395 alert for this
+    /// account (nil when there is none, or on a daemon that omits the block).
+    /// It is the ONE input that promotes the repair on measured evidence, and
+    /// the deck banner renders from this same value — one derivation, two
+    /// surfaces.
+    public func presentation(
+        for account: DeckAccount,
+        routedFailures alert: MemberBlackoutAlert? = nil
+    ) -> ProxyReloginRowPresentation? {
         let phase = phases[account.id]
         let note = notes[account.id]
         let error = errors[account.id]
-        let credential = ProxyRelogin.credentialText(for: account)
+        let credential = ProxyRelogin.credentialText(for: account, routedFailures: alert)
+        let isBroken = ProxyRelogin.credentialIsBroken(account, routedFailures: alert)
         guard ProxyRelogin.isOffered(for: account) || phase != nil || note != nil || error != nil else {
             return nil
         }
@@ -233,13 +303,17 @@ public final class ProxyReloginModel: ObservableObject {
         } else if let reason = ProxyRelogin.unavailableReason(for: account) {
             display = .unavailable(reason: reason)
         } else if ProxyRelogin.isAvailable(for: account) {
-            display = .action(prominent: ProxyRelogin.credentialIsBroken(account))
+            display = .action(prominent: isBroken)
         } else if credential != nil {
             display = .quiet
         } else {
             return nil
         }
-        return ProxyReloginRowPresentation(credentialText: credential, display: display)
+        return ProxyReloginRowPresentation(
+            credentialText: credential,
+            display: display,
+            credentialIsBroken: isBroken
+        )
     }
 
     /// Start the repair (AFTER the view's confirmation — the "ask each time"

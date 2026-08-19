@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import DailyChart from './DailyChart.jsx';
+import Findings from './Findings.jsx';
 import Treemap, { collapseSmall } from './Treemap.jsx';
 import {
   Badge, Segmented, Why, slotColor, useElementSize, usePersisted, NEUTRAL,
@@ -152,6 +153,60 @@ function dimensionItems(series, buckets, selection, dimension) {
     });
   }
   return items;
+}
+
+function forecastTime(row) {
+  return row?.dryAt ? 'dry at ~' + formatClock(row.dryAt) : 'no forecast';
+}
+
+function forecastBasis(report, row) {
+  const basis = report?.basisWindow?.label || 'basis unavailable';
+  if (row.status !== 'forecast') return basis + ' · ' + (row.reason || 'burn rate unavailable');
+  const carryover = row.carryover?.assumed
+    ? ' · assumes pace carries over after ' + formatClock(row.carryover.resetAt) + ' reset'
+    : '';
+  return (report.estimateLabel || 'Estimate') + ' · ' + basis + carryover;
+}
+
+/** A time and its evidence basis — deliberately no forecast chart. */
+function ExhaustionForecast({ report }) {
+  if (!report) return null;
+  const accounts = Array.isArray(report.accounts) ? report.accounts : [];
+  const worst = report.pool?.worstCase || null;
+  const poolCarryover = worst?.carryover?.assumed ? ' · pace carried over after reset' : '';
+  return (
+    <section className="card compact exhaustion-forecast">
+      <div className="card-head">
+        <h2 className="card-title">Exhaustion forecast</h2>
+        <span className="card-note">
+          Pool worst · {worst ? worst.accountLabel + ' · ' + forecastTime(worst) + poolCarryover : 'no forecast'}
+        </span>
+      </div>
+      {accounts.length ? (
+        <table className="data">
+          <thead>
+            <tr><th>Subscription</th><th>Forecast</th><th>Basis</th></tr>
+          </thead>
+          <tbody>
+            {accounts.map((row) => (
+              <tr key={row.accountId}>
+                <td>
+                  <span className="cell-key">
+                    <span style={{ color: providerColor(row.provider) }}>
+                      <ProviderMark provider={row.provider} size={11} />
+                    </span>
+                    {row.accountLabel}
+                  </span>
+                </td>
+                <td><strong>{forecastTime(row)}</strong></td>
+                <td className="muted">{forecastBasis(report, row)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : <div className="empty">No enabled subscriptions.</div>}
+    </section>
+  );
 }
 
 export default function Overview({ model, lens, selection, onSelect, onOpenProject }) {
@@ -512,6 +567,10 @@ export default function Overview({ model, lens, selection, onSelect, onOpenProje
           </div>
         </div>
       </section>
+
+      <ExhaustionForecast report={model.exhaustion} />
+
+      <Findings findings={model.findings} unavailable={model.findingsUnavailable} />
 
       <MoversStrip
         rows={moverRows}

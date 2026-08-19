@@ -249,13 +249,14 @@ public struct LaunchctlDaemonServiceController: LaunchdServiceControlling {
     public init() {}
 
     public func probeService() async -> LaunchdServiceProbe {
-        // Exit-code semantics live in the pure classifier: only launchctl's
-        // explicit "could not find service" (113) reads as absent; every
-        // other failure — including launchctl not running at all — is
-        // unknown and can never trigger the wedge repair.
-        classifyLaunchctlPrintExit(
-            await Self.runLaunchctl(["print", "gui/\(getuid())/\(Self.label)"])
-        )
+        // Classification semantics live in the pure classifier: only
+        // launchctl's explicit "could not find service" (113) reads as
+        // absent; every other failure — including launchctl not running at
+        // all — is unknown and can never trigger the wedge repair. Issue
+        // #514: the job record's own text is read too, because a job wedged
+        // by a stale launch constraint still prints with exit 0.
+        let result = await Self.runLaunchctl(["print", "gui/\(getuid())/\(Self.label)"])
+        return classifyLaunchctlPrint(exitCode: result.status, output: result.output)
     }
 
     public func bootOutService() async {
@@ -282,22 +283,39 @@ public struct LaunchctlDaemonServiceController: LaunchdServiceControlling {
         }
     }
 
+    /// A launchctl invocation's exit status and whatever it printed.
+    struct LaunchctlResult {
+        var status: Int32
+        var output: String
+    }
+
     /// Runs /bin/launchctl without ever blocking the calling actor — the
     /// model drives this from the main actor at launch — and with a hard
     /// deadline: a hung launchctl is terminated and reported as the same
     /// synthetic 127 as "couldn't launch", which the classifier maps to
     /// `.unknown` (never repair, never bootout on a probe that didn't
     /// actually answer).
+    ///
+    /// stdout is captured through a temporary file rather than a `Pipe`:
+    /// `launchctl print` can outrun the pipe buffer, and draining a pipe
+    /// only after the process exits would deadlock. Any capture failure
+    /// yields empty output, which classifies as `.loaded`/`.unknown` — the
+    /// non-repairing readings.
     private static func runLaunchctl(
         _ arguments: [String],
         deadline: TimeInterval = 5
-    ) async -> Int32 {
-        await withCheckedContinuation { continuation in
+    ) async -> LaunchctlResult {
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("modeldeck-launchctl-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        FileManager.default.createFile(atPath: outputURL.path, contents: nil)
+        let sink = try? FileHandle(forWritingTo: outputURL)
+        let status = await withCheckedContinuation { continuation in
             let resumeOnce = ResumeOnce(continuation)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
             process.arguments = arguments
-            process.standardOutput = FileHandle.nullDevice
+            process.standardOutput = sink ?? FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             process.terminationHandler = { finished in
                 resumeOnce.resume(finished.terminationStatus)
@@ -314,6 +332,9 @@ public struct LaunchctlDaemonServiceController: LaunchdServiceControlling {
                 resumeOnce.resume(127)
             }
         }
+        try? sink?.close()
+        let output = (try? String(contentsOf: outputURL, encoding: .utf8)) ?? ""
+        return LaunchctlResult(status: status, output: output)
     }
 }
 
@@ -371,6 +392,70 @@ public enum HostCodeSignature {
     }
 }
 
+// MARK: - Bundled daemon signature (issue #514)
+
+/// Verifies Contents/Resources/daemon/modeldeckd — the binary launchd is
+/// asked to spawn — before the stale-launch-constraint repair re-registers
+/// the service. The 2026-08-18 incident's tell was precisely that this
+/// binary was fine (`codesign -vv` valid, designated requirement satisfied,
+/// ran cleanly by hand) while launchd kept enforcing the OLD binary's
+/// constraint; the repair is only correct in that direction, so a binary
+/// that does NOT check out must leave the registration alone.
+///
+/// Fail-closed on purpose: anything other than a fully verified, production-
+/// team binary reads as "don't repair".
+public struct BundledDaemonSignature: BundledDaemonVerifying {
+    private let bundle: Bundle
+
+    public init(bundle: Bundle = .main) {
+        self.bundle = bundle
+    }
+
+    /// Same location release-dmg.sh stages the daemon at, next to the
+    /// manifest the bundled-commit check already reads.
+    public var binaryURL: URL? {
+        bundle.url(forResource: "modeldeckd", withExtension: nil, subdirectory: "daemon")
+    }
+
+    public func verifyBundledDaemon() async -> BundledDaemonVerification {
+        guard let url = binaryURL else { return .unavailable }
+        // Hashing a SEA binary is not main-actor work.
+        return await Task.detached(priority: .userInitiated) {
+            Self.verify(at: url)
+        }.value
+    }
+
+    static func verify(at url: URL) -> BundledDaemonVerification {
+        var staticCodeRef: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &staticCodeRef) == errSecSuccess,
+              let staticCode = staticCodeRef
+        else { return .unavailable }
+        // 1. The signature validates against the bytes on disk.
+        guard SecStaticCodeCheckValidity(staticCode, [], nil) == errSecSuccess
+        else { return .invalid }
+        // 2. It satisfies its OWN designated requirement — the check the
+        //    live diagnosis ran by hand.
+        var requirementRef: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirementRef) == errSecSuccess,
+              let requirement = requirementRef,
+              SecStaticCodeCheckValidity(staticCode, [], requirement) == errSecSuccess
+        else { return .invalid }
+        // 3. And it is the production app's own daemon, not some other
+        //    validly signed binary that happens to sit at that path (the
+        //    #486 bar, reused verbatim).
+        var infoRef: CFDictionary?
+        guard SecCodeCopySigningInformation(
+            staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &infoRef
+        ) == errSecSuccess, let info = infoRef as? [String: Any]
+        else { return .unavailable }
+        let allowed = HostCodeSignature.allowsServiceManagement(
+            flags: (info[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0,
+            teamIdentifier: info[kSecCodeInfoTeamIdentifier as String] as? String
+        )
+        return allowed ? .valid : .invalid
+    }
+}
+
 // MARK: - Assembly
 
 extension DaemonSetupModel.Dependencies {
@@ -385,6 +470,7 @@ extension DaemonSetupModel.Dependencies {
             marker: UserDefaultsRegistrationMarker(),
             probe: client,
             launchdControl: LaunchctlDaemonServiceController(),
+            bundledDaemon: BundledDaemonSignature(bundle: bundle),
             bundledCommit: DaemonBundleManifest.load(from: bundle)?.MDGitCommit,
             hostSignatureAllowsServiceManagement:
                 HostCodeSignature.currentProcessAllowsServiceManagement()

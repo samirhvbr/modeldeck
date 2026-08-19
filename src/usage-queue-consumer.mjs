@@ -14,6 +14,7 @@ function summary() {
     duplicates: 0,
     resolved: 0,
     unresolved: 0,
+    riderRejections: 0,
     warnings: {
       keyFile: 0,
       requestFailures: 0,
@@ -126,7 +127,10 @@ export class UsageQueueConsumer {
 
     let pull;
     try {
-      pull = parseUsagePull(await response.text(), { machine: this.machine });
+      pull = parseUsagePull(await response.text(), {
+        machine: this.machine,
+        resolveClientKeyProfile: (keySha256) => this.store.clientKeyProfile?.(keySha256) ?? null,
+      });
       if (pull.kind === 'instances') throw new Error('unexpected instances envelope');
     } catch {
       result.warnings.malformedBodies += 1;
@@ -137,10 +141,17 @@ export class UsageQueueConsumer {
     if (pull.kind === 'empty') return result;
     result.records = pull.records.length;
     result.warnings.malformedRecords = pull.malformedRecords.length;
+    result.riderRejections = pull.riderRejections;
     if (pull.malformedRecords.length > 0) {
       emit(
         this.warn,
         `usage queue pull skipped malformed records: count=${pull.malformedRecords.length} (warnings=${pull.malformedRecords.length})`,
+      );
+    }
+    if (pull.riderRejections > 0) {
+      emit(
+        this.warn,
+        `usage queue rejected rider fields: count=${pull.riderRejections}`,
       );
     }
 

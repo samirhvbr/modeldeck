@@ -46,6 +46,7 @@ function schedulerFixture({ store = new Store(':memory:'), ...overrides } = {}) 
   const service = new ModelDeckService(store, {
     claudeProfilesDir: '/tmp/modeldeck-warehouse-claude-placeholder',
     codexProfilesDir: '/tmp/modeldeck-warehouse-codex-placeholder',
+    grokSessionsDir: '/tmp/modeldeck-warehouse-grok-placeholder',
     ingestTranscriptArchive: async (options) => {
       calls.push({ name: 'transcriptArchive', options });
       return { warnings: 0 };
@@ -53,6 +54,14 @@ function schedulerFixture({ store = new Store(':memory:'), ...overrides } = {}) 
     ingestCodexRollouts: async (options) => {
       calls.push({ name: 'codexRollouts', options });
       return { warnings: { malformedLines: 0 } };
+    },
+    ingestGrokSessions: async (options) => {
+      calls.push({ name: 'grokSessions', options });
+      return { warnings: { malformedLines: 0, schemaDriftFields: 0 } };
+    },
+    runDiagnostician: (options) => {
+      calls.push({ name: 'diagnostician', options });
+      return { detectors: 1, findings: 0 };
     },
     refitUsageEstimates: (receivedStore) => {
       calls.push({ name: 'usageEstimateRefit', store: receivedStore });
@@ -157,7 +166,7 @@ test('TRIPWIRE: settings API immediately reschedules warehouse ingest when analy
   }
 });
 
-test('TRIPWIRE: every warehouse pass schedules transcript archive, Codex rollouts, and usage-estimate refit', async () => {
+test('TRIPWIRE: every warehouse pass ingests all three corpora, scans findings, and refits usage estimates', async () => {
   const data = schedulerFixture();
   try {
     const starting = data.service.startWarehouseIngest();
@@ -167,13 +176,20 @@ test('TRIPWIRE: every warehouse pass schedules transcript archive, Codex rollout
     assert.deepEqual(data.calls.map((call) => call.name), [
       'transcriptArchive',
       'codexRollouts',
+      'grokSessions',
+      'diagnostician',
       'usageEstimateRefit',
     ]);
     assert.equal(data.calls[0].options.store, data.store);
     assert.equal(data.calls[0].options.directory, '/tmp/modeldeck-warehouse-claude-placeholder');
     assert.equal(data.calls[1].options.store, data.store);
     assert.equal(data.calls[1].options.profilesRoot, '/tmp/modeldeck-warehouse-codex-placeholder');
-    assert.equal(data.calls[2].store, data.store);
+    assert.equal(data.calls[2].options.store, data.store);
+    assert.equal(data.calls[2].options.sessionsRoot, '/tmp/modeldeck-warehouse-grok-placeholder');
+    assert.equal(data.calls[3].options.store, data.store);
+    assert.equal(typeof data.calls[3].options.logger, 'function');
+    assert.equal(data.calls[3].options.yieldToServeLoop, data.service.yieldToServeLoop);
+    assert.equal(data.calls[4].store, data.store);
     assert.equal(data.timers.timers.size, 1);
 
     const status = data.service.warehouseIngestStatus();
@@ -184,6 +200,8 @@ test('TRIPWIRE: every warehouse pass schedules transcript archive, Codex rollout
     assert.deepEqual(Object.keys(status.lastPass.jobs), [
       'transcriptArchive',
       'codexRollouts',
+      'grokSessions',
+      'diagnostician',
       'usageEstimateRefit',
     ]);
     assert.deepEqual((await data.service.state()).warehouseIngest, status,
@@ -193,9 +211,13 @@ test('TRIPWIRE: every warehouse pass schedules transcript archive, Codex rollout
     assert.deepEqual(data.calls.map((call) => call.name), [
       'transcriptArchive',
       'codexRollouts',
+      'grokSessions',
+      'diagnostician',
       'usageEstimateRefit',
       'transcriptArchive',
       'codexRollouts',
+      'grokSessions',
+      'diagnostician',
       'usageEstimateRefit',
     ]);
     assert.equal(data.timers.timers.size, 1, 'the recurring pass re-arms one timer');
@@ -203,6 +225,26 @@ test('TRIPWIRE: every warehouse pass schedules transcript archive, Codex rollout
     await data.service.stopWarehouseIngest();
     data.store.close();
   }
+});
+
+test('TRIPWIRE: an unconfigured Grok root cannot escape an isolated service fixture', async (t) => {
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  let grokCalls = 0;
+  const service = new ModelDeckService(store, {
+    claudeProfilesDir: '/tmp/modeldeck-warehouse-isolated-claude-placeholder',
+    codexProfilesDir: '/tmp/modeldeck-warehouse-isolated-codex-placeholder',
+    ingestTranscriptArchive: async () => ({ warnings: 0 }),
+    ingestCodexRollouts: async () => ({ warnings: {} }),
+    ingestGrokSessions: async () => { grokCalls += 1; return { warnings: {} }; },
+    runDiagnostician: async () => ({ detectors: 0, findings: 0 }),
+    refitUsageEstimates: () => ({ pools: 0 }),
+  });
+
+  const outcomes = await service.runWarehouseIngestPass();
+
+  assert.equal(grokCalls, 0, 'only an explicitly configured Grok root may be read');
+  assert.equal(Object.hasOwn(outcomes, 'grokSessions'), false);
 });
 
 test('analytics kill switch disarms warehouse ingest and rejects a stale generation tick', async () => {
@@ -220,7 +262,7 @@ test('analytics kill switch disarms warehouse ingest and rejects a stale generat
     );
     await awaitCurrentPass(data.service, data.timers);
     await enabling;
-    assert.equal(data.calls.length, 3);
+    assert.equal(data.calls.length, 5);
     assert.equal(data.timers.timers.size, 1);
     const staleTick = data.timers.timers.values().next().value.callback;
 
@@ -230,7 +272,7 @@ test('analytics kill switch disarms warehouse ingest and rejects a stale generat
     assert.equal(data.timers.timers.size, 0);
     staleTick();
     await data.timers.flush();
-    assert.equal(data.calls.length, 3, 'a cleared timer from the old generation cannot run');
+    assert.equal(data.calls.length, 5, 'a cleared timer from the old generation cannot run');
     assert.equal(data.timers.timers.size, 0);
   } finally {
     await data.service.stopWarehouseIngest();
@@ -246,6 +288,7 @@ test('disabling warehouse ingest waits for an in-flight pass before completing',
   const service = new ModelDeckService(store, {
     ingestTranscriptArchive: () => transcriptGate,
     ingestCodexRollouts: async () => ({ warnings: {} }),
+    ingestGrokSessions: async () => ({ warnings: {} }),
     refitUsageEstimates: () => ({ pools: 1 }),
     setTimeout: timers.setTimeout,
     clearTimeout: timers.clearTimeout,
@@ -285,7 +328,7 @@ test('demo fixture daemon never schedules warehouse ingest', async () => {
   }
 });
 
-test('failed warehouse ingest job logs and the daemon reschedules all three paths', async () => {
+test('failed warehouse ingest job logs and the daemon reschedules all five paths', async () => {
   let transcriptAttempts = 0;
   const logs = [];
   const data = schedulerFixture({
@@ -305,6 +348,8 @@ test('failed warehouse ingest job logs and the daemon reschedules all three path
     assert.deepEqual(data.calls.map((call) => call.name), [
       'transcriptArchive',
       'codexRollouts',
+      'grokSessions',
+      'diagnostician',
       'usageEstimateRefit',
     ], 'one failed job does not skip the remaining paths');
     assert.equal(first.transcriptArchive.ok, false);
@@ -318,9 +363,13 @@ test('failed warehouse ingest job logs and the daemon reschedules all three path
     assert.deepEqual(data.calls.map((call) => call.name), [
       'transcriptArchive',
       'codexRollouts',
+      'grokSessions',
+      'diagnostician',
       'usageEstimateRefit',
       'transcriptArchive',
       'codexRollouts',
+      'grokSessions',
+      'diagnostician',
       'usageEstimateRefit',
     ]);
     assert.equal(data.timers.timers.size, 1, 'the successful retry keeps the loop recurring');

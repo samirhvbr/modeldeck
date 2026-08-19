@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { extractIdentity } from './identity.mjs';
 import { claudeCredentialsPresent } from './claude-keychain.mjs';
 import { createProviderProfileHelpers, activeLinkBlockedError } from './provider-profile.mjs';
+import { LEGACY_CLIENT_KEY_SERVICE, assertClientKeyService } from '../client-key-helper.mjs';
 
 const execFileAsync = promisify(execFile);
 const usageProbePath = isSea() ? null : fileURLToPath(new URL('./claude-usage-probe.mjs', import.meta.url));
@@ -289,13 +290,20 @@ const assertOwnerOnlyDirectory = claudeProfile.assertOwnerOnlyDirectory;
 /// export, same stale-managed-key clear, and xtrace suspended around the
 /// credential handling — a preview a user pastes under `zsh -x` must be
 /// exactly as trace-safe as the generated env file.
-export function claudeProxyPointerShellSnippet() {
+/// Issue #522: the Keychain SERVICE is per-profile
+/// (`cli-proxy-api-client.<slug>`); callers pass the service their profile's
+/// recorded helper state names, and the default keeps a caller that has no
+/// record on the pre-#522 shared item. `assertClientKeyService` refuses any
+/// name ModelDeck did not derive, so nothing unvalidated is interpolated
+/// into this command string (design §3.5).
+export function claudeProxyPointerShellSnippet(keychainService = LEGACY_CLIENT_KEY_SERVICE) {
+  const service = assertClientKeyService(keychainService);
   return [
     // An inherited stale __modeldeck_xtrace=1 must not re-enable tracing
     // for a shell that never had it on (CodeRabbit, PR #301).
     'unset __modeldeck_xtrace',
     'case $- in *x*) __modeldeck_xtrace=1; set +x;; esac',
-    '__modeldeck_key="$("${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s cli-proxy-api-client -w 2>/dev/null || true)"',
+    `__modeldeck_key="$("\${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s ${service} -w 2>/dev/null || true)"`,
     'if [ -n "${__modeldeck_key:-}" ]; then export ANTHROPIC_API_KEY="$__modeldeck_key" MODELDECK_MANAGED_ANTHROPIC_API_KEY=1',
     'elif [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY; fi',
     'unset __modeldeck_key',
@@ -304,10 +312,18 @@ export function claudeProxyPointerShellSnippet() {
   ].join('; ');
 }
 
-export function claudePinnedEnvFileContent(profileRealPath, proxyRouted = false) {
+export function claudePinnedEnvFileContent(
+  profileRealPath,
+  proxyRouted = false,
+  keychainService = LEGACY_CLIENT_KEY_SERVICE,
+) {
   if (!profileRealPath || typeof profileRealPath !== 'string') {
     throw new Error('Claude profile real path is required');
   }
+  // Issue #522: validated even when the block is not emitted, so a caller
+  // that resolved a bad service name fails at the writer rather than
+  // silently pinning the wrong profile's key on the next activation.
+  const service = assertClientKeyService(keychainService);
   const quoted = `'${profileRealPath.replaceAll("'", `'\\''`)}'`;
   return [
     '# Written by ModelDeck at account activation. Do not edit.',
@@ -346,7 +362,7 @@ export function claudePinnedEnvFileContent(profileRealPath, proxyRouted = false)
       // can stand in a fake without touching the real Keychain; it carries
       // no security cost (anyone who controls the sourcing environment
       // already controls PATH).
-      '  __modeldeck_key="$("${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s cli-proxy-api-client -w 2>/dev/null || true)"',
+      `  __modeldeck_key="$("\${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password -s ${service} -w 2>/dev/null || true)"`,
       '  if [ -n "${__modeldeck_key:-}" ]; then',
       '    export ANTHROPIC_API_KEY="$__modeldeck_key"',
       '    export MODELDECK_MANAGED_ANTHROPIC_API_KEY=1',

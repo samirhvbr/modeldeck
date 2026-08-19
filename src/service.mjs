@@ -33,6 +33,13 @@ import {
   statuslineSessionDir,
   statuslineSnapshotsFromCapture,
 } from './adapters/claude-statusline.mjs';
+import {
+  LEGACY_CLIENT_KEY_HELPER,
+  classifyClaudeHelper,
+  clientKeyHelperCommand,
+  clientKeyService,
+  clientKeyServiceForRecord,
+} from './client-key-helper.mjs';
 import { claudeModelTier, isModelDowngrade, isModelRecovery } from './model-tier.mjs';
 import {
   createCodexProfileHome,
@@ -55,6 +62,8 @@ import {
   proxyReloginNextPhase,
 } from './proxy-relogin.mjs';
 import {
+  REQUEST_USAGE_PRUNE_BATCH_SIZE,
+  REQUEST_USAGE_RETENTION_DAYS,
   USAGE_SNAPSHOT_PRUNE_BATCH_SIZE,
   USAGE_SNAPSHOT_RETENTION_DAYS,
 } from './db.mjs';
@@ -71,6 +80,8 @@ import {
 } from './usage-queue-guard.mjs';
 import { ingestTranscriptArchive } from './transcript-ingest.mjs';
 import { ingestCodexRollouts } from './codex-rollout-ingest.mjs';
+import { ingestGrokSessions } from './grok-session-ingest.mjs';
+import { runDiagnostician as scanDiagnostician } from './diagnostician.mjs';
 import { refitUsageEstimates } from './usage-estimate.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -141,7 +152,10 @@ const CLAUDE_AUTH_OVERRIDE_ABSENT = Object.freeze({
   helperRouted: false,
 });
 
-export const CLIPROXY_API_KEY_HELPER = 'security find-generic-password -s cli-proxy-api-client -w';
+/// Issue #522: the pre-per-profile shared helper, kept under its historic
+/// export name because it is still what an un-migrated profile is wired to
+/// and what the guard admits without an ownership record.
+export const CLIPROXY_API_KEY_HELPER = LEGACY_CLIENT_KEY_HELPER;
 export const DEFAULT_CLIPROXY_BASE_URL = 'http://127.0.0.1:8317';
 const DEFAULT_PROXY_JOIN_POLL_INTERVAL_MS = 2_000;
 const DEFAULT_PROXY_JOIN_TIMEOUT_MS = 5 * 60_000;
@@ -412,6 +426,20 @@ class ClaudeProxyRoutingConflictError extends Error {
   }
 }
 
+// Issue #520 bounds for the app's client-key report. The entry cap is a
+// structural bound on a token-gated but still untrusted body; the empty-key
+// hash is refused because a keyless proxy request reports `api_key: ""`
+// (recon V1) and must always resolve to honest NULL.
+const CLIENT_KEY_REPORT_MAX_ENTRIES = 1000;
+// The generation ratchet's ceiling, and how far ahead of the applied value a
+// single report may jump. The ceiling alone would only move the poisoning
+// problem to a lower number; the jump bound is what makes it unreachable,
+// since the counter can never be pushed far past reality in one step. Both
+// are astronomically above real use: the app bumps once per provisioning.
+const CLIENT_KEY_REPORT_MAX_GENERATION = 1_000_000_000;
+export const CLIENT_KEY_REPORT_MAX_GENERATION_JUMP = 1_000_000;
+const SHA256_OF_EMPTY_STRING = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
+
 function serviceError(message, statusCode) {
   const error = new Error(message);
   error.statusCode = statusCode;
@@ -645,6 +673,10 @@ export class ModelDeckService {
     this.codexPath = options.codexPath || 'codex';
     this.codexActiveLink = options.codexActiveLink || path.join(os.homedir(), '.codex');
     this.codexProfilesDir = options.codexProfilesDir || path.join(os.homedir(), '.codex-profiles');
+    // External Grok data is opt-in at this seam. The production composition
+    // root passes GROK_SESSIONS_DIR; isolated service fixtures therefore cannot
+    // fall through to the user's real ~/.grok store.
+    this.grokSessionsDir = options.grokSessionsDir || null;
     this.fetchClaude = options.fetchClaude || fetchClaudeUsage;
     this.fetchCodex = options.fetchCodex || fetchCodexRateLimits;
     this.activateClaude = options.activateClaude || activateClaudeProfile;
@@ -663,6 +695,16 @@ export class ModelDeckService {
       || claudeCredentialKeychainSlotState;
     this.migrateClaude = options.migrateClaude || migrateClaudeSwapProfiles;
     this.exec = options.exec || options.execFile || options.run || execFileAsync;
+    // Issue #2 (public tracker): the bundled daemon's launchd plist carries a
+    // static PATH, and launchd never expands $HOME — so PATH alone cannot see
+    // home-relative install directories like ~/.local/bin, where Anthropic's
+    // native installer puts `claude`. These directories are probed by
+    // absolute path whenever PATH resolution comes up empty.
+    this.toolPathFallbackDirs = options.toolPathFallbackDirs || [
+      path.join(os.homedir(), '.local', 'bin'),
+      '/opt/homebrew/bin',
+      '/usr/local/bin',
+    ];
     this.childEnv = options.childEnv || process.env;
     this.userInfo = options.userInfo || os.userInfo;
     this.listProviderProcesses = options.listProviderProcesses || (async () => {
@@ -686,8 +728,11 @@ export class ModelDeckService {
       || ((count) => {
         if (count > 0) console.log(`[modeldeck] usage snapshots pruned: ${count}`);
       });
+    this.logRequestUsagePrune = options.logRequestUsagePrune
+      || ((count) => console.log(`[modeldeck] request usage pruned: ${count}`));
     this.usageSnapshotPruneTimer = null;
     this.usageSnapshotPrunePromise = null;
+    this.requestUsagePrunePromise = null;
     this.usageSnapshotPruneStarted = false;
     this.usageSnapshotPruneGeneration = 0;
     this.usageQueueConsumerTimer = null;
@@ -708,6 +753,8 @@ export class ModelDeckService {
     this.managedProxyAppReport = null;
     this.ingestTranscriptArchive = options.ingestTranscriptArchive || ingestTranscriptArchive;
     this.ingestCodexRollouts = options.ingestCodexRollouts || ingestCodexRollouts;
+    this.ingestGrokSessions = options.ingestGrokSessions || ingestGrokSessions;
+    this.runDiagnostician = options.runDiagnostician || scanDiagnostician;
     this.refitUsageEstimates = options.refitUsageEstimates || refitUsageEstimates;
     this.warehouseIngestMachine = options.warehouseIngestMachine || 'studio';
     this.logWarehouseIngest = options.logWarehouseIngest
@@ -845,7 +892,7 @@ export class ModelDeckService {
   }
 
   // -------------------------------------------------------------------------
-  // Issue #181 — bounded usage snapshot retention.
+  // Issue #181/#499 — bounded usage retention.
 
   /// Start independently of provider auto-refresh: maintenance must still run
   /// when polling is disabled and in credential-free demo fixture mode. Store
@@ -864,12 +911,18 @@ export class ModelDeckService {
     this.usageSnapshotPruneTimer = null;
     // The Store is closed immediately after app.close(), so let a batch already
     // in progress finish before the caller can close its SQLite connection.
-    await (this.usageSnapshotPrunePromise || Promise.resolve()).catch(() => {});
+    await Promise.all([
+      (this.usageSnapshotPrunePromise || Promise.resolve()).catch(() => {}),
+      (this.requestUsagePrunePromise || Promise.resolve()).catch(() => {}),
+    ]);
   }
 
   runScheduledUsageSnapshotPrune(generation) {
-    void this.pruneUsageSnapshots().catch((error) => {
-      console.error(`[modeldeck] usage snapshot prune failed: ${error?.message || error}`);
+    void Promise.all([
+      this.pruneUsageSnapshots(),
+      this.pruneRequestUsage(),
+    ]).catch((error) => {
+      console.error(`[modeldeck] usage retention prune failed: ${error?.message || error}`);
     }).finally(() => {
       if (!this.usageSnapshotPruneStarted || generation !== this.usageSnapshotPruneGeneration) return;
       this.usageSnapshotPruneTimer = this.setTimeout(() => {
@@ -904,6 +957,36 @@ export class ModelDeckService {
     this.usageSnapshotPrunePromise = promise;
     const clear = () => {
       if (this.usageSnapshotPrunePromise === promise) this.usageSnapshotPrunePromise = null;
+    };
+    void promise.then(clear, clear);
+    return promise;
+  }
+
+  /// Drain request evidence older than the settled 400-day policy through the
+  /// same bounded, yielding shape as usage snapshot retention.
+  pruneRequestUsage() {
+    if (this.requestUsagePrunePromise) return this.requestUsagePrunePromise;
+    const cutoff = new Date(this.now() - REQUEST_USAGE_RETENTION_DAYS * DAY_MS).toISOString();
+    const promise = (async () => {
+      let total = 0;
+      try {
+        while (true) {
+          const pruned = this.store.pruneRequestUsageBatch({
+            cutoff,
+            batchSize: REQUEST_USAGE_PRUNE_BATCH_SIZE,
+          });
+          total += pruned;
+          if (pruned < REQUEST_USAGE_PRUNE_BATCH_SIZE) break;
+          await this.yieldToServeLoop();
+        }
+      } finally {
+        this.logRequestUsagePrune(total);
+      }
+      return total;
+    })();
+    this.requestUsagePrunePromise = promise;
+    const clear = () => {
+      if (this.requestUsagePrunePromise === promise) this.requestUsagePrunePromise = null;
     };
     void promise.then(clear, clear);
     return promise;
@@ -1081,6 +1164,7 @@ export class ModelDeckService {
         at: new Date(this.now()).toISOString(),
         records: Number(result?.records || 0),
         inserted: Number(result?.inserted || 0),
+        riderRejections: Number(result?.riderRejections || 0),
         warnings: usageQueueWarningCount(result),
       };
       return result;
@@ -1186,6 +1270,16 @@ export class ModelDeckService {
           profilesRoot: this.codexProfilesDir,
           machine: this.warehouseIngestMachine,
         })],
+        ...(this.grokSessionsDir ? [['grokSessions', () => this.ingestGrokSessions({
+          store: this.store,
+          sessionsRoot: this.grokSessionsDir,
+          machine: this.warehouseIngestMachine,
+        })]] : []),
+        ['diagnostician', () => this.runDiagnostician({
+          store: this.store,
+          logger: (message) => this.logWarehouseIngest(message),
+          yieldToServeLoop: this.yieldToServeLoop,
+        })],
         ['usageEstimateRefit', () => this.refitUsageEstimates(this.store)],
       ];
       const outcomes = {};
@@ -1194,7 +1288,7 @@ export class ModelDeckService {
           const result = await run();
           const warnings = name === 'transcriptArchive'
             ? Number(result?.warnings || 0)
-            : name === 'codexRollouts'
+            : ['codexRollouts', 'grokSessions'].includes(name)
               ? Object.values(result?.warnings || {}).reduce((total, count) => total + Number(count || 0), 0)
               : 0;
           outcomes[name] = { ok: true, warnings };
@@ -2095,11 +2189,19 @@ export class ModelDeckService {
       metadata.identitySource = identitySource;
     }
     const identity = latest.identity || (identitySource ? profileIdentity.identity : '');
-    if (identity === latest.identity && JSON.stringify(metadata) === JSON.stringify(latest.metadata)) return latest;
+    // The identity-seed lookup above is another await AFTER the rebase, so
+    // rebase once more on the freshest row for every daemon-owned key this
+    // call does not author — #522's ownership record, and the narrow
+    // claudeRenewal/claudePlan windows for free.
+    const authored = [];
+    if (rateLimitTier) authored.push('claudePlan');
+    if (identitySource) authored.push('claudeAccountUuid', 'identitySource');
+    const rebased = this.mergeDaemonMetadataAtPersist(latest.id, metadata, authored);
+    if (identity === latest.identity && JSON.stringify(rebased) === JSON.stringify(latest.metadata)) return latest;
     return this.store.saveAccount({
       id: latest.id, provider: latest.provider, label: latest.label,
       profileRef: latest.profileRef, identity, color: latest.color,
-      enabled: latest.enabled, metadata,
+      enabled: latest.enabled, metadata: rebased,
     });
   }
 
@@ -2237,43 +2339,89 @@ export class ModelDeckService {
   // Daemon-owned metadata keys are written by verify/refresh, never by API
   // callers — an edit that re-sends a stale metadata object must not clobber
   // them (CodeRabbit, PR #29).
-  static DAEMON_OWNED_METADATA = ['claudePlan', 'claudeAccountUuid', 'identitySource', 'claudeRenewal', 'codexPlan', 'migratedFromClaudeSwap'];
+  //
+  // Issue #522: `clientKeyHelper` is the foreign-helper guard's ownership
+  // record, and it is daemon-owned in BOTH directions. A stale re-send that
+  // dropped it would leave settings.json on the per-profile helper while the
+  // shell env re-pinned the legacy item — two surfaces fetching different
+  // profiles' keys, the exact mis-attribution this record exists to prevent —
+  // and would then 409 every wire and unwire. A caller-SUPPLIED value is
+  // equally dangerous in reverse: it would let an API client declare an
+  // arbitrary helper "ours" and have ModelDeck overwrite or delete it. The
+  // stored value therefore always wins over whatever the input carries.
+  static DAEMON_OWNED_METADATA = ['claudePlan', 'claudeAccountUuid', 'identitySource', 'claudeRenewal', 'codexPlan', 'migratedFromClaudeSwap', 'clientKeyHelper'];
+
+  /// Must be applied at the PERSISTENCE POINT, not on entry to an async
+  /// caller. It reads the stored row and returns the merged input
+  /// synchronously, so a call adjacent to `store.saveAccount` is atomic
+  /// against the event loop; a snapshot taken before an `await` is not.
+  /// `saveAccount` awaits profile validation and the explainer install
+  /// between the two, and a client-key migration landing in that window would
+  /// otherwise be erased by the pending save committing its stale snapshot —
+  /// the same wipe the daemon-owned list exists to prevent, arriving by
+  /// timing instead of by stale re-send (CodeRabbit, PR #532).
+  /// Rebase daemon-owned metadata on the FRESHEST stored row, for a caller
+  /// about to persist. `authored` names the daemon-owned keys this particular
+  /// call legitimately writes — a verify refreshing `claudePlan`, say — and
+  /// those are left alone; every other daemon-owned key is taken from the
+  /// fresh row, or dropped when the fresh row has none.
+  ///
+  /// Call it IMMEDIATELY before the write. Read-merge-write is synchronous
+  /// and therefore atomic against the event loop; a snapshot taken before an
+  /// `await` is not, and every clobber in this class came from exactly that.
+  mergeDaemonMetadataAtPersist(accountId, metadata, authored = []) {
+    const freshest = this.store.getAccount(accountId);
+    const merged = { ...metadata };
+    for (const key of ModelDeckService.DAEMON_OWNED_METADATA) {
+      if (authored.includes(key)) continue;
+      // The STORED value always wins: present, it is restored over whatever
+      // the caller sent; absent, a caller-supplied value is dropped rather
+      // than adopted. Restoring alone would still let an API client mint
+      // daemon-owned state on an account that has none — for #522's
+      // `clientKeyHelper` that means declaring an arbitrary helper "ours"
+      // and having ModelDeck overwrite or delete it.
+      const stored = freshest?.metadata?.[key];
+      if (stored !== undefined) merged[key] = stored;
+      else delete merged[key];
+    }
+    return merged;
+  }
 
   preserveDaemonMetadata(input) {
     if (!input?.id || input.metadata == null) return input;
     const existing = this.store.getAccount(input.id);
     if (!existing?.metadata) return input;
-    const kept = {};
-    for (const key of ModelDeckService.DAEMON_OWNED_METADATA) {
-      if (existing.metadata[key] !== undefined) kept[key] = existing.metadata[key];
-    }
-    return { ...input, metadata: { ...input.metadata, ...kept } };
+    // An API caller authors none of these keys.
+    return { ...input, metadata: this.mergeDaemonMetadataAtPersist(input.id, input.metadata) };
   }
 
   async saveAccount(input) {
-    input = this.preserveDaemonMetadata(input);
+    // Every `store.saveAccount` below re-reads the daemon-owned keys
+    // IMMEDIATELY before writing, so nothing that lands during the awaits in
+    // between can be clobbered by a stale snapshot. The create paths get the
+    // same treatment through their own delegation.
     if (input.provider === 'codex') {
-      if (!input.profileRef) return this.createCodexAccount(input);
+      if (!input.profileRef) return this.createCodexAccount(this.preserveDaemonMetadata(input));
       // Caller-supplied Codex homes get the same containment contract as
       // Claude: they must live inside ModelDeck's managed profiles directory.
       const profileRef = await validateCodexProfileHome({ profileRef: input.profileRef, profilesDir: this.codexProfilesDir });
-      const account = this.store.saveAccount({ ...input, profileRef });
+      const account = this.store.saveAccount(this.preserveDaemonMetadata({ ...input, profileRef }));
       if (input.isDefault) this.invalidateToolProbe();
       return account;
     }
     if (input.provider !== 'claude') {
-      const account = this.store.saveAccount(input);
+      const account = this.store.saveAccount(this.preserveDaemonMetadata(input));
       if (input.isDefault) this.invalidateToolProbe();
       return account;
     }
-    if (!input.profileRef) return this.createClaudeAccount(input);
+    if (!input.profileRef) return this.createClaudeAccount(this.preserveDaemonMetadata(input));
     const profileRef = await validateClaudeProfileHome({ profileRef: input.profileRef, profilesDir: this.claudeProfilesDir });
     try {
       await this.ensureClaudeProfileExplainer({ profileRef });
     } catch (error) {
       console.error(`[modeldeck] profile explainer install failed during Claude profile registration: ${error?.message || error}`);
     }
-    let account = this.store.saveAccount({ ...input, profileRef });
+    let account = this.store.saveAccount(this.preserveDaemonMetadata({ ...input, profileRef }));
     account = await this.refreshClaudeProfileMetadata(account);
     if (input.isDefault) this.invalidateToolProbe();
     await this.accountProfileSetChanged();
@@ -2436,6 +2584,15 @@ export class ModelDeckService {
         if (codexPlan) metadata.codexPlan = codexPlan;
         else delete metadata.codexPlan;
       }
+      // The provider auth probe above spawns the provider CLI and can run for
+      // seconds; `account` is the pre-probe snapshot. Rebase the daemon-owned
+      // keys this call does NOT author immediately before writing, or a
+      // client-key migration that landed during the probe is erased — the
+      // record rolls back to legacy, unwire 409-wedges, and the next
+      // shell-env write splits the two surfaces onto different profiles'
+      // keys (security re-review of PR #532).
+      const authored = account.provider === 'codex' ? ['codexPlan'] : [];
+      if (claudePlan) authored.push('claudePlan');
       saved = this.store.saveAccount({
         id: account.id,
         provider: account.provider,
@@ -2444,7 +2601,11 @@ export class ModelDeckService {
         identity: identityChanged ? result.identity : account.identity,
         color: account.color,
         enabled: account.enabled,
-        metadata: planChanged ? metadata : account.metadata,
+        metadata: this.mergeDaemonMetadataAtPersist(
+          account.id,
+          planChanged ? metadata : account.metadata,
+          authored,
+        ),
       });
     }
     // Login runs outside the daemon. A verification is the authoritative
@@ -3451,10 +3612,15 @@ export class ModelDeckService {
 
   async writeClaudeShellEnvFile(profileRealPath, proxyRouted = false) {
     const file = this.claudeShellEnvFile;
+    // Issue #522: the Keychain service is resolved HERE, from the profile's
+    // own recorded helper state, rather than passed by each caller — the
+    // three call sites (activation, startup reconcile, routing change) cannot
+    // then disagree about which profile's key a shell will fetch.
+    const keychainService = await this.claudeClientKeyServiceFor(profileRealPath);
     await fs.promises.mkdir(path.dirname(file), { recursive: true });
     const temporary = `${file}.modeldeck-${process.pid}-${crypto.randomUUID()}`;
     try {
-      await fs.promises.writeFile(temporary, claudePinnedEnvFileContent(profileRealPath, proxyRouted), { mode: 0o600 });
+      await fs.promises.writeFile(temporary, claudePinnedEnvFileContent(profileRealPath, proxyRouted, keychainService), { mode: 0o600 });
       await fs.promises.rename(temporary, file);
     } catch (error) {
       await fs.promises.unlink(temporary).catch(() => {});
@@ -3514,7 +3680,19 @@ export class ModelDeckService {
   }
 
   async installedToolVersion(binary) {
-    const result = await this.exec(binary, ['--version'], { timeout: 10_000, maxBuffer: 1_000_000 });
+    let result;
+    try {
+      result = await this.exec(binary, ['--version'], { timeout: 10_000, maxBuffer: 1_000_000 });
+    } catch (error) {
+      // Issue #2: ENOENT on a bare name means the daemon's PATH missed it.
+      // Retry via the known install directories before reporting the CLI
+      // missing — a native-installer claude lives in ~/.local/bin, which the
+      // bundled launchd PATH cannot include.
+      if (error?.code !== 'ENOENT' || path.isAbsolute(binary)) throw error;
+      const fallback = await this.toolPathFallback(binary);
+      if (!fallback) throw error;
+      result = await this.exec(fallback, ['--version'], { timeout: 10_000, maxBuffer: 1_000_000 });
+    }
     const version = semver(result?.stdout ?? result) || semver(result?.stderr);
     if (!version) throw new Error('version output did not contain a semantic version');
     return version;
@@ -4047,6 +4225,285 @@ export class ModelDeckService {
     }
   }
 
+  // Issue #522 — per-profile client-key helper wiring (design §2.5).
+  //
+  // ModelDeck records, per profile, the EXACT `apiKeyHelper` string it last
+  // wrote. That record is the only thing that makes a helper "ours"
+  // (`classifyClaudeHelper`), the only thing that decides which Keychain
+  // service the shell env and launch preview point at, and the thing that
+  // makes the legacy→per-profile migration resumable.
+  claudeClientKeyRecord(account) {
+    const record = account?.metadata?.clientKeyHelper;
+    return record && typeof record === 'object' && !Array.isArray(record) ? record : null;
+  }
+
+  /// The Claude account owning this profile directory. Callers pass either the
+  /// managed profile path or its resolved target, so both sides are
+  /// realpath'd. No owning account (a directory ModelDeck does not track)
+  /// keeps the pre-#522 legacy service, which is exactly today's behaviour.
+  async claudeAccountForProfile(profileRef) {
+    let target;
+    try { target = await this.realpath(profileRef); }
+    catch { return null; }
+    for (const account of this.store.listAccounts()) {
+      if (account.provider !== 'claude') continue;
+      let candidate;
+      try { candidate = await this.realpath(account.profileRef); }
+      catch { continue; }
+      if (candidate === target) return account;
+    }
+    return null;
+  }
+
+  async claudeClientKeyServiceFor(profileRef) {
+    return clientKeyServiceForRecord(this.claudeClientKeyRecord(await this.claudeAccountForProfile(profileRef)));
+  }
+
+  /// Persist (or clear) the recorded written helper state. Follows the
+  /// renewal-metadata pattern: a full saveAccount with the account's own
+  /// current fields, so no unrelated column is rewritten.
+  saveClaudeClientKeyRecord(accountId, record) {
+    const account = this.store.getAccount(accountId);
+    if (!account) return null;
+    const metadata = { ...account.metadata };
+    if (record) metadata.clientKeyHelper = record;
+    else delete metadata.clientKeyHelper;
+    this.store.saveAccount({
+      id: account.id,
+      provider: account.provider,
+      label: account.label,
+      identity: account.identity,
+      purpose: account.purpose,
+      profileRef: account.profileRef,
+      color: account.color,
+      enabled: account.enabled,
+      metadata,
+    });
+    return record;
+  }
+
+  /// The helper this profile SHOULD carry when routed: the per-profile item
+  /// once migration has provisioned one, the legacy shared item otherwise.
+  claudeDesiredHelper(account) {
+    const record = this.claudeClientKeyRecord(account);
+    return record?.mode === 'per-profile'
+      ? clientKeyHelperCommand(clientKeyServiceForRecord(record))
+      : LEGACY_CLIENT_KEY_HELPER;
+  }
+
+  /// Honest, read-only report of where this profile's wiring actually stands —
+  /// including a migration that stopped between its two files.
+  async claudeClientKeyWiring(accountId) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    if (account.provider !== 'claude') {
+      throw serviceError('client key wiring is only supported for claude accounts', 400);
+    }
+    const record = this.claudeClientKeyRecord(account);
+    const profileRef = managedClaudeProfile(account.profileRef, this.claudeProfilesDir);
+    let settingsHelper = null;
+    try {
+      const parsed = parseJsonPreservingNumberValues(await fs.promises.readFile(path.join(profileRef, 'settings.json'), 'utf8'));
+      if (isJsonObject(parsed) && typeof parsed.apiKeyHelper === 'string') settingsHelper = parsed.apiKeyHelper;
+    } catch { /* absent or unparseable settings reports as not wired */ }
+    const service = clientKeyServiceForRecord(record);
+    const active = await this.claudeProfileIsActive(profileRef).catch(() => false);
+    let shellEnvWired = null;
+    if (active) {
+      try {
+        shellEnvWired = (await fs.promises.readFile(this.claudeShellEnvFile, 'utf8'))
+          .includes(`find-generic-password -s ${service} -w`);
+      } catch { shellEnvWired = false; }
+    }
+    // The two writes are separate files and cannot be atomic together, so
+    // each is reported on its own evidence rather than inferred from the
+    // other (the #282 major-2 discipline).
+    //
+    // `settingsWired` deliberately means "settings.json carries the exact
+    // helper ModelDeck recorded writing", not merely "some helper is
+    // present". A pre-#522 install that was wired before this record existed
+    // therefore reports false until its next wire or migration records the
+    // string — honest ("we cannot prove we wrote this") rather than a claim
+    // of ownership the guard itself would refuse to make.
+    const settingsWired = Boolean(record?.helper) && settingsHelper === record.helper;
+    return {
+      accountId: account.id,
+      mode: record?.mode === 'per-profile' ? 'per-profile' : 'legacy',
+      service,
+      stage: record?.migration?.stage ?? null,
+      settingsWired,
+      shellEnvWired,
+      // D6/§2.5: the shared item is left in place and its value stays in
+      // `api-keys`, so live shells that read it at startup keep working —
+      // their requests attribute as honest NULL, never guessed.
+      legacySharedKeyStillAdmitted: record?.mode === 'per-profile',
+      // Computed from EVIDENCE, never from the recorded stage alone. A stage
+      // left over from an earlier migration — after an unwire removed the
+      // helper, say — must not report a profile as wired when neither file
+      // carries the helper any more.
+      complete: record?.migration?.stage === 'complete'
+        && settingsWired
+        && (shellEnvWired ?? true),
+    };
+  }
+
+  /// The legacy→per-profile migration, daemon half (design §2.5).
+  ///
+  /// The app owns raw keys and the proxy config: it provisions the profile's
+  /// Keychain item (#520) and appends the key — plus the legacy value, for
+  /// live-session continuity — through the consented write path (#521). This
+  /// method performs the third stage only, the two files the daemon owns, and
+  /// REFUSES until the app reports the consented config write landed: wiring
+  /// a helper to a key `api-keys` does not carry would 401 every request.
+  ///
+  /// Resumable: each stage is persisted as it completes, so a crash between
+  /// settings.json and the shell env file is picked up by the next call
+  /// instead of being redone or silently left half-applied.
+  async migrateClaudeClientKeyHelper(accountId, input = {}) {
+    const account = this.store.getAccount(accountId);
+    if (!account) throw serviceError('account not found', 404);
+    if (account.provider !== 'claude') {
+      throw serviceError('client key wiring is only supported for claude accounts', 400);
+    }
+    if (input?.configWriteVerified !== true) {
+      throw serviceError(
+        'per-profile client key migration needs the consented config write to have landed first; '
+        + 'the proxy would reject a key its api-keys list does not carry',
+        409,
+      );
+    }
+    const service = clientKeyService(account.id);
+    await this.assertClientKeyItemPresent(service);
+    return this.withClaudeActivationLock(async () => {
+      const latest = this.store.getAccount(accountId);
+      if (!latest) throw serviceError('account not found', 404);
+      const profileRef = managedClaudeProfile(latest.profileRef, this.claudeProfilesDir);
+      return this.withClaudeProfileSettingsLock(
+        profileRef,
+        () => this.applyClaudeClientKeyMigration(latest, profileRef, service),
+      );
+    });
+  }
+
+  /// Metadata-only Keychain presence check — deliberately WITHOUT `-w`, so no
+  /// key value can enter the daemon process (design §2.1: the daemon never
+  /// retains a raw client key). Only a proven item-not-found refuses; any
+  /// other failure is unknown state and refuses too, because wiring a helper
+  /// at an item that may not exist would leave sessions unauthenticated.
+  async assertClientKeyItemPresent(service) {
+    // Off darwin there is no Keychain to probe, so this check is a deliberate
+    // no-op rather than a refusal: `security` does not exist, and failing
+    // closed would make the migration impossible on the platforms the test
+    // fixtures and the Linux daemon build run on. The gate that actually
+    // matters — the consented config write — is platform-independent and
+    // still applies.
+    if (this.platform !== 'darwin') return;
+    try {
+      await this.exec('/usr/bin/security', ['find-generic-password', '-s', service], {
+        timeout: 5_000,
+        maxBuffer: 65_536,
+      });
+    } catch {
+      throw serviceError(
+        `the per-profile client key for ${service} is not in the Keychain; provision it before wiring the helper`,
+        409,
+      );
+    }
+  }
+
+  async applyClaudeClientKeyMigration(account, profileRef, service) {
+    // Same conflict rule as a routing change: never mutate settings behind a
+    // renewal or activation whose assumptions this would change.
+    this.assertClaudeProxyRoutingIdle(account.id);
+    const record = this.claudeClientKeyRecord(account);
+    if (record?.migration?.stage === 'complete' && record.service === service) {
+      // Idempotent: a re-run of a FINISHED migration reports state, never
+      // rewrites files. "Finished" is the evidence-backed `complete`, not the
+      // recorded stage — a stage whose files no longer carry the helper must
+      // fall through and be re-applied, or the migration could never be
+      // re-run after an unwire.
+      const state = await this.claudeClientKeyWiring(account.id);
+      if (state.complete) return state;
+    }
+    const helper = clientKeyHelperCommand(service);
+    const at = new Date(this.now()).toISOString();
+    const migration = {
+      from: 'legacy',
+      startedAt: record?.migration?.startedAt ?? at,
+      updatedAt: at,
+      stage: 'settings',
+    };
+
+    const settingsPath = path.join(profileRef, 'settings.json');
+    let raw = null;
+    try { raw = await fs.promises.readFile(settingsPath, 'utf8'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    let settings = {};
+    if (raw != null) {
+      try { settings = parseJsonPreservingNumberValues(raw); }
+      catch { throw serviceError('Claude profile settings.json is not valid JSON; fix it before migrating the client key helper', 400); }
+      if (!isJsonObject(settings)) {
+        throw serviceError('Claude profile settings.json must contain a JSON object', 400);
+      }
+    }
+    // Design §2.5 migrates ROUTED profiles. An apiKeyHelper outranks the
+    // profile's stored OAuth, so adding one to a profile that does not talk
+    // to the local proxy would break it outright — the same predicate the
+    // shell pointer uses (#277 review), refused rather than assumed.
+    const baseUrl = isJsonObject(settings.env) ? settings.env.ANTHROPIC_BASE_URL : undefined;
+    if (!isLoopbackUrl(baseUrl)) {
+      throw serviceError(
+        'per-profile client keys apply only to profiles routed through the local proxy; '
+        + 'route this profile before migrating its helper',
+        409,
+      );
+    }
+    // The same ownership guard the wire path uses: a helper ModelDeck cannot
+    // prove it wrote is the user's, and migration overwrites nothing.
+    this.assertClaudeHelperIsOurs(settings.apiKeyHelper, record, 'migrating');
+
+    const next = { ...settings, apiKeyHelper: helper };
+    const written = `${JSON.stringify(next, null, 2)}\n`;
+    const wroteSettings = raw !== written;
+    if (wroteSettings) await this.writeClaudeProfileSettings(settingsPath, written);
+    this.saveClaudeClientKeyRecord(account.id, {
+      mode: 'per-profile', service, helper, writtenAt: at, migration,
+    });
+
+    try {
+      if (await this.claudeProfileIsActive(profileRef)) {
+        const { cliproxyRouted } = await this.claudeAuthOverrideState(profileRef);
+        await this.writeClaudeShellEnvFile(profileRef, cliproxyRouted);
+      }
+    } catch (error) {
+      // Partial state, recorded and reported honestly rather than rolled
+      // back: settings.json already points at the per-profile item, and the
+      // next call resumes from the recorded `settings` stage.
+      throw serviceError(
+        `client key helper migration wrote settings.json but could not refresh the shell environment: ${errorMessage(error)}`,
+        500,
+      );
+    }
+    this.saveClaudeClientKeyRecord(account.id, {
+      mode: 'per-profile',
+      service,
+      helper,
+      writtenAt: at,
+      migration: { ...migration, stage: 'complete', updatedAt: new Date(this.now()).toISOString() },
+    });
+    return this.claudeClientKeyWiring(account.id);
+  }
+
+  /// The foreign-helper guard's refusal half (design §2.5, should-fix 7).
+  assertClaudeHelperIsOurs(helper, record, action) {
+    if (classifyClaudeHelper(helper, record) !== 'foreign') return;
+    throw serviceError(
+      "this profile's settings.json carries an apiKeyHelper that ModelDeck did not write; "
+      + `remove it yourself before ${action} sessions through the proxy`,
+      409,
+    );
+  }
+
   wireProxyRouting(accountId) {
     return this.setProxyRouting(accountId, true);
   }
@@ -4111,8 +4568,15 @@ export class ModelDeckService {
     const foreignBase = typeof existingBase === 'string'
       && existingBase !== this.cliproxyBaseUrl
       && !isLoopbackUrl(existingBase);
-    const foreignHelper = typeof settings.apiKeyHelper === 'string'
-      && settings.apiKeyHelper !== CLIPROXY_API_KEY_HELPER;
+    // Issue #522: ownership is PROVEN, not inferred. A helper is ModelDeck's
+    // only when it exactly matches this profile's recorded written state —
+    // or, for a profile that predates per-profile keys, the one fixed legacy
+    // string every earlier release wrote. A helper that merely LOOKS
+    // generated, even carrying a real account's slug, has no record behind it
+    // and may be the user's own deliberate wiring: it gets this 409, never an
+    // overwrite or a delete (should-fix 7, sharpened by CodeRabbit).
+    const helperRecord = this.claudeClientKeyRecord(account);
+    const foreignHelper = classifyClaudeHelper(settings.apiKeyHelper, helperRecord) === 'foreign';
     if (foreignBase || foreignHelper) {
       const inTheWay = [
         ...(foreignBase ? [`env.ANTHROPIC_BASE_URL (${existingBase})`] : []),
@@ -4126,12 +4590,15 @@ export class ModelDeckService {
     }
 
     const next = { ...settings };
+    // Issue #522: a migrated profile is re-wired to its OWN item; one that
+    // never migrated keeps the shared item, unchanged from before.
+    const desiredHelper = this.claudeDesiredHelper(account);
     if (enabled) {
       next.env = {
         ...(settings.env || {}),
         ANTHROPIC_BASE_URL: this.cliproxyBaseUrl,
       };
-      next.apiKeyHelper = CLIPROXY_API_KEY_HELPER;
+      next.apiKeyHelper = desiredHelper;
     } else {
       delete next.apiKeyHelper;
       if (settings.env) {
@@ -4152,6 +4619,24 @@ export class ModelDeckService {
         await this.writeClaudeProfileSettings(settingsPath, written);
         wroteSettings = true;
       }
+      // Issue #522: record the exact string we just wrote (or that we no
+      // longer carry a helper) BEFORE the shell env is written — the shell
+      // writer reads the record to pick its Keychain service, and the guard
+      // reads it on every later wire/unwire.
+      const nextRecord = {
+        ...(helperRecord || {}),
+        mode: helperRecord?.mode === 'per-profile' ? 'per-profile' : 'legacy',
+        service: clientKeyServiceForRecord(helperRecord),
+        helper: enabled ? desiredHelper : null,
+        writtenAt: new Date(this.now()).toISOString(),
+      };
+      // Unwiring removes the helper, so any recorded migration is spent: a
+      // stale `complete` stage would otherwise make the state report claim a
+      // finished migration with nothing wired, and would make the POST's
+      // idempotency short-circuit turn re-migration into a permanent no-op.
+      // The provisioning (mode/service) survives; the migration does not.
+      if (!enabled) delete nextRecord.migration;
+      this.saveClaudeClientKeyRecord(account.id, nextRecord);
       const routing = await this.claudeAuthOverrideState(profileRef);
       if (active) {
         // cliproxyRouted, not proxyRouted: the shell key pointer goes only
@@ -4172,6 +4657,10 @@ export class ModelDeckService {
       // the exact pre-action settings bytes and best-effort restore its pin.
       if (wroteSettings) {
         try {
+          // The recorded helper state is part of the pre-action snapshot: a
+          // record naming a helper the restored settings.json does not carry
+          // would make the next wire refuse its own profile.
+          this.saveClaudeClientKeyRecord(account.id, helperRecord);
           if (raw == null) await fs.promises.unlink(settingsPath).catch((unlinkError) => {
             if (unlinkError.code !== 'ENOENT') throw unlinkError;
           });
@@ -4453,6 +4942,90 @@ export class ModelDeckService {
     };
   }
 
+  // Issue #520 — the app's hash→profile client-key mapping (design §2.1,
+  // decision 0036 D1). Full-state and idempotent: the app re-reports the
+  // complete mapping on every launch/handshake and the store applies it in
+  // one transaction as a replacement, so a rebuilt daemon DB or a report lost
+  // in flight self-heals instead of leaving requests unattributed.
+  //
+  // Everything crossing this boundary is treated as untrusted input even
+  // though the channel is token-gated: hashes must be 64 lowercase hex, and
+  // the hash of the empty string is refused outright because a keyless
+  // request's usage record carries `api_key: ""` (recon V1) and would
+  // otherwise attribute every unauthenticated request to a real profile.
+  reportClientKeys(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) {
+      throw serviceError('client key report must be a JSON object', 400);
+    }
+    const generation = input.generation;
+    if (!Number.isSafeInteger(generation) || generation < 1) {
+      throw serviceError('client key report generation must be a positive integer', 400);
+    }
+    // Bounded ABOVE as well as below (CodeRabbit, PR #529). The generation is
+    // a one-way ratchet, so a single report claiming MAX_SAFE_INTEGER would
+    // persist a value no honest successor can exceed — every later report
+    // rejected as stale, forever, and the app's resync would adopt the
+    // poisoned number and make it permanent. A mutation-token holder can do
+    // worse things, but a buggy caller must not be able to brick attribution.
+    if (generation > CLIENT_KEY_REPORT_MAX_GENERATION) {
+      throw serviceError(`client key report generation exceeds ${CLIENT_KEY_REPORT_MAX_GENERATION}`, 400);
+    }
+    const rawEntries = input.entries;
+    if (!Array.isArray(rawEntries)) throw serviceError('client key report entries must be an array', 400);
+    if (rawEntries.length > CLIENT_KEY_REPORT_MAX_ENTRIES) {
+      throw serviceError(`client key report carries more than ${CLIENT_KEY_REPORT_MAX_ENTRIES} entries`, 400);
+    }
+    const entries = [];
+    const seenHashes = new Set();
+    const seenLabels = new Set();
+    for (const raw of rawEntries) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        throw serviceError('each client key entry must be a JSON object', 400);
+      }
+      const keySha256 = String(raw.key_sha256 ?? '');
+      if (!/^[0-9a-f]{64}$/.test(keySha256)) {
+        throw serviceError('client key entry hash must be 64 lowercase hex characters', 400);
+      }
+      if (keySha256 === SHA256_OF_EMPTY_STRING) {
+        throw serviceError('client key entry hash is the empty-key hash', 400);
+      }
+      if (seenHashes.has(keySha256)) throw serviceError('client key report repeats a hash', 400);
+      seenHashes.add(keySha256);
+      const rawProfileId = String(raw.profile_id ?? '');
+      const profileId = rawProfileId.trim();
+      if (!profileId || rawProfileId.length > 128 || /\p{Cc}/u.test(rawProfileId)) {
+        throw serviceError('client key entry profile_id must be a non-empty string of at most 128 characters, free of control characters', 400);
+      }
+      const profileLabel = raw.profile_label == null ? null : String(raw.profile_label);
+      if (profileLabel != null && (profileLabel.length > 128 || /\p{Cc}/u.test(profileLabel))) {
+        throw serviceError('client key entry profile_label must be at most 128 characters and free of control characters', 400);
+      }
+      // Design §2.2: receipts store the label only, so two key-enabled
+      // profiles sharing one would be indistinguishable. The app refuses this
+      // at provisioning; the daemon refuses it again rather than trusting a
+      // client to have done so.
+      //
+      // Blank labels are NOT exempt (CodeRabbit, PR #529). Two rows both
+      // labelled "" are exactly as indistinguishable on a receipt as two
+      // labelled "Work", and the app-side gate already collides them — it
+      // inserts the normalized label unconditionally. Exempting them here
+      // would have let a report the app would never build slip through the
+      // check this comment claims to make. One blank label is fine; a second
+      // is a collision.
+      const normalizedLabel = (profileLabel ?? '').trim().toLowerCase();
+      if (seenLabels.has(normalizedLabel)) {
+        throw serviceError('client key report repeats a profile label', 400);
+      }
+      seenLabels.add(normalizedLabel);
+      entries.push({ keySha256, profileId, profileLabel });
+    }
+    return this.store.replaceClientKeyMap({
+      generation,
+      entries,
+      maximumGenerationJump: CLIENT_KEY_REPORT_MAX_GENERATION_JUMP,
+    });
+  }
+
   reportManagedProxy(input) {
     const report = managedProxyAppReport(input);
     this.managedProxyAppReport = {
@@ -4630,10 +5203,30 @@ export class ModelDeckService {
 
   async toolExecutablePath(binary) {
     if (path.isAbsolute(binary)) return binary;
-    const result = await this.exec('/usr/bin/which', [binary], { timeout: 10_000, maxBuffer: 65_536 });
-    const resolved = String(result?.stdout ?? result).trim().split(/\r?\n/, 1)[0];
+    let resolved = '';
+    try {
+      const result = await this.exec('/usr/bin/which', [binary], { timeout: 10_000, maxBuffer: 65_536 });
+      resolved = String(result?.stdout ?? result).trim().split(/\r?\n/, 1)[0];
+    } catch {
+      // `which` exits non-zero for a binary the daemon's PATH cannot see;
+      // that is the fallback-probe case below, not an error to surface.
+    }
+    if (!resolved) resolved = await this.toolPathFallback(binary);
     if (!resolved) throw new Error(`${binary} is not installed`);
     return resolved;
+  }
+
+  // Issue #2: the first executable match for `binary` in the known install
+  // directories the daemon's static PATH cannot express, or '' when none.
+  async toolPathFallback(binary) {
+    for (const dir of this.toolPathFallbackDirs) {
+      const candidate = path.join(dir, binary);
+      try {
+        await fs.promises.access(candidate, fs.constants.X_OK);
+        return candidate;
+      } catch { /* not in this directory — keep probing */ }
+    }
+    return '';
   }
 
   async detectToolInstall(tool) {
@@ -4752,8 +5345,12 @@ export class ModelDeckService {
       // (CodeRabbit, PR #301): a pasted preview run under `zsh -x` must be
       // as trace-safe as the generated shell env, and must resolve
       // `security` the same way.
+      // Issue #522: the preview points at the MAPPED account's own Keychain
+      // item — the same record the shell env writer reads — so a pasted
+      // preview and a fresh terminal fetch the identical key.
+      const previewService = clientKeyServiceForRecord(this.claudeClientKeyRecord(account));
       const preview = cliproxyRouted
-        ? `cd ${shellQuote(cwd)} && ${claudeProxyPointerShellSnippet()}; ${pins} ${invocation}`
+        ? `cd ${shellQuote(cwd)} && ${claudeProxyPointerShellSnippet(previewService)}; ${pins} ${invocation}`
         : `cd ${shellQuote(cwd)} && if [ "\${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY; fi; ${pins} ${invocation}`;
       return {
         provider,
@@ -4766,6 +5363,10 @@ export class ModelDeckService {
         // env so `claude -r` finds the transcript under the same pin.
         env: { CLAUDE_CONFIG_DIR: profileRef, CLAUDE_SECURESTORAGE_CONFIG_DIR: profileRef },
         credential,
+        // Issue #522: the launcher resolves the pointer itself at spawn, so
+        // it needs the SAME item the preview names — a directive, never a
+        // credential value. Null when the account is not cliproxy-routed.
+        keychainService: cliproxyRouted ? previewService : null,
         preview,
       };
     }

@@ -459,13 +459,13 @@ test('TRIPWIRE headroom-demoted — headroom left the landing, and its page sums
   assert.equal(/total/i.test(limits.querySelector('.card-note').textContent), false);
 });
 
-test('TRIPWIRE project-burn-deleted — the switcher offers the four views the charter kept', async (t) => {
+test('TRIPWIRE project-burn-deleted — the switcher offers only the chartered detail views', async (t) => {
   await landing(t);
   await openDetail();
 
   const views = [...document.querySelectorAll('.segmented[aria-label="Detail view"] button')]
     .map((node) => node.textContent.trim());
-  assert.deepEqual(views, ['Headroom', 'Burn timeline', 'Model × effort', 'Sessions']);
+  assert.deepEqual(views, ['Headroom', 'Reset calendar', 'Burn timeline', 'Model × effort', 'Sessions']);
   // Charter d3: the project-burn view is gone, not renamed and not hidden.
   assert.equal(/project burn/i.test(document.querySelector('.page').textContent), false);
 });

@@ -399,10 +399,13 @@ export async function loadModel({ rangeKey, scope }) {
   const provider = scope || null;
   const base = { since, until };
 
-  const [burn, state, estimate] = await Promise.all([
+  const [burn, state, estimate, findingPayload, exhaustion] = await Promise.all([
     getJSON('/api/usage/projects?' + query({ ...base, limit: 200, bucket: 'hour', provider })),
     getJSON('/api/state').catch(() => ({ accounts: [], usage: [] })),
     getJSON('/api/usage/estimate?' + query(base)).catch(() => null),
+    getJSON('/api/usage/findings?' + query({ ...base, provider }))
+      .catch(() => ({ findings: [], unavailable: true })),
+    getJSON('/api/usage/exhaustion-forecast?' + query({ provider })).catch(() => null),
   ]);
 
   const buckets = enumerateBuckets(since, until, resolution);
@@ -599,7 +602,9 @@ export async function loadModel({ rangeKey, scope }) {
   const baseline = await loadBaseline({ since, provider, resolveKey });
 
   return {
-    rangeKey, resolution, scope, since, until, buckets, baseline,
+    rangeKey, resolution, scope, since, until, buckets, baseline, exhaustion,
+    findings: Array.isArray(findingPayload?.findings) ? findingPayload.findings : [],
+    findingsUnavailable: findingPayload?.unavailable === true,
     memberBlackout: state.memberBlackout || { threshold: null, alerts: [] },
     projects: list,
     corpusByBucket,

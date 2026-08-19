@@ -336,7 +336,14 @@ struct AccountsSettingsPane: View {
             onDismissProxyOutcome: { proxyPoolModel.dismissOutcome(accountID: account.id) },
             // Issue #396: the in-app repair. Nil on a machine without the
             // proxy or on a daemon that does not report it — same discipline.
-            relogin: proxyReloginModel.presentation(for: account),
+            // Issue #515: the deck's own routed-failure streak rides along, so
+            // a member serving nothing but 401s promotes its repair here even
+            // while the recorded credential still reads healthy. The deck
+            // banner reads this same derivation.
+            relogin: proxyReloginModel.presentation(
+                for: account,
+                routedFailures: ProxyRelogin.routedFailures(for: account, in: state)
+            ),
             onProxyFixSignIn: { proxyConfirmation = ProxyPoolConfirmation(account: account, action: .fixSignIn) },
             onProxyCancelRelogin: { proxyReloginModel.cancel(accountID: account.id) },
             onDismissReloginOutcome: { proxyReloginModel.dismissOutcome(accountID: account.id) },
@@ -1023,7 +1030,11 @@ struct AccountRosterRow: View {
                 if let credentialText = relogin.credentialText {
                     Text(credentialText)
                         .font(.system(size: 10))
-                        .foregroundStyle(ProxyRelogin.credentialIsBroken(account) ? .orange : .secondary)
+                        // Issue #515: the presentation already decided this on
+                        // BOTH measures (recorded credential, routed-failure
+                        // streak) — the row must not re-derive it and reach a
+                        // calmer conclusion than the deck's banner.
+                        .foregroundStyle(relogin.credentialIsBroken ? .orange : .secondary)
                         .lineLimit(1)
                         .help(reloginCredentialHelp(relogin, base: credentialText))
                 }
@@ -1971,6 +1982,15 @@ struct GeneralSettingsPane: View {
                 model: proxyOnboardingModel,
                 available: managedProxyAvailable
             )
+
+            // Issue #524: whether receipts can name the profile that spent a
+            // request, plus the consented config-write flow when one is in
+            // progress. Both inputs are nil until the per-profile key path has
+            // an owner in the app, and the surface is silent until then by
+            // decision (ClientKeyAttributionSurface) rather than by accident —
+            // a permanent row about a feature nothing can reach yet is the
+            // nagging #445 ruled out.
+            ClientKeyAttributionSection(wiring: nil, consentModel: nil)
 
             Section {
                 Toggle("Launch at login", isOn: Binding(

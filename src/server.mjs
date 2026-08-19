@@ -4,17 +4,22 @@ import { fileURLToPath } from 'node:url';
 import packageMetadata from '../package.json' with { type: 'json' };
 import { DASHBOARD_APP_HTML } from './dashboard-app.mjs';
 import { Store } from './db.mjs';
+import { scopeFindings } from './diagnostician.mjs';
 import { ModelDeckService } from './service.mjs';
 import { readLaneRuns, tagSessionsWithLaneRuns } from './lane-manifest.mjs';
 import { resolveMutationToken } from './token.mjs';
 import { parseOtlpLogs, parseOtlpMetrics } from './otel-ingest.mjs';
 import { usageEstimateReport } from './usage-estimate.mjs';
-import { activityBreakdownReport, attributionReport, costReport } from './usage-analytics.mjs';
+import {
+  activityBreakdownReport, attributionReport, costReport, exhaustionForecastReport,
+} from './usage-analytics.mjs';
 import { runProbeCli as runClaudeUsageProbe } from './adapters/claude-usage-probe.mjs';
 import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from './adapters/claude-statusline.mjs';
+import { resetCalendarReport } from './capacity.mjs';
 import {
   HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
+  GROK_SESSIONS_DIR,
   CLIPROXY_AUTH_DIR, CLIPROXY_BIN, CLIPROXY_BASE_URL, CLIPROXY_CONFIG_DIR,
   CLIPROXY_MANAGEMENT_KEY_PATH, LANE_MANIFEST_PATH,
 } from './paths.mjs';
@@ -125,6 +130,7 @@ export function createApp({
     codexPath: CODEX_PATH,
     codexActiveLink: CODEX_ACTIVE_LINK,
     codexProfilesDir: CODEX_PROFILES_DIR,
+    grokSessionsDir: GROK_SESSIONS_DIR,
     cliproxyAuthDir: CLIPROXY_AUTH_DIR,
     cliproxyConfigDir: CLIPROXY_CONFIG_DIR,
     cliproxyPath: CLIPROXY_BIN,
@@ -191,6 +197,13 @@ export function createApp({
       if (req.method === 'POST' && url.pathname === '/api/managed-proxy/report') {
         return json(res, 200, { appReport: ownedService.reportManagedProxy(await body(req)) });
       }
+      // Issue #520: the app owns raw client keys and reports only SHA-256
+      // hashes. Full-state and idempotent — the store applies it atomically
+      // and rejects a generation it has already applied, so a replayed report
+      // cannot resurrect a rotated key. Inherits the mutation-token gate above.
+      if (req.method === 'POST' && url.pathname === '/api/client-keys/report') {
+        return json(res, 200, { clientKeys: ownedService.reportClientKeys(await body(req)) });
+      }
       // Issue #359: every usage-analytics API route shares the dashboard's
       // kill-switch boundary. Prefix gating keeps future /api/usage/* routes
       // indistinguishable from routes that do not exist until explicitly enabled.
@@ -208,6 +221,18 @@ export function createApp({
       if (req.method === 'GET' && (url.pathname === '/dashboard' || url.pathname === '/dashboard/')) {
         if (!ownedStore.getSettings().usageAnalyticsEnabled) return json(res, 404, { error: 'not found' });
         return html(res, DASHBOARD_APP_HTML);
+      }
+      // Receipts-v1 diagnostician findings are materialized by the daemon's
+      // warehouse pass. This endpoint is a read only — it never rescans the
+      // corpus or advances a suppression revision while a dashboard polls it.
+      if (req.method === 'GET' && url.pathname === '/api/usage/findings') {
+        return json(res, 200, {
+          findings: scopeFindings(ownedStore.listFindings(), {
+            provider: url.searchParams.get('provider'),
+            since: url.searchParams.get('since'),
+            until: url.searchParams.get('until'),
+          }),
+        });
       }
       // This endpoint may later supersede the Mac app's client-side BurnRateWindow sampling.
       if (req.method === 'GET' && url.pathname === '/api/usage/history') {
@@ -230,11 +255,22 @@ export function createApp({
           provider: url.searchParams.get('provider'),
         }));
       }
+      if (req.method === 'GET' && url.pathname === '/api/usage/resets') {
+        return json(res, 200, resetCalendarReport(
+          ownedStore.latestUsage(),
+          ownedStore.listAccounts(),
+        ));
+      }
       if (req.method === 'GET' && url.pathname === '/api/usage/estimate') {
         return json(res, 200, usageEstimateReport(ownedStore, {
           since: url.searchParams.get('since'),
           until: url.searchParams.get('until'),
           accountId: url.searchParams.get('accountId'),
+        }));
+      }
+      if (req.method === 'GET' && url.pathname === '/api/usage/exhaustion-forecast') {
+        return json(res, 200, exhaustionForecastReport(ownedStore, {
+          provider: url.searchParams.get('provider'),
         }));
       }
       if (req.method === 'GET' && url.pathname === '/api/usage/attribution') {
@@ -493,6 +529,22 @@ export function createApp({
           ? await ownedService.wireProxyRouting(account.id)
           : await ownedService.unwireProxyRouting(account.id);
         return json(res, 200, routing);
+      }
+      // Issue #522: the legacy→per-profile client-key helper migration, daemon
+      // half. GET reports honest state (including a migration that stopped
+      // between its two files); POST performs the settings + shell-env stages
+      // and refuses unless the app reports #521's consented config write
+      // landed. The app keeps the raw key and the config edit; the daemon
+      // never sees either.
+      const clientKeyHelperMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/client-key-helper$/);
+      if (clientKeyHelperMatch && (req.method === 'GET' || req.method === 'POST')) {
+        const account = ownedStore.getAccount(decodeURIComponent(clientKeyHelperMatch[1]));
+        if (!account) return json(res, 404, { error: 'account not found' });
+        return json(res, 200, {
+          clientKeyHelper: req.method === 'POST'
+            ? await ownedService.migrateClaudeClientKeyHelper(account.id, await body(req))
+            : await ownedService.claudeClientKeyWiring(account.id),
+        });
       }
       // Issue #174: per-profile statusline capture opt-in. Both writes stay
       // inside the profile's OWN settings.json (never the active-profile

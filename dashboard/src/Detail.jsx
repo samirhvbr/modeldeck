@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import DailyChart from './DailyChart.jsx';
 import { Meter, Segmented, Why, slotColor, NEUTRAL } from './ui.jsx';
 import { ProviderMark } from './brand.jsx';
+import ResetCalendar from './ResetCalendar.jsx';
 import { getJSON, query } from './api.js';
 import {
   allocateRounded, boundsForSelection, bucketsIn, foldCwd, projectValueSeries, sumOver,
@@ -54,6 +55,7 @@ import {
 
 export const DETAIL_VIEWS = [
   { value: 'headroom', label: 'Headroom' },
+  { value: 'resets', label: 'Reset calendar' },
   { value: 'timeline', label: 'Burn timeline' },
   { value: 'model-effort', label: 'Model × effort' },
   { value: 'sessions', label: 'Sessions' },
@@ -142,6 +144,7 @@ export default function Detail({ model, route, go, lens }) {
       </div>
 
       {view === 'headroom' ? <Headroom model={model} /> : null}
+      {view === 'resets' ? <ResetCalendar provider={model.scope} /> : null}
       {view === 'timeline' ? <Timeline model={model} selection={selection} /> : null}
       {view === 'model-effort' ? (
         <ModelEffort

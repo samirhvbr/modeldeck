@@ -567,7 +567,7 @@ test('session explorer parameters are validated like every other reader param', 
   const data = fixture(t);
   seed(data.store);
 
-  assert.throws(() => data.store.usageSessions({ provider: 'anthropic' }), /usage sessions provider must be claude or codex/);
+  assert.throws(() => data.store.usageSessions({ provider: 'anthropic' }), /usage sessions provider must be claude, codex, or grok/);
   assert.throws(() => data.store.usageSessions({ accountId: '   ' }), /usage sessions accountId must be a non-empty string/);
   assert.throws(() => data.store.usageSessions({ since: '2026-08-01' }), /usage sessions since must be a canonical ISO timestamp/);
   assert.throws(
@@ -581,7 +581,7 @@ test('session explorer parameters are validated like every other reader param', 
 
   const badProvider = await request(data.app, '/api/usage/sessions?provider=gemini');
   assert.equal(badProvider.status, 400);
-  assert.deepEqual(JSON.parse(badProvider.body), { error: 'usage sessions provider must be claude or codex' });
+  assert.deepEqual(JSON.parse(badProvider.body), { error: 'usage sessions provider must be claude, codex, or grok' });
 
   const badLimit = await request(data.app, '/api/usage/sessions?limit=999');
   assert.equal(badLimit.status, 400);

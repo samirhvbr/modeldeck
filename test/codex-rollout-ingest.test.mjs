@@ -44,6 +44,12 @@ test('Codex rollout ingest streams nested sessions and flat archives into replay
   });
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /archived-placeholder-session\.jsonl line 5/);
+  assert.deepEqual(
+    store.db.prepare('SELECT DISTINCT parser, parser_version FROM ingest_file_state').all()
+      .map((row) => ({ ...row })),
+    [{ parser: 'codex-rollout', parser_version: 1 }],
+    'replay state records the Codex rollout parser provenance',
+  );
 
   const sessions = store.db.prepare('SELECT * FROM codex_sessions ORDER BY session_id').all();
   assert.equal(sessions.length, 2, 'the empty profile produces no rows and no error');

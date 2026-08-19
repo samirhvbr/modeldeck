@@ -2,6 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 
+const CODEX_ROLLOUT_PARSER = 'codex-rollout';
+const CODEX_ROLLOUT_PARSER_VERSION = 1;
+
 const TOKEN_FIELDS = Object.freeze({
   input_tokens: 'inputTokens',
   cached_input_tokens: 'cachedInputTokens',
@@ -439,7 +442,10 @@ export async function ingestCodexRollouts({
         const finalStat = fs.statSync(item.file);
         if (finalStat.size === fileStat.size && finalStat.mtimeMs === fileStat.mtimeMs
           && finalStat.ino === fileStat.ino) {
-          store.recordIngestFileState(item.file, finalStat);
+          store.recordIngestFileState(item.file, finalStat, {
+            parser: CODEX_ROLLOUT_PARSER,
+            parserVersion: CODEX_ROLLOUT_PARSER_VERSION,
+          });
         }
       } catch (error) {
         summary.warnings.malformedFiles += 1;

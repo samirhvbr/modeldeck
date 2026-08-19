@@ -53,6 +53,12 @@ private final class TripwireLaunchdControl: LaunchdServiceControlling, @unchecke
     func bootOutService() async { bootOutCalls += 1 }
 }
 
+/// A perfectly verified bundled daemon — the #514 repair's precondition, so
+/// the untrusted-host stand-down is proved against the MOST tempting inputs.
+private final class TripwireBundledDaemon: BundledDaemonVerifying, @unchecked Sendable {
+    func verifyBundledDaemon() async -> BundledDaemonVerification { .valid }
+}
+
 // MARK: - Pure decision: untrusted signature outranks everything
 
 final class Issue486DecisionTripwireTests: XCTestCase {
@@ -66,7 +72,8 @@ final class Issue486DecisionTripwireTests: XCTestCase {
             hostSignatureAllowsServiceManagement: false,
             probe: probe, registration: registration,
             launchdService: launchdService, legacyPresent: false,
-            recordedCommit: recordedCommit, bundledCommit: "new"
+            recordedCommit: recordedCommit, bundledCommit: "new",
+            bundledDaemon: .valid
         )
     }
 
@@ -129,6 +136,7 @@ final class Issue486ModelTripwireTests: XCTestCase {
                 marker: marker,
                 probe: probe,
                 launchdControl: launchd,
+                bundledDaemon: TripwireBundledDaemon(),
                 bundledCommit: "new",
                 hostSignatureAllowsServiceManagement: false
             ),

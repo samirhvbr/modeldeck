@@ -4,6 +4,7 @@ import path from 'node:path';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService } from '../src/service.mjs';
 import { evaluateCapacity } from '../src/capacity.mjs';
+import { LEGACY_CLIENT_KEY_SERVICE, assertClientKeyService } from '../src/client-key-helper.mjs';
 import {
   DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, HOST, PORT,
@@ -126,10 +127,14 @@ if (command === 'serve') {
           // ANTHROPIC_API_KEY would override the profile's stored OAuth —
           // and a managed key inherited from the launching shell is
           // cleared rather than left stale.
+          // Issue #522: the profile's OWN item, named by the spec, so the
+          // launcher and the preview it prints can never fetch different
+          // keys. Validated here too — this is a command argument.
+          const keychainService = assertClientKeyService(spec.keychainService || LEGACY_CLIENT_KEY_SERVICE);
           let key = '';
           try {
             key = execFileSync(process.env.MODELDECK_SECURITY_BIN || '/usr/bin/security', [
-              'find-generic-password', '-s', 'cli-proxy-api-client', '-w',
+              'find-generic-password', '-s', keychainService, '-w',
             ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
           } catch {
             key = '';

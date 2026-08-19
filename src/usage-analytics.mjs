@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import pinnedPriceSnapshot from '../data/litellm-prices-2026-08-11.json' with { type: 'json' };
+import { evaluateWorstCapacity } from './capacity.mjs';
 import { tagSessionsWithLaneRuns } from './lane-manifest.mjs';
 import { apportionMeasuredTotal, CLAUDE_POOL_ID, MIN_FIT_QUALITY } from './usage-estimate.mjs';
 
@@ -43,6 +44,8 @@ function fitFromStore(store, scope) {
 }
 
 const RESET_MARKER_TOLERANCE_MS = 5 * 60 * 1000;
+const EXHAUSTION_BASIS_HOURS = 3;
+const EXHAUSTION_MINIMUM_SPAN_MS = 30 * 60 * 1000;
 
 function resetMarkerChanged(previous, current) {
   if (previous == null || current == null) return previous !== current;
@@ -50,6 +53,174 @@ function resetMarkerChanged(previous, current) {
   const after = Date.parse(current);
   if (Number.isFinite(before) && Number.isFinite(after)) return Math.abs(after - before) > RESET_MARKER_TOLERANCE_MS;
   return previous !== current;
+}
+
+function exhaustionBurnRate(rows) {
+  let previous = null;
+  let observations = 0;
+  let burned = 0;
+  let elapsed = 0;
+  let usableEarliest = null;
+  let usableLatest = null;
+  for (const row of rows) {
+    const used = row.used_percent == null ? null : Number(row.used_percent);
+    const observedAt = Date.parse(row.observed_at);
+    if (used == null || !Number.isFinite(used) || !Number.isFinite(observedAt)) continue;
+    observations += 1;
+    if (previous != null) {
+      const interval = observedAt - previous.observedAt;
+      const scheduledResetCrossed = previous.resetsAt != null
+        && Number.isFinite(Date.parse(previous.resetsAt))
+        && Date.parse(previous.resetsAt) > previous.observedAt
+        && Date.parse(previous.resetsAt) <= observedAt;
+      // BurnRateWindow precedent: a reset-crossing interval contributes
+      // neither movement nor time. The reset marker catches the adversarial
+      // case where a full refill and fresh burn still leave the used level
+      // above its pre-reset value.
+      const resetCrossed = used < previous.used
+        || resetMarkerChanged(previous.resetsAt, row.resets_at)
+        || scheduledResetCrossed;
+      if (interval > 0 && !resetCrossed) {
+        burned += used - previous.used;
+        elapsed += interval;
+        usableEarliest = usableEarliest == null ? previous.observedAt : Math.min(usableEarliest, previous.observedAt);
+        usableLatest = usableLatest == null ? observedAt : Math.max(usableLatest, observedAt);
+      }
+    }
+    previous = { used, observedAt, resetsAt: row.resets_at };
+  }
+  if (observations < 2 || elapsed <= 0 || usableEarliest == null || usableLatest == null
+      || usableLatest - usableEarliest < EXHAUSTION_MINIMUM_SPAN_MS) {
+    return { rate: null, reason: 'Not enough recent observations for a reset-free burn rate.' };
+  }
+  if (!(burned > 0)) return { rate: null, reason: 'No burn measured in the basis window.' };
+  return { rate: burned / (elapsed / 3_600_000), reason: null };
+}
+
+function observedResetCadenceMs(rows) {
+  let previousResetMs = null;
+  let cadenceMs = null;
+  for (const row of rows) {
+    const resetMs = row.resets_at == null ? NaN : Date.parse(row.resets_at);
+    if (!Number.isFinite(resetMs)) continue;
+    if (previousResetMs != null && Math.abs(resetMs - previousResetMs) > RESET_MARKER_TOLERANCE_MS) {
+      const interval = resetMs - previousResetMs;
+      if (interval > 0) cadenceMs = interval;
+    }
+    previousResetMs = resetMs;
+  }
+  return cadenceMs;
+}
+
+/**
+ * Reset-aware exhaustion estimates over the same short-window evidence rule as
+ * BurnRateWindow. Provider percentages remain the ground truth; only the dry
+ * time is estimated, and the payload carries that label plus its fixed basis.
+ */
+export function exhaustionForecastReport(store, { now = Date.now(), provider = null } = {}) {
+  if (!store?.db) throw new Error('exhaustion forecast store is required');
+  if (provider != null && !['claude', 'codex'].includes(provider)) {
+    throw new Error('exhaustion forecast provider must be claude or codex');
+  }
+  const nowMs = typeof now === 'string' ? Date.parse(now) : Number(now);
+  if (!Number.isFinite(nowMs)) throw new Error('exhaustion forecast now must be a timestamp');
+  const until = new Date(nowMs).toISOString();
+  const since = new Date(nowMs - EXHAUSTION_BASIS_HOURS * 3_600_000).toISOString();
+  const latest = store.latestUsage();
+  const history = store.db.prepare(`
+    SELECT used_percent, resets_at, observed_at, id
+    FROM usage_snapshots INDEXED BY usage_account_scope_observed
+    WHERE account_id = ? AND scope = ? AND stale = 0 AND used_percent IS NOT NULL
+      AND julianday(observed_at) >= julianday(?)
+      AND julianday(observed_at) <= julianday(?)
+    ORDER BY julianday(observed_at), id
+  `);
+  const accounts = store.listAccounts()
+    .filter((account) => account.enabled && (provider == null || account.provider === provider))
+    .sort((left, right) => String(left.label).localeCompare(String(right.label)))
+    .map((account) => {
+      // Capacity evaluation owns which present limit binds and supplies its
+      // reset timestamp. The forecast only adds history-derived pace.
+      const capacity = evaluateWorstCapacity(
+        latest.filter((row) => row.accountId === account.id),
+        [account],
+        { now: nowMs },
+      );
+      const current = capacity.worst;
+      const base = {
+        accountId: account.id,
+        accountLabel: account.label,
+        provider: account.provider,
+        scope: current?.scope ?? null,
+        status: 'no-forecast',
+        dryAt: null,
+        burnRatePercentPerHour: null,
+        resetsAt: current?.resetsAt ?? null,
+        carryover: null,
+        reason: null,
+      };
+      if (!current) {
+        return {
+          ...base,
+          reason: capacity.excluded[0]?.reason || 'Current usage is unavailable.',
+        };
+      }
+      const rows = history.all(account.id, current.scope, since, until);
+      const burn = exhaustionBurnRate(rows);
+      if (burn.rate == null) return { ...base, reason: burn.reason };
+      const resetMs = current.resetsAt == null ? null : Date.parse(current.resetsAt);
+      if (resetMs != null && Number.isFinite(resetMs) && resetMs <= nowMs) {
+        return { ...base, reason: 'The next reset time is not current.' };
+      }
+      const directDryMs = nowMs + (Math.max(0, Number(current.remainingPercent)) / burn.rate) * 3_600_000;
+      let dryMs = directDryMs;
+      let carryover = null;
+      if (resetMs != null && Number.isFinite(resetMs) && directDryMs > resetMs) {
+        const fullWindowBurnMs = (100 / burn.rate) * 3_600_000;
+        const resetCadenceMs = observedResetCadenceMs(rows);
+        if (resetCadenceMs != null && fullWindowBurnMs > resetCadenceMs) {
+          return {
+            ...base,
+            burnRatePercentPerHour: Number(burn.rate.toFixed(6)),
+            reason: 'At the measured pace this account refills before it runs dry.',
+          };
+        }
+        dryMs = resetMs + fullWindowBurnMs;
+        carryover = {
+          assumed: true,
+          resetAt: new Date(resetMs).toISOString(),
+          note: resetCadenceMs == null
+            ? 'Assumes the measured burn rate carries over after this reset; the reset cadence is unobserved, so this estimate assumes no earlier refill.'
+            : 'Assumes the measured burn rate carries over after this reset.',
+        };
+      }
+      return {
+        ...base,
+        status: 'forecast',
+        dryAt: new Date(dryMs).toISOString(),
+        burnRatePercentPerHour: Number(burn.rate.toFixed(6)),
+        carryover,
+      };
+    });
+  const worstCase = accounts
+    .filter((account) => account.status === 'forecast')
+    .sort((left, right) => Date.parse(left.dryAt) - Date.parse(right.dryAt)
+      || String(left.accountLabel).localeCompare(String(right.accountLabel)))[0] || null;
+  return {
+    estimateLabel: 'Estimate',
+    basisWindow: {
+      source: 'usage_snapshots',
+      label: `trailing ${EXHAUSTION_BASIS_HOURS} hours`,
+      since,
+      until,
+      hours: EXHAUSTION_BASIS_HOURS,
+      minimumSpanMinutes: EXHAUSTION_MINIMUM_SPAN_MS / 60_000,
+    },
+    accounts,
+    pool: worstCase
+      ? { status: 'forecast', worstCase }
+      : { status: 'no-forecast', worstCase: null },
+  };
 }
 
 function localHourKey(value) {

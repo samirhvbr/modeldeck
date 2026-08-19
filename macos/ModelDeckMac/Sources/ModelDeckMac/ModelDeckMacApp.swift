@@ -86,6 +86,9 @@ struct ModelDeckMacApp: App {
             // Issue #72: the popover's manual Refresh asks the daemon for a
             // real provider poll so the footer's data age visibly restarts.
             usageRefresher: client,
+            // Issue #503: the deck's time-to-dry line reads the daemon's
+            // #497 forecast — the app's only source for a dry time (0034).
+            forecastProvider: client,
             // Issue #260: the burn window survives relaunch, so a
             // self-announcing update (#241) can no longer blank the burst
             // signal mid-run and snap the verdict back to GREEN.
@@ -563,6 +566,7 @@ struct ModelDeckMacApp: App {
                 deckModel: deckModel,
                 renewModel: renewModel,
                 signInModel: signInModel,
+                proxyReloginModel: proxyReloginModel,
                 appUpdateModel: appUpdateModel,
                 appUpdateInstallModel: appUpdateInstallModel,
                 stagedPromptModel: appUpdateStagedPrompt,
@@ -644,6 +648,7 @@ struct ModelDeckMacApp: App {
                     deckModel: deckModel,
                     renewModel: renewModel,
                     signInModel: signInModel,
+                    proxyReloginModel: proxyReloginModel,
                     appUpdateModel: appUpdateModel,
                     appUpdateInstallModel: appUpdateInstallModel,
                     stagedPromptModel: appUpdateStagedPrompt,

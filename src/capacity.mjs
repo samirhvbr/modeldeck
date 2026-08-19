@@ -33,6 +33,31 @@ export function evaluateCapacity(usage, accounts, options = {}) {
   };
 }
 
+export function resetCalendarReport(usage, accounts, options = {}) {
+  const timeZone = options.timeZone
+    || Intl.DateTimeFormat().resolvedOptions().timeZone
+    || 'UTC';
+  const windowsByAccount = new Map();
+  for (const row of usage) {
+    if (!windowsByAccount.has(row.accountId)) windowsByAccount.set(row.accountId, []);
+    windowsByAccount.get(row.accountId).push({
+      scope: row.scope,
+      resetsAt: row.resetsAt || null,
+      observedAt: row.observedAt || null,
+    });
+  }
+  return {
+    timeZone,
+    accounts: accounts.map((account) => ({
+      accountId: account.id,
+      label: account.label,
+      provider: account.provider,
+      windows: (windowsByAccount.get(account.id) || [])
+        .sort((left, right) => String(left.scope).localeCompare(String(right.scope))),
+    })),
+  };
+}
+
 export function evaluateWorstCapacity(usage, accounts, options = {}) {
   const thresholdPercent = Number(options.thresholdPercent ?? 25);
   const criticalPercent = Number(options.criticalPercent ?? 10);

@@ -1,0 +1,59 @@
+{
+  "sessions": [
+    {
+      "provider": "claude",
+      "profileSlug": "claude-profile-placeholder",
+      "sessionId": "claude-bloated-session-placeholder",
+      "points": [
+        { "at": "2026-08-17T18:00:00.000Z", "uncached": 30000, "cached": 270000 },
+        { "at": "2026-08-17T18:05:00.000Z", "uncached": 20000, "cached": 290000, "cacheWrite": 10000, "totalInput": 320000 },
+        { "at": "2026-08-17T18:10:00.000Z", "uncached": 34000, "cached": 306000 },
+        { "at": "2026-08-17T18:15:00.000Z", "uncached": 36000, "cached": 324000 }
+      ]
+    },
+    {
+      "provider": "claude",
+      "profileSlug": "claude-profile-placeholder",
+      "sessionId": "claude-normal-session-placeholder",
+      "points": [
+        { "at": "2026-08-17T19:00:00.000Z", "uncached": 5000, "cached": 25000 },
+        { "at": "2026-08-17T19:05:00.000Z", "uncached": 5000, "cached": 35000 },
+        { "at": "2026-08-17T19:10:00.000Z", "uncached": 5000, "cached": 45000 },
+        { "at": "2026-08-17T19:15:00.000Z", "uncached": 5000, "cached": 55000 }
+      ]
+    },
+    {
+      "provider": "codex",
+      "profileSlug": "codex-profile-placeholder",
+      "sessionId": "codex-bloated-session-placeholder",
+      "points": [
+        { "at": "2026-08-17T20:00:00.000Z", "uncached": 20000, "cached": 210000, "cacheWrite": 10000, "totalInput": 240000 },
+        { "at": "2026-08-17T20:05:00.000Z", "uncached": 25000, "cached": 245000, "cacheWrite": 10000, "totalInput": 280000 },
+        { "at": "2026-08-17T20:10:00.000Z", "uncached": 30000, "cached": 280000, "cacheWrite": 10000, "totalInput": 320000 },
+        { "at": "2026-08-17T20:15:00.000Z", "uncached": 35000, "cached": 315000, "cacheWrite": 10000, "totalInput": 360000 }
+      ]
+    },
+    {
+      "provider": "codex",
+      "profileSlug": "codex-profile-placeholder",
+      "sessionId": "codex-normal-session-placeholder",
+      "points": [
+        { "at": "2026-08-17T21:00:00.000Z", "uncached": 10000, "cached": 50000 },
+        { "at": "2026-08-17T21:05:00.000Z", "uncached": 10000, "cached": 70000 },
+        { "at": "2026-08-17T21:10:00.000Z", "uncached": 10000, "cached": 90000 },
+        { "at": "2026-08-17T21:15:00.000Z", "uncached": 10000, "cached": 110000 }
+      ]
+    }
+  ],
+  "codexAtMultiplierBoundary": {
+    "provider": "codex",
+    "profileSlug": "codex-profile-placeholder",
+    "sessionId": "codex-boundary-session-placeholder",
+    "points": [
+      { "at": "2026-08-17T22:00:00.000Z", "uncached": 22000, "cached": 250000 },
+      { "at": "2026-08-17T22:05:00.000Z", "uncached": 22000, "cached": 250000 },
+      { "at": "2026-08-17T22:10:00.000Z", "uncached": 22000, "cached": 250000 },
+      { "at": "2026-08-17T22:15:00.000Z", "uncached": 22000, "cached": 250000 }
+    ]
+  }
+}

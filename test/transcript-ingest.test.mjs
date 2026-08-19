@@ -119,6 +119,12 @@ test('Claude transcript ingest handles both eras, dedupes API calls, and single-
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /malformed JSON.*profile-placeholder-01/);
   assert.doesNotMatch(warnings[0], /deliberately malformed/);
+  assert.deepEqual(
+    store.db.prepare('SELECT DISTINCT parser, parser_version FROM ingest_file_state').all()
+      .map((row) => ({ ...row })),
+    [{ parser: 'claude-transcript', parser_version: 1 }],
+    'replay state records the transcript parser provenance',
+  );
 
   const sessions = store.db.prepare('SELECT * FROM transcript_sessions ORDER BY session_id').all();
   assert.equal(sessions.length, 2);

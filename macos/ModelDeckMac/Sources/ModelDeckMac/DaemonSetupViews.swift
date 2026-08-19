@@ -116,6 +116,11 @@ struct DaemonSetupCard: View {
         }
     }
 
+    /// Issue #514: "Check Again" is the user's only escalation when the
+    /// service can't start, so `retry()` must re-evaluate deeply enough to
+    /// find a launchd job wedged on a stale launch constraint — the incident
+    /// where this button re-ran a no-op forever. Covered by
+    /// Issue514RepairTripwireTests.testCheckAgainEscalatesToTheStaleConstraintRepair.
     private var startingUp: some View {
         VStack(alignment: .leading, spacing: 6) {
             progressRow("Background service starting…")

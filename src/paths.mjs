@@ -50,6 +50,11 @@ export const CODEX_PROFILES_DIR = path.resolve(
 export const CODEX_ACTIVE_LINK = path.resolve(
   process.env.MODELDECK_CODEX_ACTIVE_LINK || path.join(os.homedir(), '.codex'),
 );
+// Grok owns this external session store. ModelDeck only streams
+// */*/updates.jsonl read-only; the override keeps tests on fixtures.
+export const GROK_SESSIONS_DIR = path.resolve(
+  process.env.MODELDECK_GROK_SESSIONS_DIR || path.join(os.homedir(), '.grok', 'sessions'),
+);
 // CLIProxyAPI owns OAuth and auth-file writes. ModelDeck only spawns its
 // provider login command, then reads identity/routing metadata from the auth
 // directory. Keep binary discovery configurable like Claude/Codex paths.

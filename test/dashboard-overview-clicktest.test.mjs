@@ -273,9 +273,18 @@ function fixture(t, { memberBlackout = null } = {}) {
  * leak that grows with every test added here.
  */
 async function landing(t, options = {}) {
-  const data = fixture(t, options);
+  const { forecastPayload = null, ...fixtureOptions } = options;
+  const data = fixture(t, fixtureOptions);
   const dom = installDom({ width: 1040, height: 340 });
   installFetch(data.app, { host: `127.0.0.1:${PORT}` });
+  if (forecastPayload) {
+    const daemonFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (!String(url).startsWith('/api/usage/exhaustion-forecast')) return daemonFetch(url);
+      const payload = typeof forecastPayload === 'function' ? forecastPayload(String(url)) : forecastPayload;
+      return { ok: true, status: 200, async json() { return payload; } };
+    };
+  }
   const harness = await loadModule('test-support/mount.jsx');
   const root = harness.mountApp(document.getElementById('root'));
   t.after(() => {
@@ -517,6 +526,52 @@ test('a routed-member blackout is loud on the Overview without opening a detail 
   );
 });
 
+test('every subscription shows a dry-time estimate and basis, with the pool worst case', async (t) => {
+  const all = [
+    {
+      accountId: 'forecast-claude-placeholder', accountLabel: 'Placeholder Claude One',
+      provider: 'claude', scope: 'weekly', status: 'forecast',
+      dryAt: '2026-08-18T09:00:00.000Z', burnRatePercentPerHour: 10,
+      resetsAt: '2026-08-18T01:00:00.000Z',
+      carryover: {
+        assumed: true, resetAt: '2026-08-18T01:00:00.000Z',
+        note: 'Assumes the measured burn rate carries over after this reset.',
+      },
+      reason: null,
+    },
+    {
+      accountId: 'forecast-codex-placeholder', accountLabel: 'Placeholder Codex One',
+      provider: 'codex', scope: 'weekly', status: 'forecast',
+      dryAt: '2026-08-18T12:00:00.000Z', burnRatePercentPerHour: 5,
+      resetsAt: '2026-08-20T00:00:00.000Z', carryover: null, reason: null,
+    },
+  ];
+  const forecastPayload = {
+    estimateLabel: 'Estimate',
+    basisWindow: { source: 'usage_snapshots', label: 'trailing 3 hours', hours: 3, minimumSpanMinutes: 30 },
+    accounts: all,
+    pool: { status: 'forecast', worstCase: all[0] },
+  };
+  await landing(t, { forecastPayload });
+
+  const card = document.querySelector('.exhaustion-forecast');
+  assert.ok(card, 'the exhaustion forecast is on the Overview');
+  assert.match(card.querySelector('.card-note').textContent,
+    /Pool worst.*Placeholder Claude One.*dry at ~/);
+  const rows = [...card.querySelectorAll('tbody tr')];
+  assert.deepEqual(rows.map((row) => row.querySelector('td').textContent.trim()), [
+    'Placeholder Claude One', 'Placeholder Codex One',
+  ]);
+  for (const row of rows) {
+    assert.match(row.querySelectorAll('td')[1].textContent, /dry at ~/);
+    assert.match(row.querySelectorAll('td')[2].textContent, /Estimate.*trailing 3 hours/);
+  }
+  assert.match(rows[0].querySelectorAll('td')[2].textContent,
+    /assumes pace carries over after .* reset/,
+    'a forecast beyond the next reset states the carryover assumption on the page');
+  assert.equal(card.querySelector('.recharts-wrapper, canvas'), null, 'the forecast is a time and basis, not a chart');
+});
+
 test('the COST lens re-denominates the page and shows the model table with its API-rate caveat', async (t) => {
   await landing(t);
   const cardTitles = () => [...document.querySelectorAll('.card-title')].map((node) => node.textContent);
@@ -579,7 +634,7 @@ test('one model id under two providers stays two series, each with its own value
   assert.equal(labels.filter((label) => label === SHARED_MODEL).length, 2, labels.join(' | '));
 
   await clickLabel('Table', () => document.querySelectorAll('table.data').length > 0, 'the data table');
-  const table = document.querySelector('table.data');
+  const table = document.querySelector('.chart-wrap table.data');
   const headers = [...table.querySelectorAll('thead th')].map((node) => node.textContent.trim());
   const rows = [...table.querySelectorAll('tbody tr')]
     .map((row) => [...row.querySelectorAll('td')].map((cell) => cell.textContent.trim()));

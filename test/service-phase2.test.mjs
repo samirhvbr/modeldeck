@@ -368,6 +368,24 @@ test('Claude activation pins proxy credentials by Keychain pointer and removes t
   assert.equal(fs.readFileSync(path.join(data.firstHome, 'settings.json'), 'utf8'), proxiedSettings);
   assert.equal(fs.existsSync(path.join(data.secondHome, 'settings.json')), false);
 
+  // Issue #522: activation resolves the Keychain item from the ACTIVATED
+  // profile's own recorded helper state. A profile with no record keeps the
+  // shared item (asserted above); a profile with a per-profile record must
+  // get its own, or activation would hand a migrated profile another
+  // profile's key — the mis-attribution blocker 1 exists to prevent.
+  const service = `cli-proxy-api-client.${first.id}`;
+  data.service.saveClaudeClientKeyRecord(first.id, {
+    mode: 'per-profile',
+    service,
+    helper: `security find-generic-password -s ${service} -w`,
+    writtenAt: new Date().toISOString(),
+  });
+  await data.service.activateAccount(first.id);
+  content = fs.readFileSync(envFile, 'utf8');
+  assert.ok(content.includes(`find-generic-password -s ${service} -w`));
+  assert.ok(!content.includes('-s cli-proxy-api-client -w'));
+  await data.service.activateAccount(second.id);
+
   // Codex activation must not touch the Claude pin.
   const codex = data.store.saveAccount({ provider: 'codex', label: 'Codex', profileRef: data.firstHome, isDefault: true });
   await data.service.activateAccount(codex.id);

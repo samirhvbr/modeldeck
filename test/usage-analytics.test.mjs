@@ -119,8 +119,10 @@ test('proxy pull parser maps the archive token breakdown and drops every secret-
     requestId: 'request-placeholder-1',
     machine: 'studio',
     observedAt: '2026-08-01T17:00:00.000Z',
+    profileLabel: null,
     source: 'user1@example.com',
     provider: 'claude',
+    providerRequestId: null,
     model: 'claude-placeholder-model',
     alias: 'placeholder-alias',
     reasoningEffort: 'high',
@@ -136,6 +138,9 @@ test('proxy pull parser maps the archive token breakdown and drops every secret-
     outputTotal: 20,
     outputReasoning: 5,
     total: 116,
+    limitUsedPercent: null,
+    limitStatus: null,
+    limitResetsAt: null,
   }]);
 
   const normalized = JSON.stringify(pull.records);
@@ -218,7 +223,13 @@ test('archive ingest counts skipped envelopes, resolves Claude accounts, and is 
     duplicates: 1,
     resolved: 1,
     unresolved: 1,
-    warnings: { emptyUsageFiles: 1, instancesFiles: 1, malformedFiles: 0, malformedRecords: 0 },
+    riderRejections: 0,
+    warnings: {
+      emptyUsageFiles: 1,
+      instancesFiles: 1,
+      malformedFiles: 0,
+      malformedRecords: 0,
+    },
   });
   assert.equal(warnings.length, 2);
   assert.match(warnings[0], /pull-003\.json: usage is empty/);
@@ -296,7 +307,13 @@ test('archive ingest skips malformed files and records while retaining valid fil
     duplicates: 0,
     resolved: 0,
     unresolved: 2,
-    warnings: { emptyUsageFiles: 0, instancesFiles: 0, malformedFiles: 1, malformedRecords: 1 },
+    riderRejections: 0,
+    warnings: {
+      emptyUsageFiles: 0,
+      instancesFiles: 0,
+      malformedFiles: 1,
+      malformedRecords: 1,
+    },
   });
   assert.equal(warnings.length, 2);
   assert.match(warnings[0], /pull-002\.json: malformed file/);

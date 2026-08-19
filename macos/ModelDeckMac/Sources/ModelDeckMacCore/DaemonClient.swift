@@ -145,6 +145,14 @@ public struct DaemonClient: Sendable {
         try await get("/api/capacity/worst")
     }
 
+    /// `GET /api/usage/exhaustion-forecast` — the daemon's reset-aware
+    /// time-to-dry estimate per account plus the pool's worst case (issue
+    /// #497). Decision 0034: this endpoint is the app's ONLY source of a dry
+    /// time; nothing here inspects live harness state.
+    public func exhaustionForecast() async throws -> ExhaustionForecast {
+        try await get("/api/usage/exhaustion-forecast")
+    }
+
     /// `GET /api/session` — fetches the daemon's mutation token. The server
     /// requires the same token as BOTH the `x-modeldeck-token` header and the
     /// `modeldeck_session` cookie on every non-GET request (`mutationAllowed`
@@ -167,6 +175,88 @@ public struct DaemonClient: Sendable {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(report)
         let _: Ack = try await send(request)
+    }
+
+    /// `POST /api/client-keys/report` — the hash→profile mapping for every
+    /// key-enabled Claude profile (#520, design §2.1). Full-state and
+    /// idempotent: the daemon applies it in one transaction as a complete
+    /// replacement and rejects a report older than the last generation it
+    /// applied, so replay can never resurrect a rotated key. No raw key is in
+    /// this body — SHA-256 hashes only.
+    @discardableResult
+    public func reportClientKeys(_ report: ClientKeyReport) async throws -> ClientKeyReportAck {
+        struct Envelope: Decodable {
+            struct Applied: Decodable {
+                var applied: Bool?
+                var generation: Int?
+            }
+            var clientKeys: Applied?
+
+            enum CodingKeys: String, CodingKey { case clientKeys }
+        }
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "client-keys", "report"]
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(report)
+        let envelope: Envelope = try await send(request)
+        // Tolerant per DaemonModels' leniency contract: an older daemon that
+        // answers `{}` is read as "applied at the generation we sent", which
+        // is the pre-#520 behaviour of a daemon with no generation to hold.
+        return ClientKeyReportAck(
+            applied: envelope.clientKeys?.applied ?? true,
+            generation: envelope.clientKeys?.generation ?? report.generation
+        )
+    }
+
+    /// `POST /api/accounts/:id/client-key-helper` — the daemon half of the
+    /// legacy→per-profile migration (#522): it repoints `settings.json` and
+    /// the pinned shell env at this profile's own Keychain item. The daemon
+    /// refuses unless `configWriteVerified` says the consented `api-keys`
+    /// append (#521) already landed, because a helper pointing at a key the
+    /// proxy's list does not carry would 401 every request. No key material
+    /// crosses this call — only the fact that the config write succeeded.
+    @discardableResult
+    public func wireClientKeyHelper(
+        accountID: String,
+        configWriteVerified: Bool
+    ) async throws -> ClientKeyHelperWiring {
+        struct Envelope: Decodable { var clientKeyHelper: ClientKeyHelperWiring }
+        struct Body: Encodable { var configWriteVerified: Bool }
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", accountID, "client-key-helper"]
+        )
+        // The write queues on the daemon's GLOBAL Claude activation lock,
+        // which another account's renewal can hold for up to 60s, then adds a
+        // Keychain presence probe (its own 5s budget) and two file writes.
+        // Same budget as setProxyRouting: with the 5s default the client
+        // abandons a migration the daemon still completes, and the app's
+        // wiring state disagrees with the daemon's record.
+        //
+        // A client-side timeout is not a verdict either way. The migration is
+        // resumable and its state is authoritative daemon-side, so callers
+        // reconcile with `clientKeyHelperWiring(accountID:)` rather than
+        // treating the throw as "it failed" — a re-run of a genuinely
+        // finished migration reports state without rewriting anything.
+        request.timeoutInterval = 120
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(configWriteVerified: configWriteVerified))
+        let envelope: Envelope = try await send(request)
+        return envelope.clientKeyHelper
+    }
+
+    /// `GET /api/accounts/:id/client-key-helper` — read-only wiring state,
+    /// including a migration that stopped between its two files.
+    public func clientKeyHelperWiring(accountID: String) async throws -> ClientKeyHelperWiring {
+        struct Envelope: Decodable { var clientKeyHelper: ClientKeyHelperWiring }
+        let request = try await authorizedRequest(
+            method: "GET",
+            pathComponents: ["api", "accounts", accountID, "client-key-helper"]
+        )
+        let envelope: Envelope = try await send(request)
+        return envelope.clientKeyHelper
     }
 
     /// `POST /api/accounts/:id/activate` — switch the account's provider to
@@ -594,3 +684,5 @@ extension DaemonClient: AccountActivating {}
 extension DaemonClient: ManagedProxyReporting {}
 
 extension DaemonClient: WorstCapacityProviding {}
+
+extension DaemonClient: ClientKeyReporting {}

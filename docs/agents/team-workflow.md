@@ -108,7 +108,7 @@ Bound 2026-08-14 (full-binding re-run).
 Bound 2026-08-14 (full-binding re-run).
 
 - **Memory home**: `docs/decisions/` + `docs/terms.md` (created on first record — nothing pre-seeded)
-- **Size bound**: 30 records — past it, sessions offer a consolidation pass, dispositioned by the decider, never run unprompted
+- **Size bound**: 40 records (raised from 30 by Tim's consolidation-pass disposition, 2026-08-17 — the store was healthy at 34; the bound now reflects real decision volume) — past it, sessions offer a consolidation pass, dispositioned by the decider, never run unprompted
 - **Backfill**: requested on 2026-08-14 (Tim, setup re-run) — the one-time lane drafting decision records from closed PRs/issues/handoffs for card-by-card disposition; not yet run
 
 ## Orchestration (pointers — ModelDeck's own machinery is authoritative)

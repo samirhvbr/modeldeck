@@ -21,7 +21,10 @@
   <key>EnvironmentVariables</key>
   <dict>
     <!-- System paths for `security` (Keychain token) plus the common CLI
-         install locations for `claude` / `codex` probes. -->
+         install locations for `claude` / `codex` probes. launchd never
+         expands $HOME here, so home-relative install locations (the native
+         installers' ~/.local/bin) are probed by absolute path in the daemon
+         instead (Service#toolPathFallback, public issue #2). -->
     <key>PATH</key>
     <string>/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin</string>
     <key>MODELDECK_HOST</key>

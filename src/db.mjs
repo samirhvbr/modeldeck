@@ -27,9 +27,12 @@ function now() {
 // margin. The newest row is protected independently of age for idle accounts.
 export const USAGE_SNAPSHOT_RETENTION_DAYS = 90;
 export const USAGE_SNAPSHOT_PRUNE_BATCH_SIZE = 500;
+export const REQUEST_USAGE_RETENTION_DAYS = 400;
+export const REQUEST_USAGE_PRUNE_BATCH_SIZE = 500;
 // Raw history retains the newest rows; truncated=true means older matching
 // observations were omitted from the response.
 export const USAGE_HISTORY_RAW_LIMIT = 10_000;
+export const CORPUS_PROVIDERS = Object.freeze(['claude', 'codex', 'grok']);
 
 export const DEFAULT_SETTINGS = Object.freeze({
   autoRefreshEnabled: true,
@@ -297,7 +300,11 @@ const REQUEST_USAGE_NUMBER_FIELDS = [
   'outputTotal',
   'outputReasoning',
   'total',
+  'limitUsedPercent',
 ];
+
+const REQUEST_USAGE_LIMIT_STATUSES = new Set(['allowed', 'allowed_warning', 'rejected']);
+const REQUEST_USAGE_PROVIDER_ID_RE = /^[A-Za-z0-9_.-]+$/;
 
 const CODEX_TURN_TOKEN_FIELDS = [
   'inputTokens',
@@ -306,6 +313,16 @@ const CODEX_TURN_TOKEN_FIELDS = [
   'outputTokens',
   'reasoningOutputTokens',
   'totalTokens',
+];
+
+const GROK_TURN_TOKEN_FIELDS = [
+  'inputTokens',
+  'outputTokens',
+  'totalTokens',
+  'cachedReadTokens',
+  'cacheCreationTokens',
+  'reasoningTokens',
+  'costUsdTicks',
 ];
 
 function validateRequestUsageRecord(record) {
@@ -322,10 +339,39 @@ function validateRequestUsageRecord(record) {
   if (record.statusCode != null && (!Number.isInteger(record.statusCode) || record.statusCode < 0)) {
     throw new Error('request usage statusCode must be a non-negative integer or null');
   }
+  if (record.profileLabel != null && (
+    typeof record.profileLabel !== 'string'
+    || !record.profileLabel.trim()
+    || record.profileLabel.length > 128
+    || /\p{Cc}/u.test(record.profileLabel)
+  )) {
+    throw new Error('request usage profileLabel must be a non-empty string of at most 128 characters, free of control characters, or null');
+  }
+  if (record.providerRequestId != null && (
+    typeof record.providerRequestId !== 'string'
+    || record.providerRequestId.length > 128
+    || !REQUEST_USAGE_PROVIDER_ID_RE.test(record.providerRequestId)
+  )) {
+    throw new Error('request usage providerRequestId must be an allowlisted string or null');
+  }
+  if (record.limitStatus != null && !REQUEST_USAGE_LIMIT_STATUSES.has(record.limitStatus)) {
+    throw new Error('request usage limitStatus must be allowed, allowed_warning, rejected, or null');
+  }
+  if (record.limitResetsAt != null) {
+    const resetMs = typeof record.limitResetsAt === 'string' ? Date.parse(record.limitResetsAt) : NaN;
+    if (!Number.isFinite(resetMs)
+      || new Date(resetMs).toISOString() !== record.limitResetsAt
+      || Math.abs(resetMs - observedMs) > REQUEST_USAGE_RETENTION_DAYS * 86_400_000) {
+      throw new Error('request usage limitResetsAt must be a canonical ISO timestamp within 400 days or null');
+    }
+  }
   for (const key of REQUEST_USAGE_NUMBER_FIELDS) {
     if (record[key] != null && (!Number.isFinite(record[key]) || record[key] < 0)) {
       throw new Error(`request usage ${key} must be a non-negative number or null`);
     }
+  }
+  if (record.limitUsedPercent != null && record.limitUsedPercent > 100) {
+    throw new Error('request usage limitUsedPercent must be at most 100 or null');
   }
   for (const key of ['inputUncached', 'inputCacheRead', 'inputCacheWrite', 'outputTotal', 'outputReasoning', 'total']) {
     if (record[key] != null && !Number.isInteger(record[key])) {
@@ -365,6 +411,64 @@ function validateCodexSessionRecord(session, turns) {
     }
     for (const key of CODEX_TURN_TOKEN_FIELDS) {
       if (!Number.isSafeInteger(turn[key]) || turn[key] < 0) throw new Error(`Codex turn ${key} must be a non-negative safe integer`);
+    }
+  }
+}
+
+function validateGrokSessionRecord(session, turns) {
+  if (!session || typeof session !== 'object' || Array.isArray(session)) throw new Error('Grok session must be an object');
+  for (const key of ['sessionId', 'profileSlug', 'cwdKey', 'machine', 'sourceFile']) {
+    if (typeof session[key] !== 'string' || !session[key].trim()) throw new Error(`Grok session ${key} is required`);
+  }
+  for (const key of ['firstTimestamp', 'lastTimestamp']) {
+    if (session[key] == null) continue;
+    const parsed = typeof session[key] === 'string' ? Date.parse(session[key]) : NaN;
+    if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== session[key]) {
+      throw new Error(`Grok session ${key} must be a canonical ISO timestamp or null`);
+    }
+  }
+  if (session.firstTimestamp != null && session.lastTimestamp != null
+      && session.firstTimestamp > session.lastTimestamp) {
+    throw new Error('Grok session firstTimestamp must not follow lastTimestamp');
+  }
+  if (!Number.isInteger(session.parserVersion) || session.parserVersion < 1) {
+    throw new Error('Grok session parserVersion must be a positive integer');
+  }
+  if (!turns || typeof turns[Symbol.iterator] !== 'function') throw new Error('Grok turns must be iterable');
+  for (const turn of turns) {
+    if (!turn || typeof turn !== 'object' || Array.isArray(turn)) throw new Error('Grok turn must be an object');
+    if (!Number.isInteger(turn.turnIndex) || turn.turnIndex < 0) throw new Error('Grok turn turnIndex must be a non-negative integer');
+    if (turn.turnId != null && (typeof turn.turnId !== 'string' || !turn.turnId.trim())) throw new Error('Grok turn turnId must be text or null');
+    if (turn.timestamp != null) {
+      const parsed = typeof turn.timestamp === 'string' ? Date.parse(turn.timestamp) : NaN;
+      if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== turn.timestamp) {
+        throw new Error('Grok turn timestamp must be a canonical ISO timestamp or null');
+      }
+    }
+    for (const key of GROK_TURN_TOKEN_FIELDS) {
+      if (!Number.isSafeInteger(turn[key]) || turn[key] < 0) throw new Error(`Grok turn ${key} must be a non-negative safe integer`);
+    }
+    for (const key of ['modelCalls', 'numTurns']) {
+      if (turn[key] != null && (!Number.isSafeInteger(turn[key]) || turn[key] < 0)) {
+        throw new Error(`Grok turn ${key} must be a non-negative safe integer or null`);
+      }
+    }
+    if (turn.apiDurationMs != null && (!Number.isFinite(turn.apiDurationMs) || turn.apiDurationMs < 0)) {
+      throw new Error('Grok turn apiDurationMs must be a non-negative number or null');
+    }
+    if (typeof turn.provenanceJson !== 'string' || typeof turn.sourceJson !== 'string') {
+      throw new Error('Grok turn provenanceJson and sourceJson are required');
+    }
+    if (!Array.isArray(turn.modelUsage)) throw new Error('Grok turn modelUsage must be an array');
+    for (const model of turn.modelUsage) {
+      if (!model || typeof model !== 'object' || Array.isArray(model)) throw new Error('Grok model usage must be an object');
+      if (typeof model.model !== 'string' || !model.model.trim()) throw new Error('Grok model usage model is required');
+      for (const key of GROK_TURN_TOKEN_FIELDS) {
+        if (!Number.isSafeInteger(model[key]) || model[key] < 0) {
+          throw new Error(`Grok model usage ${key} must be a non-negative safe integer`);
+        }
+      }
+      if (typeof model.sourceJson !== 'string') throw new Error('Grok model usage sourceJson is required');
     }
   }
 }
@@ -678,10 +782,12 @@ export class Store {
         machine TEXT NOT NULL DEFAULT 'studio',
         observed_at TEXT NOT NULL,
         account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
-        -- Raw proxy source: plaintext email for Claude. Store it only when
-        -- account_id is NULL.
+        profile_label TEXT,
+        -- Ingest-safe proxy source: plaintext identity for OAuth, SHA-256 for
+        -- key-authenticated upstreams. Store it only when account_id is NULL.
         source_raw TEXT,
         provider TEXT NOT NULL CHECK(provider IN ('claude','codex')),
+        provider_request_id TEXT,
         model TEXT NOT NULL,
         alias TEXT,
         reasoning_effort TEXT,
@@ -697,6 +803,9 @@ export class Store {
         output_total INTEGER NOT NULL DEFAULT 0,
         output_reasoning INTEGER NOT NULL DEFAULT 0,
         total INTEGER NOT NULL DEFAULT 0,
+        limit_used_percent REAL,
+        limit_status TEXT,
+        limit_resets_at TEXT,
         CHECK(account_id IS NULL OR source_raw IS NULL)
       );
       CREATE INDEX IF NOT EXISTS request_usage_observed
@@ -781,11 +890,79 @@ export class Store {
         ON codex_turns(timestamp);
       CREATE INDEX IF NOT EXISTS codex_turns_model_effort
         ON codex_turns(model, reasoning_effort);
+
+      CREATE TABLE IF NOT EXISTS grok_sessions (
+        session_id TEXT PRIMARY KEY,
+        profile_slug TEXT NOT NULL,
+        cwd_key TEXT NOT NULL,
+        machine TEXT NOT NULL DEFAULT 'studio',
+        cwd TEXT,
+        first_timestamp TEXT,
+        last_timestamp TEXT,
+        source_file TEXT NOT NULL,
+        parser_version INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS grok_sessions_profile_last
+        ON grok_sessions(profile_slug, last_timestamp);
+      CREATE INDEX IF NOT EXISTS grok_sessions_cwd
+        ON grok_sessions(cwd);
+
+      CREATE TABLE IF NOT EXISTS grok_turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL REFERENCES grok_sessions(session_id) ON DELETE CASCADE,
+        turn_index INTEGER NOT NULL,
+        turn_id TEXT,
+        timestamp TEXT,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        cached_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        model_calls INTEGER,
+        api_duration_ms REAL,
+        cost_usd_ticks INTEGER NOT NULL DEFAULT 0,
+        num_turns INTEGER,
+        parser_version INTEGER NOT NULL,
+        source_file TEXT NOT NULL,
+        source_line INTEGER NOT NULL,
+        provenance_json TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        UNIQUE(session_id, turn_index)
+      );
+      CREATE INDEX IF NOT EXISTS grok_turns_timestamp
+        ON grok_turns(timestamp);
+      CREATE INDEX IF NOT EXISTS grok_turns_session_turn_id
+        ON grok_turns(session_id, turn_id) WHERE turn_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS grok_model_usage (
+        session_id TEXT NOT NULL,
+        turn_index INTEGER NOT NULL,
+        turn_id TEXT,
+        model TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        total_tokens INTEGER NOT NULL DEFAULT 0,
+        cached_read_tokens INTEGER NOT NULL DEFAULT 0,
+        cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+        reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd_ticks INTEGER NOT NULL DEFAULT 0,
+        parser_version INTEGER NOT NULL,
+        source_json TEXT NOT NULL,
+        PRIMARY KEY(session_id, turn_index, model),
+        FOREIGN KEY(session_id, turn_index)
+          REFERENCES grok_turns(session_id, turn_index) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS grok_model_usage_model
+        ON grok_model_usage(model);
+
       CREATE TABLE IF NOT EXISTS ingest_file_state (
         path TEXT PRIMARY KEY,
         size INTEGER NOT NULL,
         mtime_ms REAL NOT NULL,
         ino INTEGER NOT NULL,
+        parser TEXT,
+        parser_version INTEGER,
         last_ingested_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS transcript_sessions (
@@ -883,6 +1060,21 @@ export class Store {
         ON transcript_skill_events(skill) WHERE skill IS NOT NULL;
       CREATE INDEX IF NOT EXISTS transcript_skill_events_command
         ON transcript_skill_events(command_name) WHERE command_name IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS findings (
+        id TEXT PRIMARY KEY,
+        pathology_kind TEXT NOT NULL,
+        scope_key TEXT NOT NULL,
+        corpus_fingerprint TEXT NOT NULL,
+        evidence_json TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+        active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
+        first_detected_at TEXT NOT NULL,
+        last_changed_at TEXT NOT NULL,
+        resolved_at TEXT,
+        UNIQUE(pathology_kind, scope_key)
+      );
+      CREATE INDEX IF NOT EXISTS findings_active_changed
+        ON findings(active, last_changed_at DESC);
       CREATE TABLE IF NOT EXISTS otel_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ingest_key TEXT NOT NULL UNIQUE,
@@ -1050,6 +1242,29 @@ export class Store {
         value_json TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL
       );
+
+      -- Issue #520 / decision 0036 D1: the app-owned client key -> profile
+      -- mapping, keyed by SHA-256 of a ModelDeck-generated 256-bit random
+      -- key. These hashes are NOT credentials and no raw key ever lands here;
+      -- the discard-hardening invariant (a request's api_key never reaches
+      -- SQLite) is unchanged. Ingest attribution reads this table (build
+      -- item 6); this schema and its write path are build item 3.
+      CREATE TABLE IF NOT EXISTS client_key_map (
+        key_sha256 TEXT PRIMARY KEY,
+        profile_id TEXT NOT NULL,
+        profile_label TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      -- The last report generation applied. The app persists a monotonic
+      -- generation and re-reports full state on every handshake; recording
+      -- what we applied is what lets a replayed or out-of-order report be
+      -- rejected instead of resurrecting a rotated key or a removed profile.
+      CREATE TABLE IF NOT EXISTS client_key_map_state (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        generation INTEGER NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `);
     this.db.prepare(`
       INSERT OR IGNORE INTO settings(id, value_json, updated_at) VALUES (1, '{}', ?)
@@ -1060,6 +1275,29 @@ export class Store {
     // downgrading a fresh fit to 'not-assessed'.
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      const requestUsageColumns = new Set(
+        this.db.prepare('PRAGMA table_info(request_usage)').all().map((column) => column.name),
+      );
+      for (const [column, type] of [
+        ['profile_label', 'TEXT'],
+        ['provider_request_id', 'TEXT'],
+        ['limit_used_percent', 'REAL'],
+        ['limit_status', 'TEXT'],
+        ['limit_resets_at', 'TEXT'],
+      ]) {
+        if (!requestUsageColumns.has(column)) {
+          this.db.exec(`ALTER TABLE request_usage ADD COLUMN ${column} ${type}`);
+        }
+      }
+      const ingestFileStateColumns = new Set(
+        this.db.prepare('PRAGMA table_info(ingest_file_state)').all().map((column) => column.name),
+      );
+      if (!ingestFileStateColumns.has('parser')) {
+        this.db.exec('ALTER TABLE ingest_file_state ADD COLUMN parser TEXT');
+      }
+      if (!ingestFileStateColumns.has('parser_version')) {
+        this.db.exec('ALTER TABLE ingest_file_state ADD COLUMN parser_version INTEGER');
+      }
       const estimateFitColumns = new Set(
         this.db.prepare('PRAGMA table_info(usage_estimate_fits)').all().map((column) => column.name),
       );
@@ -1333,6 +1571,28 @@ export class Store {
     `).run(cutoff, batchSize).changes;
   }
 
+  /// Delete at most one bounded batch of request evidence strictly older than
+  /// the retention cutoff. Boundary and future clock-skew rows remain intact.
+  pruneRequestUsageBatch({ cutoff, batchSize = REQUEST_USAGE_PRUNE_BATCH_SIZE }) {
+    const cutoffMs = typeof cutoff === 'string' ? Date.parse(cutoff) : NaN;
+    if (!Number.isFinite(cutoffMs) || new Date(cutoffMs).toISOString() !== cutoff) {
+      throw new Error('request usage prune cutoff must be a canonical ISO timestamp');
+    }
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > REQUEST_USAGE_PRUNE_BATCH_SIZE) {
+      throw new Error(`request usage prune batchSize must be an integer from 1 to ${REQUEST_USAGE_PRUNE_BATCH_SIZE}`);
+    }
+    return this.db.prepare(`
+      DELETE FROM request_usage
+      WHERE id IN (
+        SELECT id
+        FROM request_usage INDEXED BY request_usage_observed
+        WHERE observed_at < ?
+        ORDER BY observed_at, id
+        LIMIT ?
+      )
+    `).run(cutoff, batchSize).changes;
+  }
+
   /// Issue #174: the newest stored row for one (account, scope) — the
   /// statusline ingest's record-if-newer guard reads this before inserting.
   /// Same ordering contract as latestUsage: newest observed_at wins, insert
@@ -1429,12 +1689,13 @@ export class Store {
     `);
     const insert = this.db.prepare(`
       INSERT OR IGNORE INTO request_usage(
-        request_id, machine, observed_at, account_id, source_raw,
-        provider, model, alias, reasoning_effort, endpoint, user_agent_class,
+        request_id, machine, observed_at, account_id, profile_label, source_raw,
+        provider, provider_request_id, model, alias, reasoning_effort, endpoint, user_agent_class,
         failed, status_code, latency_ms, ttft_ms,
         input_uncached, input_cache_read, input_cache_write,
-        output_total, output_reasoning, total
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        output_total, output_reasoning, total,
+        limit_used_percent, limit_status, limit_resets_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const summary = { inserted: 0, duplicates: 0, resolved: 0, unresolved: 0 };
     this.db.exec('BEGIN IMMEDIATE');
@@ -1448,8 +1709,10 @@ export class Store {
           record.machine,
           record.observedAt,
           accountId,
+          record.profileLabel ?? null,
           accountId == null ? record.source : null,
           record.provider,
+          record.providerRequestId ?? null,
           record.model,
           record.alias || null,
           record.reasoningEffort || null,
@@ -1465,6 +1728,9 @@ export class Store {
           record.outputTotal ?? 0,
           record.outputReasoning ?? 0,
           record.total ?? 0,
+          record.limitUsedPercent ?? null,
+          record.limitStatus ?? null,
+          record.limitResetsAt ?? null,
         );
         if (result.changes === 0) {
           summary.duplicates += 1;
@@ -1620,21 +1886,30 @@ export class Store {
 
   getIngestFileState(filePath) {
     const row = this.db.prepare(`
-      SELECT size, mtime_ms, ino FROM ingest_file_state WHERE path = ?
+      SELECT size, mtime_ms, ino, parser, parser_version FROM ingest_file_state WHERE path = ?
     `).get(filePath);
-    return row ? { size: row.size, mtimeMs: row.mtime_ms, ino: row.ino } : null;
+    return row ? {
+      size: row.size,
+      mtimeMs: row.mtime_ms,
+      ino: row.ino,
+      parser: row.parser || null,
+      parserVersion: row.parser_version == null ? null : Number(row.parser_version),
+    } : null;
   }
 
-  recordIngestFileState(filePath, { size, mtimeMs, ino }) {
+  recordIngestFileState(filePath, { size, mtimeMs, ino }, { parser = null, parserVersion = null } = {}) {
     this.db.prepare(`
-      INSERT INTO ingest_file_state(path, size, mtime_ms, ino, last_ingested_at)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO ingest_file_state(
+        path, size, mtime_ms, ino, parser, parser_version, last_ingested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(path) DO UPDATE SET
         size = excluded.size,
         mtime_ms = excluded.mtime_ms,
         ino = excluded.ino,
+        parser = excluded.parser,
+        parser_version = excluded.parser_version,
         last_ingested_at = excluded.last_ingested_at
-    `).run(filePath, size, mtimeMs, ino, now());
+    `).run(filePath, size, mtimeMs, ino, parser, parserVersion, now());
   }
 
   /// Upsert one streamed Codex rollout summary. Active rollout files grow in
@@ -1752,6 +2027,186 @@ export class Store {
         );
         if (!turnExists) summary.turnsInserted += 1;
         else if (turnResult.changes > 0) summary.turnsUpdated += 1;
+      }
+      this.db.exec('COMMIT');
+      return summary;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /// Upsert one read-only Grok updates stream. The source file may grow in
+  /// place, so stable session/turn indexes provide the same replay behavior as
+  /// Codex rollouts while source JSON and a parser version preserve schema
+  /// drift for later reprocessing.
+  ingestGrokSession(session, turns) {
+    turns = [...turns];
+    validateGrokSessionRecord(session, turns);
+    const insertSession = this.db.prepare(`
+      INSERT INTO grok_sessions(
+        session_id, profile_slug, cwd_key, machine, cwd,
+        first_timestamp, last_timestamp, source_file, parser_version
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        profile_slug=excluded.profile_slug,
+        cwd_key=excluded.cwd_key,
+        machine=excluded.machine,
+        cwd=COALESCE(excluded.cwd, grok_sessions.cwd),
+        first_timestamp=CASE
+          WHEN excluded.first_timestamp IS NULL THEN grok_sessions.first_timestamp
+          WHEN grok_sessions.first_timestamp IS NULL THEN excluded.first_timestamp
+          ELSE MIN(grok_sessions.first_timestamp, excluded.first_timestamp)
+        END,
+        last_timestamp=CASE
+          WHEN excluded.last_timestamp IS NULL THEN grok_sessions.last_timestamp
+          WHEN grok_sessions.last_timestamp IS NULL THEN excluded.last_timestamp
+          ELSE MAX(grok_sessions.last_timestamp, excluded.last_timestamp)
+        END,
+        source_file=excluded.source_file,
+        parser_version=excluded.parser_version
+      WHERE grok_sessions.profile_slug IS NOT excluded.profile_slug
+        OR grok_sessions.cwd_key IS NOT excluded.cwd_key
+        OR grok_sessions.machine IS NOT excluded.machine
+        OR grok_sessions.cwd IS NOT COALESCE(excluded.cwd, grok_sessions.cwd)
+        OR grok_sessions.first_timestamp IS NOT CASE
+          WHEN excluded.first_timestamp IS NULL THEN grok_sessions.first_timestamp
+          WHEN grok_sessions.first_timestamp IS NULL THEN excluded.first_timestamp
+          ELSE MIN(grok_sessions.first_timestamp, excluded.first_timestamp)
+        END
+        OR grok_sessions.last_timestamp IS NOT CASE
+          WHEN excluded.last_timestamp IS NULL THEN grok_sessions.last_timestamp
+          WHEN grok_sessions.last_timestamp IS NULL THEN excluded.last_timestamp
+          ELSE MAX(grok_sessions.last_timestamp, excluded.last_timestamp)
+        END
+        OR grok_sessions.source_file IS NOT excluded.source_file
+        OR grok_sessions.parser_version IS NOT excluded.parser_version
+    `);
+    const insertTurn = this.db.prepare(`
+      INSERT INTO grok_turns(
+        session_id, turn_index, turn_id, timestamp,
+        input_tokens, output_tokens, total_tokens, cached_read_tokens,
+        cache_creation_tokens, reasoning_tokens, model_calls,
+        api_duration_ms, cost_usd_ticks, num_turns, parser_version,
+        source_file, source_line, provenance_json, source_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, turn_index) DO UPDATE SET
+        turn_id=excluded.turn_id,
+        timestamp=excluded.timestamp,
+        input_tokens=excluded.input_tokens,
+        output_tokens=excluded.output_tokens,
+        total_tokens=excluded.total_tokens,
+        cached_read_tokens=excluded.cached_read_tokens,
+        cache_creation_tokens=excluded.cache_creation_tokens,
+        reasoning_tokens=excluded.reasoning_tokens,
+        model_calls=excluded.model_calls,
+        api_duration_ms=excluded.api_duration_ms,
+        cost_usd_ticks=excluded.cost_usd_ticks,
+        num_turns=excluded.num_turns,
+        parser_version=excluded.parser_version,
+        source_file=excluded.source_file,
+        source_line=excluded.source_line,
+        provenance_json=excluded.provenance_json,
+        source_json=excluded.source_json
+      WHERE grok_turns.parser_version IS NOT excluded.parser_version
+        OR grok_turns.provenance_json IS NOT excluded.provenance_json
+        OR grok_turns.source_json IS NOT excluded.source_json
+    `);
+    const insertModel = this.db.prepare(`
+      INSERT INTO grok_model_usage(
+        session_id, turn_index, turn_id, model,
+        input_tokens, output_tokens, total_tokens, cached_read_tokens,
+        cache_creation_tokens, reasoning_tokens, cost_usd_ticks,
+        parser_version, source_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, turn_index, model) DO UPDATE SET
+        turn_id=excluded.turn_id,
+        input_tokens=excluded.input_tokens,
+        output_tokens=excluded.output_tokens,
+        total_tokens=excluded.total_tokens,
+        cached_read_tokens=excluded.cached_read_tokens,
+        cache_creation_tokens=excluded.cache_creation_tokens,
+        reasoning_tokens=excluded.reasoning_tokens,
+        cost_usd_ticks=excluded.cost_usd_ticks,
+        parser_version=excluded.parser_version,
+        source_json=excluded.source_json
+      WHERE grok_model_usage.parser_version IS NOT excluded.parser_version
+        OR grok_model_usage.source_json IS NOT excluded.source_json
+    `);
+    const existingSession = this.db.prepare('SELECT 1 FROM grok_sessions WHERE session_id = ?');
+    const existingTurn = this.db.prepare('SELECT 1 FROM grok_turns WHERE session_id = ? AND turn_index = ?');
+    const existingModel = this.db.prepare(`
+      SELECT 1 FROM grok_model_usage WHERE session_id = ? AND turn_index = ? AND model = ?
+    `);
+    const summary = {
+      sessionsInserted: 0,
+      sessionsUpdated: 0,
+      turnsInserted: 0,
+      turnsUpdated: 0,
+      modelUsageInserted: 0,
+      modelUsageUpdated: 0,
+    };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const sessionExists = Boolean(existingSession.get(session.sessionId));
+      const sessionResult = insertSession.run(
+        session.sessionId,
+        session.profileSlug,
+        session.cwdKey,
+        session.machine,
+        session.cwd ?? null,
+        session.firstTimestamp ?? null,
+        session.lastTimestamp ?? null,
+        session.sourceFile,
+        session.parserVersion,
+      );
+      if (!sessionExists) summary.sessionsInserted += 1;
+      else if (sessionResult.changes > 0) summary.sessionsUpdated += 1;
+      for (const turn of turns) {
+        const turnExists = Boolean(existingTurn.get(session.sessionId, turn.turnIndex));
+        const result = insertTurn.run(
+          session.sessionId,
+          turn.turnIndex,
+          turn.turnId ?? null,
+          turn.timestamp ?? null,
+          turn.inputTokens,
+          turn.outputTokens,
+          turn.totalTokens,
+          turn.cachedReadTokens,
+          turn.cacheCreationTokens,
+          turn.reasoningTokens,
+          turn.modelCalls ?? null,
+          turn.apiDurationMs ?? null,
+          turn.costUsdTicks,
+          turn.numTurns ?? null,
+          session.parserVersion,
+          session.sourceFile,
+          turn.sourceLine,
+          turn.provenanceJson,
+          turn.sourceJson,
+        );
+        if (!turnExists) summary.turnsInserted += 1;
+        else if (result.changes > 0) summary.turnsUpdated += 1;
+        for (const model of turn.modelUsage) {
+          const modelExists = Boolean(existingModel.get(session.sessionId, turn.turnIndex, model.model));
+          const modelResult = insertModel.run(
+            session.sessionId,
+            turn.turnIndex,
+            turn.turnId ?? null,
+            model.model,
+            model.inputTokens,
+            model.outputTokens,
+            model.totalTokens,
+            model.cachedReadTokens,
+            model.cacheCreationTokens,
+            model.reasoningTokens,
+            model.costUsdTicks,
+            session.parserVersion,
+            model.sourceJson,
+          );
+          if (!modelExists) summary.modelUsageInserted += 1;
+          else if (modelResult.changes > 0) summary.modelUsageUpdated += 1;
+        }
       }
       this.db.exec('COMMIT');
       return summary;
@@ -1979,6 +2434,120 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  /// Replace one detector's active finding set. A finding keeps one stable row
+  /// and advances its revision only when the detector's underlying corpus
+  /// fingerprint changes (or a resolved finding becomes active again). That
+  /// (id, revision) pair is the generic suppression key for future consumers.
+  syncFindings(pathologyKind, findings, { detectedAt = now() } = {}) {
+    if (typeof pathologyKind !== 'string' || !pathologyKind.trim()) {
+      throw new Error('finding pathology kind must be a non-empty string');
+    }
+    if (!Array.isArray(findings)) throw new Error('findings must be an array');
+    if (typeof detectedAt !== 'string' || !Number.isFinite(Date.parse(detectedAt))) {
+      throw new Error('finding detectedAt must be an ISO timestamp');
+    }
+
+    const existingById = this.db.prepare('SELECT * FROM findings WHERE id = ?');
+    const insert = this.db.prepare(`
+      INSERT INTO findings(
+        id, pathology_kind, scope_key, corpus_fingerprint, evidence_json,
+        revision, active, first_detected_at, last_changed_at, resolved_at
+      ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, NULL)
+    `);
+    const reactivate = this.db.prepare(`
+      UPDATE findings SET
+        corpus_fingerprint = ?, evidence_json = ?, revision = revision + 1,
+        active = 1, last_changed_at = ?, resolved_at = NULL
+      WHERE id = ?
+    `);
+    const refreshEvidence = this.db.prepare(`
+      UPDATE findings SET evidence_json = ? WHERE id = ?
+    `);
+    const activeForKind = this.db.prepare(`
+      SELECT id FROM findings WHERE pathology_kind = ? AND active = 1
+    `);
+    const resolve = this.db.prepare(`
+      UPDATE findings SET
+        active = 0, revision = revision + 1, last_changed_at = ?, resolved_at = ?
+      WHERE id = ? AND active = 1
+    `);
+    const summary = { inserted: 0, updated: 0, resolved: 0, unchanged: 0 };
+    const seen = new Set();
+
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const finding of findings) {
+        if (!finding || typeof finding !== 'object' || Array.isArray(finding)) {
+          throw new Error('finding must be a JSON object');
+        }
+        for (const field of ['id', 'scopeKey', 'corpusFingerprint']) {
+          if (typeof finding[field] !== 'string' || !finding[field].trim()) {
+            throw new Error(`finding ${field} must be a non-empty string`);
+          }
+        }
+        if (finding.evidence == null || typeof finding.evidence !== 'object' || Array.isArray(finding.evidence)) {
+          throw new Error('finding evidence must be a JSON object');
+        }
+        if (seen.has(finding.id)) throw new Error(`duplicate finding id: ${finding.id}`);
+        seen.add(finding.id);
+        const evidenceJson = JSON.stringify(finding.evidence);
+        const existing = existingById.get(finding.id);
+        if (!existing) {
+          insert.run(
+            finding.id,
+            pathologyKind,
+            finding.scopeKey,
+            finding.corpusFingerprint,
+            evidenceJson,
+            detectedAt,
+            detectedAt,
+          );
+          summary.inserted += 1;
+          continue;
+        }
+        if (existing.pathology_kind !== pathologyKind || existing.scope_key !== finding.scopeKey) {
+          throw new Error(`finding id collision: ${finding.id}`);
+        }
+        if (existing.active && existing.corpus_fingerprint === finding.corpusFingerprint) {
+          if (existing.evidence_json !== evidenceJson) refreshEvidence.run(evidenceJson, finding.id);
+          summary.unchanged += 1;
+          continue;
+        }
+        reactivate.run(finding.corpusFingerprint, evidenceJson, detectedAt, finding.id);
+        summary.updated += 1;
+      }
+
+      for (const row of activeForKind.all(pathologyKind)) {
+        if (seen.has(row.id)) continue;
+        if (resolve.run(detectedAt, detectedAt, row.id).changes > 0) summary.resolved += 1;
+      }
+      this.db.exec('COMMIT');
+      return summary;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  listFindings({ includeResolved = false } = {}) {
+    const rows = this.db.prepare(`
+      SELECT * FROM findings
+      ${includeResolved ? '' : 'WHERE active = 1'}
+      ORDER BY active DESC, last_changed_at DESC, pathology_kind, id
+    `).all();
+    return rows.map((row) => ({
+      id: row.id,
+      pathologyKind: row.pathology_kind,
+      revision: row.revision,
+      suppressionKey: `${row.id}:${row.revision}`,
+      active: Boolean(row.active),
+      evidence: JSON.parse(row.evidence_json),
+      firstDetectedAt: row.first_detected_at,
+      lastChangedAt: row.last_changed_at,
+      resolvedAt: row.resolved_at,
+    }));
   }
 
   /// Attach previously unresolved Claude rows when their raw proxy source now
@@ -2221,7 +2790,7 @@ export class Store {
     return bySlug;
   }
 
-  /// Rank sessions across BOTH providers by tokens burned in [since, until).
+  /// Rank sessions across every corpus provider by tokens burned in [since, until).
   ///
   /// Membership is "this session had a request/turn inside the range", and the
   /// aggregates then cover the in-range requests only — the same half-open
@@ -2235,13 +2804,14 @@ export class Store {
   /// (Adding the rollup is the documented ~2× inflation trap.)
   usageSessions({
     since = null, until = null, provider = null, accountId = null, limit = null, project = null,
+    includeCorpusOnly = true,
   } = {}) {
     since = canonicalSummaryBound(since, 'since', 'usage sessions');
     until = canonicalSummaryBound(until, 'until', 'usage sessions');
     if (since && until && since >= until) throw new Error('usage sessions since must be earlier than until');
     provider = usageSummaryFilter(provider, 'provider', 'usage sessions');
-    if (provider != null && !['claude', 'codex'].includes(provider)) {
-      throw new Error('usage sessions provider must be claude or codex');
+    if (provider != null && !CORPUS_PROVIDERS.includes(provider)) {
+      throw new Error('usage sessions provider must be claude, codex, or grok');
     }
     accountId = usageSummaryFilter(accountId, 'accountId', 'usage sessions');
     // Issue #346: the project-burn drill-down is the same leaderboard narrowed
@@ -2272,13 +2842,18 @@ export class Store {
       }
     }
 
-    const claudeRows = provider === 'codex' || (scopedProvider && scopedProvider !== 'claude') ? [] : this.transcriptSessionRows({
+    const claudeRows = (provider && provider !== 'claude') || (scopedProvider && scopedProvider !== 'claude') ? [] : this.transcriptSessionRows({
       since, until, profileSlug: scopedSlug, project, limit: rowLimit + 1,
     });
-    const codexRows = provider === 'claude' || (scopedProvider && scopedProvider !== 'codex') ? [] : this.codexSessionRows({
+    const codexRows = (provider && provider !== 'codex') || (scopedProvider && scopedProvider !== 'codex') ? [] : this.codexSessionRows({
       since, until, profileSlug: scopedSlug, project, limit: rowLimit + 1,
     });
-    const merged = [...claudeRows, ...codexRows].sort(
+    const grokRows = !includeCorpusOnly || (provider && provider !== 'grok') || scopedProvider
+      ? []
+      : this.grokSessionRows({
+        since, until, profileSlug: scopedSlug, project, limit: rowLimit + 1,
+      });
+    const merged = [...claudeRows, ...codexRows, ...grokRows].sort(
       (a, b) => b.totalTokens - a.totalTokens || String(b.lastAt).localeCompare(String(a.lastAt)),
     );
     const sessions = merged.slice(0, rowLimit);
@@ -2472,6 +3047,82 @@ export class Store {
     });
   }
 
+  /// Grok's turn_completed usage is already per-turn rather than cumulative.
+  /// Its inputTokens includes the cached/cache-creation subsets, so the
+  /// leaderboard uses that reported input directly.
+  grokSessionRows({
+    since = null, until = null, profileSlug = null, limit = 1, sessionId = null, project = null,
+  } = {}) {
+    const turnAt = 'COALESCE(t.timestamp, g.last_timestamp)';
+    const clauses = [];
+    const params = [];
+    if (since) { clauses.push(`${turnAt} >= ?`); params.push(since); }
+    if (until) { clauses.push(`${turnAt} < ?`); params.push(until); }
+    if (profileSlug) { clauses.push('g.profile_slug = ?'); params.push(profileSlug); }
+    if (sessionId) { clauses.push('g.session_id = ?'); params.push(sessionId); }
+    if (project) {
+      const predicate = this.projectPredicate('g.cwd', project);
+      clauses.push(predicate.sql);
+      params.push(...predicate.params);
+    }
+    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+    const rows = this.db.prepare(`
+      SELECT g.session_id AS session_id, g.profile_slug AS profile_slug, g.cwd AS cwd,
+             MIN(${turnAt}) AS first_at, MAX(${turnAt}) AS last_at,
+             COUNT(*) AS turns,
+             COALESCE(SUM(t.total_tokens), 0) AS total_tokens,
+             COALESCE(SUM(t.output_tokens), 0) AS output_tokens,
+             COALESCE(SUM(t.input_tokens), 0) AS input_tokens
+      FROM grok_sessions g
+      JOIN grok_turns t ON t.session_id = g.session_id
+      ${where}
+      GROUP BY g.session_id
+      ORDER BY total_tokens DESC, last_at DESC
+      LIMIT ?
+    `).all(...params, limit);
+    const models = this.db.prepare(`
+      SELECT m.model AS model, COUNT(*) AS turns
+      FROM grok_model_usage m
+      JOIN grok_turns t
+        ON t.session_id = m.session_id AND t.turn_index = m.turn_index
+      JOIN grok_sessions g ON g.session_id = t.session_id
+      WHERE m.session_id = ?
+        ${since ? `AND ${turnAt} >= ?` : ''} ${until ? `AND ${turnAt} < ?` : ''}
+      GROUP BY m.model
+      ORDER BY turns DESC, m.model
+    `);
+    const bounds = [since, until].filter((value) => value != null);
+    return rows.map((row) => {
+      const modelRows = models.all(row.session_id, ...bounds);
+      const identity = projectIdentityOf(row.cwd);
+      return {
+        provider: 'grok',
+        sessionId: row.session_id,
+        profileSlug: row.profile_slug,
+        title: null,
+        titleSource: null,
+        cwd: row.cwd,
+        project: identity.project,
+        worktree: identity.worktree,
+        gitBranch: null,
+        firstAt: row.first_at,
+        lastAt: row.last_at,
+        requests: Number(row.turns || 0),
+        totalTokens: Number(row.total_tokens || 0),
+        outputTokens: Number(row.output_tokens || 0),
+        inputTokens: Number(row.input_tokens || 0),
+        avgInputTokens: sessionAverage(Number(row.input_tokens || 0), Number(row.turns || 0)),
+        subagents: 0,
+        subagentTokens: 0,
+        models: modelRows.map((model) => model.model).filter(Boolean),
+        efforts: [],
+        skills: [],
+        commands: [],
+        archived: null,
+      };
+    });
+  }
+
   /// One session in full: its leaderboard row (over the session's whole life,
   /// not a range), the subagent rollup rows with their OWN request aggregates,
   /// the skill/slash-command events, and the context-size trend.
@@ -2481,16 +3132,21 @@ export class Store {
     if (!sessionId) throw new Error('usage sessions sessionId is required');
     if (!profile) throw new Error('usage sessions profile is required');
     provider = usageSummaryFilter(provider, 'provider', 'usage sessions');
-    if (provider != null && !['claude', 'codex'].includes(provider)) {
-      throw new Error('usage sessions provider must be claude or codex');
+    if (provider != null && !CORPUS_PROVIDERS.includes(provider)) {
+      throw new Error('usage sessions provider must be claude, codex, or grok');
     }
 
     const accounts = this.accountsByProfileSlug();
-    const claude = provider === 'codex' ? [] : this.transcriptSessionRows({ sessionId, profileSlug: profile, limit: 1 });
-    const codex = provider === 'claude' || claude.length
+    const claude = provider && provider !== 'claude'
+      ? []
+      : this.transcriptSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const codex = (provider && provider !== 'codex') || claude.length
       ? []
       : this.codexSessionRows({ sessionId, profileSlug: profile, limit: 1 });
-    const session = claude[0] || codex[0] || null;
+    const grok = (provider && provider !== 'grok') || claude.length || codex.length
+      ? []
+      : this.grokSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const session = claude[0] || codex[0] || grok[0] || null;
     if (!session) return { session: null, subagents: [], skills: [], contextTrend: [], truncated: false };
     const account = accounts.get(`${session.provider}:${session.profileSlug}`) || null;
     session.accountId = account ? account.accountId : null;
@@ -2539,8 +3195,9 @@ export class Store {
       lastAt: row.last_at,
     }));
 
-    const trendRows = session.provider === 'claude'
-      ? this.db.prepare(`
+    let trendRows;
+    if (session.provider === 'claude') {
+      trendRows = this.db.prepare(`
         SELECT r.observed_at AS observed_at, r.model AS model, r.agent_id AS agent_id,
                ${TRANSCRIPT_INPUT} AS input_tokens, r.output_tokens AS output_tokens,
                ${TRANSCRIPT_TOTAL} AS total_tokens
@@ -2548,8 +3205,9 @@ export class Store {
         WHERE r.session_id = ? AND r.profile_slug = ?
         ORDER BY r.observed_at
         LIMIT ?
-      `).all(session.sessionId, session.profileSlug, USAGE_SESSION_TREND_LIMIT + 1)
-      : this.db.prepare(`
+      `).all(session.sessionId, session.profileSlug, USAGE_SESSION_TREND_LIMIT + 1);
+    } else if (session.provider === 'codex') {
+      trendRows = this.db.prepare(`
         SELECT t.timestamp AS observed_at, t.model AS model, NULL AS agent_id,
                ${CODEX_INPUT} AS input_tokens, t.output_tokens AS output_tokens,
                t.total_tokens AS total_tokens
@@ -2558,6 +3216,20 @@ export class Store {
         ORDER BY t.turn_index
         LIMIT ?
       `).all(session.sessionId, USAGE_SESSION_TREND_LIMIT + 1);
+    } else {
+      trendRows = this.db.prepare(`
+        SELECT t.timestamp AS observed_at,
+               (SELECT m.model FROM grok_model_usage m
+                WHERE m.session_id = t.session_id AND m.turn_index = t.turn_index
+                ORDER BY m.input_tokens + m.output_tokens DESC, m.model LIMIT 1) AS model,
+               NULL AS agent_id, t.input_tokens AS input_tokens,
+               t.output_tokens AS output_tokens, t.total_tokens AS total_tokens
+        FROM grok_turns t
+        WHERE t.session_id = ?
+        ORDER BY t.turn_index
+        LIMIT ?
+      `).all(session.sessionId, USAGE_SESSION_TREND_LIMIT + 1);
+    }
 
     const truncated = trendRows.length > USAGE_SESSION_TREND_LIMIT;
     const contextTrend = trendRows.slice(0, USAGE_SESSION_TREND_LIMIT).map((row, index) => ({
@@ -2603,30 +3275,55 @@ export class Store {
     if (!sessionId) throw new Error('session anatomy sessionId is required');
     if (!profile) throw new Error('session anatomy profile is required');
     provider = usageSummaryFilter(provider, 'provider', 'session anatomy');
-    if (provider != null && !['claude', 'codex'].includes(provider)) {
-      throw new Error('session anatomy provider must be claude or codex');
+    if (provider != null && !CORPUS_PROVIDERS.includes(provider)) {
+      throw new Error('session anatomy provider must be claude, codex, or grok');
     }
-    const claude = provider === 'codex' ? [] : this.transcriptSessionRows({ sessionId, profileSlug: profile, limit: 1 });
-    const codex = provider === 'claude' || claude.length ? [] : this.codexSessionRows({ sessionId, profileSlug: profile, limit: 1 });
-    const session = claude[0] || codex[0] || null;
+    const claude = provider && provider !== 'claude'
+      ? []
+      : this.transcriptSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const codex = (provider && provider !== 'codex') || claude.length
+      ? []
+      : this.codexSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const grok = (provider && provider !== 'grok') || claude.length || codex.length
+      ? []
+      : this.grokSessionRows({ sessionId, profileSlug: profile, limit: 1 });
+    const session = claude[0] || codex[0] || grok[0] || null;
     if (!session) return {
       session: null, supports: null, totals: null, timeline: null,
       composition: [], compositionTruncated: false, compositionTotal: 0,
       curve: [], curveStride: 1, events: { skills: [], launches: [] }, truncated: false,
     };
     const isClaude = session.provider === 'claude';
-    const read = isClaude ? this.db.prepare(`
-      SELECT observed_at AS at, model, effort, agent_id, input_tokens AS fresh,
-             cache_creation_input_tokens AS write, cache_read_input_tokens AS read, output_tokens AS out
-      FROM transcript_requests WHERE session_id = ? AND profile_slug = ?
-      ORDER BY observed_at, id LIMIT ?
-    `).all(session.sessionId, session.profileSlug, SESSION_ANATOMY_ROW_LIMIT + 1) : this.db.prepare(`
-      SELECT COALESCE(t.timestamp, c.last_timestamp) AS at, t.model, t.reasoning_effort AS effort,
-             NULL AS agent_id, ${CODEX_INPUT_UNCACHED} AS fresh, t.cache_write_input_tokens AS write,
-             t.cached_input_tokens AS read, t.output_tokens AS out, t.total_tokens AS reported
-      FROM codex_turns t JOIN codex_sessions c ON c.session_id = t.session_id
-      WHERE t.session_id = ? ORDER BY t.turn_index LIMIT ?
-    `).all(session.sessionId, SESSION_ANATOMY_ROW_LIMIT + 1);
+    let read;
+    if (isClaude) {
+      read = this.db.prepare(`
+        SELECT observed_at AS at, model, effort, agent_id, input_tokens AS fresh,
+               cache_creation_input_tokens AS write, cache_read_input_tokens AS read, output_tokens AS out
+        FROM transcript_requests WHERE session_id = ? AND profile_slug = ?
+        ORDER BY observed_at, id LIMIT ?
+      `).all(session.sessionId, session.profileSlug, SESSION_ANATOMY_ROW_LIMIT + 1);
+    } else if (session.provider === 'codex') {
+      read = this.db.prepare(`
+        SELECT COALESCE(t.timestamp, c.last_timestamp) AS at, t.model, t.reasoning_effort AS effort,
+               NULL AS agent_id, ${CODEX_INPUT_UNCACHED} AS fresh, t.cache_write_input_tokens AS write,
+               t.cached_input_tokens AS read, t.output_tokens AS out, t.total_tokens AS reported
+        FROM codex_turns t JOIN codex_sessions c ON c.session_id = t.session_id
+        WHERE t.session_id = ? ORDER BY t.turn_index LIMIT ?
+      `).all(session.sessionId, SESSION_ANATOMY_ROW_LIMIT + 1);
+    } else {
+      read = this.db.prepare(`
+        SELECT COALESCE(t.timestamp, g.last_timestamp) AS at,
+               (SELECT m.model FROM grok_model_usage m
+                WHERE m.session_id = t.session_id AND m.turn_index = t.turn_index
+                ORDER BY m.input_tokens + m.output_tokens DESC, m.model LIMIT 1) AS model,
+               NULL AS effort, NULL AS agent_id,
+               MAX(0, t.input_tokens - t.cached_read_tokens - t.cache_creation_tokens) AS fresh,
+               t.cache_creation_tokens AS write, t.cached_read_tokens AS read,
+               t.output_tokens AS out, t.total_tokens AS reported
+        FROM grok_turns t JOIN grok_sessions g ON g.session_id = t.session_id
+        WHERE t.session_id = ? ORDER BY t.turn_index LIMIT ?
+      `).all(session.sessionId, SESSION_ANATOMY_ROW_LIMIT + 1);
+    }
     const truncated = read.length > SESSION_ANATOMY_ROW_LIMIT;
     const rows = read.slice(0, SESSION_ANATOMY_ROW_LIMIT);
     const rollupRead = isClaude ? this.db.prepare(`
@@ -2748,8 +3445,8 @@ export class Store {
         timeline: true, curve: true, cache: true, cacheRate: isClaude, unit: isClaude ? 'request' : 'turn',
         composition: isClaude, skillEvents: isClaude, laneLaunches: isClaude,
         agentTypes: isClaude && composition.some((part) => part.kind === 'lane' && part.agentType),
-        note: isClaude ? null : 'Codex rollouts record turns only — no subagent or skill records exist to dissect. '
-          + 'tokens is the displayed token-class sum; reportedTokens preserves the rollout total without reinterpreting it.',
+        note: isClaude ? null : `${session.provider === 'codex' ? 'Codex rollouts' : 'Grok updates'} record turns only — no subagent or skill records exist to dissect. `
+          + 'tokens is the displayed token-class sum; reportedTokens preserves the provider total without reinterpreting it.',
       },
       totals: { ...totals, lanes: composition.filter((part) => part.kind === 'lane').length, lanesWithoutRequests, durationMs, firstAt: firstMs ? new Date(firstMs).toISOString() : session.firstAt, lastAt: lastMs ? new Date(lastMs).toISOString() : session.lastAt },
       timeline: { bucketMs, buckets: timeline }, composition,
@@ -3215,11 +3912,15 @@ export class Store {
       ...projectBurnPayload(entry.aggregate),
     }));
 
-    // The drill-down is the session leaderboard narrowed to this project, so
-    // the two views agree by construction rather than by convention.
+    // This drill-down is the wire-provider subset of the session leaderboard.
+    // Project burn is reconciled against a warehouse that does not carry
+    // corpus-only providers yet, so Grok stays in context/session APIs without
+    // receiving a share of Claude/Codex subscription burn here.
     const sessions = project == null
       ? null
-      : this.usageSessions({ since, until, provider, project, limit: rowLimit });
+      : this.usageSessions({
+        since, until, provider, project, limit: rowLimit, includeCorpusOnly: false,
+      });
     const series = bucket == null
       ? null
       : this.projectBurnSeries({ since, until, provider, project, bucket });
@@ -3285,6 +3986,89 @@ export class Store {
     this.db.prepare('UPDATE settings SET value_json = ?, updated_at = ? WHERE id = 1')
       .run(JSON.stringify(settings), now());
     return settings;
+  }
+
+  // --- Client key map (issue #520, design §2.1/§2.2, decision 0036 D1) ---
+
+  // The last report generation applied, 0 before any report.
+  clientKeyMapGeneration() {
+    const row = this.db.prepare('SELECT generation FROM client_key_map_state WHERE id = 1').get();
+    return row ? Number(row.generation) : 0;
+  }
+
+  clientKeyMapEntries() {
+    return this.db.prepare('SELECT * FROM client_key_map ORDER BY key_sha256').all().map((row) => ({
+      keySha256: row.key_sha256,
+      profileId: row.profile_id,
+      profileLabel: row.profile_label,
+      createdAt: row.created_at,
+    }));
+  }
+
+  // Resolve a hashed client key to its profile, or null. Unknown keys
+  // resolve to null so attribution stays honest (design §2.2) — an unknown
+  // key value, raw or hashed, is never stored or logged by the caller.
+  clientKeyProfile(keySha256) {
+    const row = this.db.prepare('SELECT * FROM client_key_map WHERE key_sha256 = ?').get(String(keySha256 || ''));
+    if (!row) return null;
+    return { profileId: row.profile_id, profileLabel: row.profile_label };
+  }
+
+  // Apply one app report as an ATOMIC FULL REPLACEMENT (design §2.1).
+  //
+  // Entries absent from the report are deleted, so a rotation or a profile
+  // removal takes effect at this report and a removed key thereafter
+  // resolves to honest NULL. The generation is checked INSIDE the same
+  // transaction that writes, so two racing reports cannot interleave into a
+  // mixed state: a report at or below the applied generation is rejected
+  // (replay, out-of-order delivery) and changes nothing.
+  //
+  // Entries are pre-validated by the caller (ModelDeckService.reportClientKeys);
+  // this method owns atomicity and the generation gate only.
+  replaceClientKeyMap({ generation, entries, maximumGenerationJump = Infinity }) {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const applied = this.clientKeyMapGeneration();
+      // A report may move the ratchet forward, not teleport it (CodeRabbit,
+      // PR #529). Checked here rather than in the caller because `applied` is
+      // only authoritative inside this transaction. A refusal is not fatal:
+      // the app's resync adopts the real generation and retries from there.
+      if (generation > applied + maximumGenerationJump) {
+        this.db.exec('ROLLBACK');
+        return {
+          applied: false,
+          reason: 'generation-jump-refused',
+          generation: applied,
+          entries: this.clientKeyMapEntries().length,
+        };
+      }
+      if (!(generation > applied)) {
+        this.db.exec('ROLLBACK');
+        // Nothing was written; the caller reports the mapping as it stands.
+        return {
+          applied: false,
+          reason: 'stale-generation',
+          generation: applied,
+          entries: this.clientKeyMapEntries().length,
+        };
+      }
+      this.db.prepare('DELETE FROM client_key_map').run();
+      const insert = this.db.prepare(`
+        INSERT INTO client_key_map(key_sha256, profile_id, profile_label, created_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      const at = now();
+      for (const entry of entries) insert.run(entry.keySha256, entry.profileId, entry.profileLabel, at);
+      this.db.prepare(`
+        INSERT INTO client_key_map_state(id, generation, updated_at) VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET generation = excluded.generation, updated_at = excluded.updated_at
+      `).run(generation, at);
+      this.db.exec('COMMIT');
+      return { applied: true, generation, entries: entries.length };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   recordLaunch({ accountId, projectId, provider, commandPreview, dryRun = false }) {

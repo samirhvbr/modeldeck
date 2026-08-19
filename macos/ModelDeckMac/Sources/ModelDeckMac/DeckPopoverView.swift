@@ -18,6 +18,11 @@ struct DeckPopoverView: View {
     /// as Settings → Accounts — one flow, two honest surfaces, and the
     /// roster's own controls can never restart what the deck launched.
     @ObservedObject var signInModel: AccountSignInModel
+    /// Issue #515: the #396 credential repair, so the routed-failure banner
+    /// can offer the fix it names. The SAME shared instance Settings holds —
+    /// a repair launched from the deck is the repair Settings shows running,
+    /// and neither surface can start a second one (the #213 precedent).
+    @ObservedObject var proxyReloginModel: ProxyReloginModel
     /// Issue #33 final placement: the gear menu carries the PRIMARY
     /// "Check for App Updates…" affordance, wired to the same shared model
     /// as the Settings mirror — one check state, two entry points.
@@ -578,20 +583,28 @@ struct DeckPopoverView: View {
     /// Issue #395: live, self-clearing evidence from the existing routed-
     /// request stream. It stays in the deck's always-visible header space and
     /// is deliberately not dismissible: a member serving only failures must
-    /// not become silent again. Slice H (#396) owns the eventual repair flow;
-    /// this slice states the remedy without inventing a second login action.
+    /// not become silent again.
+    ///
+    /// Issue #515 (Tim: "the app needs to be helpful, not just give me a red
+    /// warning label"): the banner names a remedy, so it CARRIES that remedy.
+    /// It renders the #396 repair from the very presentation the Settings row
+    /// renders — same model instance, same derivation — so neither surface can
+    /// offer a fix the other hides. A daemon that offers no repair still shows
+    /// no control (the #149/#174 discipline); an unavailable one says why.
     @ViewBuilder
     private var memberBlackoutBanner: some View {
         if let alerts = statusModel.deckState?.memberBlackout?.alerts {
             ForEach(alerts) { alert in
-                let httpStatus = alert.statusCode.map { " (HTTP \($0))" } ?? ""
-                let message = "\(alert.statusLine)\(httpStatus). \(alert.remedy)"
-                Label(message, systemImage: "exclamationmark.octagon.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .help(message)
-                    .accessibilityLabel("Pool alert. \(message)")
+                let account = statusModel.deckState?.accounts.first { $0.id == alert.accountId }
+                MemberBlackoutBannerRow(
+                    alert: alert,
+                    account: account,
+                    relogin: account.flatMap {
+                        proxyReloginModel.presentation(for: $0, routedFailures: alert)
+                    },
+                    onFixSignIn: { account in proxyReloginModel.begin(account: account) },
+                    onStop: { proxyReloginModel.cancel(accountID: alert.accountId) }
+                )
             }
         }
     }
@@ -733,6 +746,7 @@ struct DeckPopoverView: View {
                             menuBarSourceTooltip: sourceTooltip,
                             staleness: { statusModel.cardStaleness(for: $0) },
                             signInRecovery: { statusModel.signInRecovery(for: $0) },
+                            forecast: { statusModel.exhaustionForecast(for: $0) },
                             renewPresentation: { renewModel.presentation(for: $0.account) },
                             onRenewNow: { row in
                                 Task { await renewModel.renew(account: row.account) }
@@ -767,6 +781,7 @@ struct DeckPopoverView: View {
                             isExpanded: deckModel.isExpanded(row.id),
                             staleness: statusModel.cardStaleness(for: row),
                             signInRecovery: statusModel.signInRecovery(for: row),
+                            forecast: statusModel.exhaustionForecast(for: row),
                             renew: renewModel.presentation(for: row.account),
                             onRenewNow: {
                                 Task { await renewModel.renew(account: row.account) }
@@ -1116,6 +1131,153 @@ struct DeckPopoverView: View {
     }
 }
 
+/// Issue #515: one routed-failure alert, WITH the remedy it names.
+///
+/// The evidence line is unchanged from #395. Under it sits the #396 repair in
+/// exactly the states that model reports: an armed FIX behind the same
+/// confirmation Settings uses (nothing leaves the app before the user agrees),
+/// a running sign-in with its Stop, a settled outcome, or — when the proxy
+/// cannot start one — the daemon's own reason, said in place rather than left
+/// as a dead control (the PR #435 rule).
+///
+/// Accessibility: every control here is a real SwiftUI Button, so it takes
+/// keyboard focus and Space/Return like any other; nothing is hover-only. The
+/// evidence line keeps its own VoiceOver sentence and each control carries a
+/// label naming the account, so neither is read as a bare "Fix".
+struct MemberBlackoutBannerRow: View {
+    let alert: MemberBlackoutAlert
+    /// The deck's account for this alert; nil when state and alert disagree
+    /// (mid-refresh), which renders the evidence line alone.
+    let account: DeckAccount?
+    /// The SAME presentation the Settings row renders — see #515.
+    let relogin: ProxyReloginRowPresentation?
+    let onFixSignIn: (DeckAccount) -> Void
+    let onStop: () -> Void
+
+    @State private var isConfirming = false
+
+    var body: some View {
+        let httpStatus = alert.statusCode.map { " (HTTP \($0))" } ?? ""
+        let message = "\(alert.statusLine)\(httpStatus). \(alert.remedy)"
+        VStack(alignment: .leading, spacing: 2) {
+            Label(message, systemImage: "exclamationmark.octagon.fill")
+                .font(.caption)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(message)
+                .accessibilityLabel("Pool alert. \(message)")
+            repairControl
+        }
+    }
+
+    @ViewBuilder
+    private var repairControl: some View {
+        if let account, let relogin {
+            switch relogin.display {
+            case .action(let prominent):
+                // CodeRabbit (PR #516): gate on `prominent`, exactly as the
+                // Settings row does. A BENCHED member can carry a routed-
+                // failure streak — the streak promotes nothing there, because
+                // signing in again would not un-bench it — and an ungated
+                // button here would show a fix Settings hides: criterion 3's
+                // disagreement, reintroduced by the surface meant to end it.
+                if prominent {
+                    // Promoted on wire evidence: the streak IS the reason, and
+                    // the #515 derivation already folded it in, so this button
+                    // appears exactly when the Settings row's does.
+                    //
+                    // The confirmation is a deck POPOVER, not a modal dialog:
+                    // the deck lives inside a menu-bar window that a modal
+                    // presentation fights with, and the explanation-popover
+                    // anatomy (#118/#152) is the surface's own idiom for "read
+                    // this, then one button". The disclosure sentence is
+                    // Settings' verbatim `ProxyRelogin.confirmation` — one
+                    // copy, one seam, so no path reaches the daemon without
+                    // the same words first.
+                    Button(ProxyRelogin.actionTitle) { isConfirming = true }
+                        .controlSize(.small)
+                        .help(ProxyRelogin.confirmation(label: account.label))
+                        .accessibilityLabel("Fix the proxy sign-in for \(account.label)")
+                        .popover(isPresented: $isConfirming, arrowEdge: .bottom) {
+                            ProxyReloginConfirmView(label: account.label) {
+                                isConfirming = false
+                                onFixSignIn(account)
+                            }
+                        }
+                } else if let credentialText = relogin.credentialText {
+                    // Not promoted, but not silent either: the row's own
+                    // sentence for this state ("Benched in the proxy pool")
+                    // says why the remedy the banner names is not offered
+                    // here — the same words Settings shows.
+                    Text(credentialText)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityLabel("Proxy sign-in. \(credentialText)")
+                }
+            case .running(let text, let canCancel):
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text(text)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if canCancel {
+                        Button("Stop", action: onStop)
+                            .controlSize(.small)
+                            .help(ProxyRelogin.cancelTooltip)
+                            .accessibilityLabel(
+                                "Stop the proxy sign-in for \(account.label)"
+                            )
+                    }
+                }
+            case .note(let text), .error(let text):
+                Text(text)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Proxy sign-in. \(text)")
+            case .unavailable(let reason):
+                // No button, but never a silent absence: the banner names the
+                // remedy, so it must also say why the app cannot run it.
+                Text(reason)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Proxy sign-in unavailable. \(reason)")
+            case .quiet:
+                EmptyView()
+            }
+        }
+    }
+}
+
+/// Issue #515: the deck's confirmation before a proxy sign-in opens — the
+/// WarningExplanationView anatomy (title, calm body, ONE prominent action)
+/// carrying Settings' own disclosure sentence. Dismissing it (Escape, or a
+/// click outside) is the "no": nothing has been asked of the daemon yet.
+struct ProxyReloginConfirmView: View {
+    let label: String
+    let onConfirm: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Fix the proxy sign-in for \(label)?")
+                .font(.system(size: 12, weight: .semibold))
+            Text(ProxyRelogin.confirmation(label: label))
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("Open Sign-in", action: onConfirm)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .accessibilityLabel("Open the proxy sign-in for \(label)")
+                .padding(.top, 4)
+        }
+        .padding(12)
+        .frame(width: 280, alignment: .leading)
+    }
+}
+
 /// Issue #283: the deck footer's bare-glyph action. No fill, no border, no
 /// text — secondary at rest, primary on hover — with the button's NAME kept
 /// in the tooltip and the accessibility label so a bare icon costs a
@@ -1244,6 +1406,10 @@ struct DeckColumnView: View {
     /// `staleness`. The default keeps the row's clock-free derivation for
     /// previews/tests.
     var signInRecovery: (DeckAccountRow) -> DeckFreshness.SignInRecovery? = { $0.signInRecovery }
+    /// Issue #503: per-row time-to-dry estimate, same seam as `staleness`
+    /// (the daemon forecast and the clock live in the status model). The
+    /// default shows no dry time for previews/tests.
+    var forecast: (DeckAccountRow) -> ExhaustionForecastPresentation? = { _ in nil }
     /// Issue #176: per-row renew state + action, supplied by the popover so
     /// the column stays free of the renew model (same seam shape as
     /// `staleness`). Defaults render nothing for previews/tests.
@@ -1363,6 +1529,7 @@ struct DeckColumnView: View {
                         isExpanded: deckModel.isExpanded(row.id),
                         staleness: staleness(row),
                         signInRecovery: signInRecovery(row),
+                        forecast: forecast(row),
                         renew: renewPresentation(row),
                         onRenewNow: { onRenewNow(row) },
                         onDismissRenewOutcome: { onDismissRenewOutcome(row) },
@@ -1453,6 +1620,11 @@ struct DeckAccountRowView: View {
     /// same seam as `staleness`). Nil falls back to the row's clock-free
     /// derivation so previews/tests render unchanged.
     var signInRecovery: DeckFreshness.SignInRecovery? = nil
+    /// Issue #503: this row's time-to-dry estimate, derived by the status
+    /// model from the daemon's #497 forecast (same injected-plain-value seam
+    /// as `staleness`). Nil renders NOTHING — "no forecast" is a real state
+    /// and the row never guesses a time.
+    var forecast: ExhaustionForecastPresentation? = nil
     /// Issue #176: this account's renew rendering state (nil = no renew
     /// affordance: healthy, signed out, Codex, or a pre-#176 daemon), and
     /// the action that runs the daemon's guarded renew op. Plain values so
@@ -1588,9 +1760,12 @@ struct DeckAccountRowView: View {
             // explicit parent label suppresses the child markers' labels, so
             // the duplicate-token warning is folded in here as well. The
             // derivation lives in Core (DeckAccountRow) where it is tested.
+            // Issue #503: the time-to-dry caption is another child of this
+            // suppressed subtree — folded into the same Core derivation.
             .accessibilityLabel(row.accessibilityLabel(
                 showsIdentity: showsIdentity,
-                isMenuBarSource: isMenuBarSource
+                isMenuBarSource: isMenuBarSource,
+                forecast: forecast
             ))
             .accessibilityHint(isExpanded ? "Collapse usage windows" : "Expand usage windows")
             // Issue #113 (CodeRabbit): the row button's explicit label
@@ -2130,6 +2305,24 @@ struct DeckAccountRowView: View {
                         .font(DeckType.caption)
                         .foregroundStyle(.secondary)
                 }
+            }
+            // Issue #503: time-to-dry — ONE quiet caption in the deck's
+            // existing caption voice, and only when the daemon actually has a
+            // forecast. No forecast renders no line at all (never "unknown",
+            // never a guessed time); decision 0019's estimate marker rides
+            // inline in the text, with the basis window, measured pace, and
+            // carryover caveat in the tooltip.
+            //
+            // Rendered in BOTH states deliberately: it is an account-level
+            // fact, not a per-window one, and the row's VoiceOver label
+            // speaks it unconditionally — a collapsed-only line would let
+            // speech claim a dry time the expanded card doesn't show.
+            if let forecast {
+                Text(forecast.rowText)
+                    .font(DeckType.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(forecast.tooltip)
             }
         }
     }

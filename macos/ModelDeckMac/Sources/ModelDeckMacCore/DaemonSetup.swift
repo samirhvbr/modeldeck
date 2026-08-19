@@ -90,17 +90,26 @@ public protocol DaemonReachabilityProbing: Sendable {
 /// no-op at the BTM layer while a stale daemon process keeps running (and
 /// its stale job record then makes every respawn fail EX_CONFIG). The live
 /// implementation shells out to /bin/launchctl for the gui domain.
-/// What `launchctl print` said about our service. Three-valued on purpose:
-/// only a CONFIRMED absence may trigger the wedge repair — a probe that
-/// failed for any other reason (launchctl couldn't run, permission trouble,
-/// an exit code we don't recognize) must read as "don't know", never as
-/// "absent" (CodeRabbit, PR #223).
+/// What `launchctl print` said about our service. Deliberately conservative:
+/// only a CONFIRMED absence may trigger the wedge repair, and only a
+/// CONFIRMED spawn rejection the #514 repair — a probe that failed for any
+/// other reason (launchctl couldn't run, permission trouble, an exit code we
+/// don't recognize) must read as "don't know", never as "absent"
+/// (CodeRabbit, PR #223).
 public enum LaunchdServiceProbe: Equatable, Sendable {
     /// Exit 0: the service exists in the launchd domain.
     case loaded
     /// launchctl's "could not find service" — the confirmed-absent state
     /// the wedge repair keys on.
     case notFound
+    /// Exit 0, and the job record says launchd rejected the binary BEFORE
+    /// exec: `state = spawn failed` with EX_CONFIG (78) / `needs LWCR
+    /// update`. Issue #514: after the 1.0.2→1.0.3 update, launchd kept
+    /// enforcing the launch constraint captured from the OLD daemon binary,
+    /// so every spawn of the new (validly signed) one failed. The job IS
+    /// there, so the `.notFound` wedge check can't see it, and the drift
+    /// re-register "succeeds" on paper while the service can never start.
+    case spawnFailed
     /// The probe itself failed; treat as loaded for repair purposes.
     case unknown
 }
@@ -116,6 +125,58 @@ public func classifyLaunchctlPrintExit(_ code: Int32) -> LaunchdServiceProbe {
     case 113: return .notFound
     default: return .unknown
     }
+}
+
+/// Issue #514: the same classification, plus what the job record ITSELF said.
+/// A wedged launch constraint is invisible in the exit code — `launchctl
+/// print` exits 0 for a job it can never spawn — so the spawn-failed state
+/// can only come from the printed record.
+public func classifyLaunchctlPrint(exitCode: Int32, output: String) -> LaunchdServiceProbe {
+    let base = classifyLaunchctlPrintExit(exitCode)
+    guard base == .loaded, launchctlPrintReportsSpawnRejection(output) else { return base }
+    return .spawnFailed
+}
+
+/// Whether a `launchctl print` record describes a job launchd refuses to
+/// spawn for a CONFIGURATION reason — the shape read live on 2026-08-18:
+///
+///     state = spawn failed
+///     last exit code = 78
+///     properties = … | needs LWCR update
+///
+/// Both halves are required on purpose. "spawn failed" alone also covers
+/// transient and unrelated failures, which a re-registration would not fix;
+/// pairing it with EX_CONFIG (78) or launchd's own "needs LWCR update" keeps
+/// the repair pinned to the stale-launch-constraint state. Whitespace is
+/// normalized because launchctl's alignment is not a contract.
+public func launchctlPrintReportsSpawnRejection(_ output: String) -> Bool {
+    let normalized = output.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    guard normalized.contains("state = spawn failed") else { return false }
+    return normalized.contains("last exit code = 78") || normalized.contains("needs lwcr update")
+}
+
+/// Issue #514: whether the daemon binary bundled in THIS app is one launchd
+/// could legitimately be asked to run. The stale-constraint repair re-stamps
+/// the launch constraint from the bundled binary's signature, so it may only
+/// run when that binary is the stale part's opposite: intact, validly signed,
+/// and satisfying its own designated requirement.
+public enum BundledDaemonVerification: Equatable, Sendable {
+    /// Signature valid, designated requirement satisfied, production team.
+    case valid
+    /// Present, but the signature or the designated requirement does not
+    /// check out — re-registering would stamp a constraint from a binary
+    /// that cannot be trusted. Never repair.
+    case invalid
+    /// No bundled daemon to verify (dev build), or the check itself could
+    /// not run. Fail-closed: also never repair.
+    case unavailable
+}
+
+/// Code-signature seam for the bundled daemon. The live implementation asks
+/// Security about Contents/Resources/daemon/modeldeckd; tests use a fake and
+/// never touch a real binary.
+public protocol BundledDaemonVerifying: Sendable {
+    func verifyBundledDaemon() async -> BundledDaemonVerification
 }
 
 public protocol LaunchdServiceControlling: Sendable {
@@ -184,6 +245,15 @@ public enum DaemonSetupDecision: Equatable, Sendable {
     /// "spawn failed", synthesized exit 78 EX_CONFIG). Plain register()
     /// no-ops here — route to the forced bootout + fresh-register repair.
     case wedgedServiceRepair(bundled: String)
+    /// Issue #514: the launchd job EXISTS but is in "spawn failed" with
+    /// EX_CONFIG / "needs LWCR update", while the bundled daemon binary
+    /// verifies — the app update replaced the binary and launchd kept
+    /// enforcing the launch constraint captured from the OLD one. Nothing
+    /// above SMAppService can see this (the registration looks perfect, the
+    /// commits match after a drift re-register), and register() alone never
+    /// clears the job record: only bootout does. Outranks drift, because a
+    /// job that cannot spawn is broken whether or not the commit moved.
+    case staleLaunchConstraintRepair(bundled: String)
     /// Our registration, our recorded commit — but the RUNNING process
     /// self-reports a different build (or none: pre-0.3.17 daemons don't
     /// self-report). The marker comparison can't see this: the incident
@@ -209,6 +279,10 @@ public enum DaemonSetupDecision: Equatable, Sendable {
 ///    bundle re-registering the service launch-constrains the production
 ///    daemon to the DEV signature);
 /// 1. no bundled daemon → dev build, stand down;
+/// 1b. registered + the launchd job is spawn-rejected (EX_CONFIG / LWCR)
+///    while nothing answers AND the bundled binary verifies → forced repair
+///    (issue #514). Ahead of drift: the plain re-register the drift rule
+///    would run is exactly what failed to recover the live incident;
 /// 2. registered + commit drift → re-register (even while running: the
 ///    running daemon is the OLD build);
 /// 3. registered + answering, but the running process self-reports a build
@@ -227,13 +301,24 @@ public func decideDaemonSetup(
     launchdService: LaunchdServiceProbe,
     legacyPresent: Bool,
     recordedCommit: String?,
-    bundledCommit: String?
+    bundledCommit: String?,
+    bundledDaemon: BundledDaemonVerification
 ) -> DaemonSetupDecision {
     guard hostSignatureAllowsServiceManagement else {
         return .hostSignatureStandDown
     }
     guard let bundledCommit, !bundledCommit.isEmpty else {
         return .bundledServiceUnavailable
+    }
+    // Issue #514. `probe == nil` for the same reason as the wedge rule: a
+    // daemon that IS answering is somebody's hand-started one, not this
+    // spawn-rejected job. `bundledDaemon == .valid` is the security gate —
+    // the repair re-stamps the launch constraint from that binary, so it
+    // runs only when the binary is provably fine and the registration is
+    // the stale part.
+    if registration == .enabled, launchdService == .spawnFailed, probe == nil,
+       bundledDaemon == .valid {
+        return .staleLaunchConstraintRepair(bundled: bundledCommit)
     }
     if registration == .enabled, recordedCommit != bundledCommit {
         return .driftReregister(recorded: recordedCommit, bundled: bundledCommit)
@@ -342,6 +427,10 @@ public final class DaemonSetupModel: ObservableObject {
         public var marker: any RegistrationMarkerStore
         public var probe: any DaemonReachabilityProbing
         public var launchdControl: any LaunchdServiceControlling
+        /// Issue #514: code-signature check on the bundled daemon binary,
+        /// consulted ONLY on the spawn-rejected path (it hashes the whole
+        /// binary, so it must never run on the ordinary launch path).
+        public var bundledDaemon: any BundledDaemonVerifying
         /// MDGitCommit from the bundle's daemon manifest; nil in dev builds.
         public var bundledCommit: String?
         /// Issue #486: whether the running app's code signature qualifies it
@@ -358,9 +447,11 @@ public final class DaemonSetupModel: ObservableObject {
             marker: any RegistrationMarkerStore,
             probe: any DaemonReachabilityProbing,
             launchdControl: any LaunchdServiceControlling,
+            bundledDaemon: any BundledDaemonVerifying,
             bundledCommit: String?,
             hostSignatureAllowsServiceManagement: Bool
         ) {
+            self.bundledDaemon = bundledDaemon
             self.registrar = registrar
             self.tokenStore = tokenStore
             self.legacyAgent = legacyAgent
@@ -430,18 +521,23 @@ public final class DaemonSetupModel: ObservableObject {
         phase = .checking
         legacyAgentPresent = deps.legacyAgent.isLegacyAgentPresent()
         let registration = deps.registrar.status
+        // Only consulted for the enabled-but-wedged / spawn-rejected checks;
+        // skip the launchctl spawn on the paths that can't be either.
+        let launchdService = registration == .enabled
+            ? await deps.launchdControl.probeService() : .loaded
         let decision = decideDaemonSetup(
             hostSignatureAllowsServiceManagement: deps.hostSignatureAllowsServiceManagement,
             // ONE health round-trip answers both reachability and staleness.
             probe: await deps.probe.probeDaemon(),
             registration: registration,
-            // Only consulted for the enabled-but-wedged check; skip the
-            // launchctl spawn on the paths that can't be wedged.
-            launchdService: registration == .enabled
-                ? await deps.launchdControl.probeService() : .loaded,
+            launchdService: launchdService,
             legacyPresent: legacyAgentPresent,
             recordedCommit: deps.marker.registeredCommit,
-            bundledCommit: deps.bundledCommit
+            bundledCommit: deps.bundledCommit,
+            // Issue #514: hashing the bundled binary is only worth doing —
+            // and only meaningful — once launchd has actually rejected it.
+            bundledDaemon: launchdService == .spawnFailed
+                ? await deps.bundledDaemon.verifyBundledDaemon() : .unavailable
         )
         switch decision {
         case .hostSignatureStandDown, .bundledServiceUnavailable, .running:
@@ -456,7 +552,8 @@ public final class DaemonSetupModel: ObservableObject {
             phase = .legacyNotRunning
         case .driftReregister(_, let bundled):
             await reregister(bundledCommit: bundled)
-        case .wedgedServiceRepair(let bundled), .staleDaemonRestart(_, let bundled):
+        case .wedgedServiceRepair(let bundled), .staleDaemonRestart(_, let bundled),
+             .staleLaunchConstraintRepair(let bundled):
             await forceRestartService(bundledCommit: bundled)
         }
     }
@@ -636,12 +733,29 @@ public final class DaemonSetupModel: ObservableObject {
             probe: probe,
             bundledCommit: bundledCommit
         )
-        guard verification == .staleProcessNeedsRestart else { return }
-        guard !didForceRestartService else {
-            phase = .failed(Self.staleDaemonAfterRestartMessage)
+        switch verification {
+        case .verified:
             return
+        case .unreachable:
+            // Issue #514: nothing answered — usually just a slow start, but
+            // it is also how a stale launch constraint looks from up here.
+            // Ask launchd directly: a job it refuses to spawn (EX_CONFIG /
+            // LWCR) needs the bootout this re-register never performed, so
+            // the update heals in THIS launch instead of leaving the deck in
+            // "starting…" under a "service updated" notice that isn't true.
+            // Gated exactly like the launch-time decision, once per chain.
+            guard !didForceRestartService,
+                  await deps.launchdControl.probeService() == .spawnFailed,
+                  await deps.bundledDaemon.verifyBundledDaemon() == .valid
+            else { return }
+            await forceRestartService(bundledCommit: bundledCommit)
+        case .staleProcessNeedsRestart:
+            guard !didForceRestartService else {
+                phase = .failed(Self.staleDaemonAfterRestartMessage)
+                return
+            }
+            await forceRestartService(bundledCommit: bundledCommit)
         }
-        await forceRestartService(bundledCommit: bundledCommit)
     }
 
     public static let staleDaemonAfterRestartMessage = "The background service is still running an older ModelDeck build after a forced restart. Restart your Mac, then click Retry."

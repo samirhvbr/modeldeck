@@ -7,6 +7,7 @@ import {
   HELPER_MISSING_ERROR,
   activateClaudeProfile,
   claudePinnedEnvFileContent,
+  claudeProxyPointerShellSnippet,
   claudeProfileEnv,
   createClaudeProfileHome,
   fetchClaudeUsage,
@@ -855,6 +856,29 @@ test('proxy-routed pinned env file adds the guarded Keychain pointer without cha
   assert.ok(content.includes('case $- in *x*) __modeldeck_xtrace=1; set +x;; esac'));
   assert.ok(content.includes('if [ "${__modeldeck_xtrace:-}" = "1" ]; then set -x; fi'));
   assert.ok(content.endsWith('\n'));
+
+  // Issue #522: the per-profile service changes the ITEM NAME and nothing
+  // else. Every property asserted above must survive verbatim, or the
+  // per-profile world has quietly lost a guard the shared world had.
+  const perProfile = claudePinnedEnvFileContent(
+    "/profiles/o'brien", true, 'cli-proxy-api-client.7f3c9e21-4a0b-4d55-9f8e-2c1b0a9d7e64',
+  );
+  assert.ok(perProfile.includes(
+    '__modeldeck_key="$("${MODELDECK_SECURITY_BIN:-/usr/bin/security}" find-generic-password'
+    + ' -s cli-proxy-api-client.7f3c9e21-4a0b-4d55-9f8e-2c1b0a9d7e64 -w 2>/dev/null || true)"',
+  ));
+  assert.equal(
+    perProfile.replace('cli-proxy-api-client.7f3c9e21-4a0b-4d55-9f8e-2c1b0a9d7e64', 'cli-proxy-api-client'),
+    content,
+    'the service name is the only difference between the shared and per-profile blocks',
+  );
+  // The one-line preview a user pastes carries the same item and the same
+  // xtrace suspension (CodeRabbit, PR #301) — never the shared item once the
+  // profile has its own.
+  const snippet = claudeProxyPointerShellSnippet('cli-proxy-api-client.7f3c9e21-4a0b-4d55-9f8e-2c1b0a9d7e64');
+  assert.ok(snippet.includes('find-generic-password -s cli-proxy-api-client.7f3c9e21-4a0b-4d55-9f8e-2c1b0a9d7e64 -w'));
+  assert.ok(!snippet.includes('-s cli-proxy-api-client -w'));
+  assert.ok(snippet.includes('case $- in *x*) __modeldeck_xtrace=1; set +x;; esac'));
 });
 
 test('shared profile helpers preserve provider-specific required and invalid-name errors', async (t) => {

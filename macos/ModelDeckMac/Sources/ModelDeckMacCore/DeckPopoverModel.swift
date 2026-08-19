@@ -646,7 +646,16 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
     /// no longer render an activation marker, the old ", active" / pending
     /// speech is gone (that state lives in Settings → Accounts); the single
     /// checkmark's "shown in menu bar" meaning is spoken instead.
-    public func accessibilityLabel(showsIdentity: Bool, isMenuBarSource: Bool = false) -> String {
+    ///
+    /// Issue #503: the time-to-dry caption is a plain `Text` inside the same
+    /// suppressed subtree, so its phrase arrives here as `forecast` — nil
+    /// (no forecast) adds nothing at all, which is exactly what the row
+    /// shows. Same trap as #65/#113/#272, same fix: derive here, test here.
+    public func accessibilityLabel(
+        showsIdentity: Bool,
+        isMenuBarSource: Bool = false,
+        forecast: ExhaustionForecastPresentation? = nil
+    ) -> String {
         let identity = showsIdentity
             ? (account.identity.flatMap { $0.isEmpty ? nil : ", \($0)" } ?? "")
             : ""
@@ -671,6 +680,9 @@ public struct DeckAccountRow: Equatable, Identifiable, Sendable {
                     ? ", benched for Fable routing, weight \(weight.liveWeight) for other models"
                     : ", proxy routing weight \(weight.weight)"
             }
+        }
+        if let forecast {
+            label += ", \(forecast.accessibilityPhrase)"
         }
         return label
     }

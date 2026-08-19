@@ -23,6 +23,20 @@ public protocol UsageRefreshing: Sendable {
 
 extension DaemonClient: UsageRefreshing {}
 
+/// Issue #503: seam for the daemon's exhaustion forecast
+/// (`GET /api/usage/exhaustion-forecast`, issue #497). `DaemonClient`
+/// conforms; tests stub it. Optional at the model's boundary, so a daemon
+/// without the endpoint simply leaves deck rows with no dry time.
+public protocol ExhaustionForecastProviding: Sendable {
+    func usageExhaustionForecast() async throws -> ExhaustionForecast
+}
+
+extension DaemonClient: ExhaustionForecastProviding {
+    public func usageExhaustionForecast() async throws -> ExhaustionForecast {
+        try await exhaustionForecast()
+    }
+}
+
 /// Icon-path diagnostics (issue #45 reopen): opt-in via
 /// `MODELDECK_ICON_DEBUG=1`, silent otherwise. Kept permanently so a future
 /// "icon looks wrong" report can be diagnosed on a live install without a
@@ -61,6 +75,11 @@ public final class MenuBarStatusModel: ObservableObject {
     /// Full daemon state for the popover deck; nil before the first
     /// successful load or when no state provider was supplied.
     @Published public private(set) var deckState: DeckState?
+    /// Issue #503: the daemon's exhaustion forecast, refreshed with the deck
+    /// state. Nil whenever no forecast provider was supplied, the daemon
+    /// doesn't serve the endpoint, or the last read failed — and nil means
+    /// deck rows show no dry time at all, never a placeholder guess.
+    @Published public private(set) var exhaustionForecast: ExhaustionForecast?
 
     public var thresholds: UsageThresholds {
         didSet { recomputeIconState() }
@@ -408,6 +427,9 @@ public final class MenuBarStatusModel: ObservableObject {
     /// Issue #72: the manual-Refresh provider poll; nil keeps every refresh
     /// a cheap cached read (pre-#72 behavior).
     private let usageRefresher: (any UsageRefreshing)?
+    /// Issue #503: nil keeps every refresh forecast-free (previews/tests and
+    /// pre-#497 daemons).
+    private let forecastProvider: (any ExhaustionForecastProviding)?
     private let clock: @Sendable () -> Date
     private var autoRefreshTask: Task<Void, Never>?
 
@@ -415,6 +437,7 @@ public final class MenuBarStatusModel: ObservableObject {
         evaluator: any UsageEvaluating,
         stateProvider: (any DeckStateProviding)? = nil,
         usageRefresher: (any UsageRefreshing)? = nil,
+        forecastProvider: (any ExhaustionForecastProviding)? = nil,
         thresholds: UsageThresholds = .default,
         clock: @escaping @Sendable () -> Date = { Date() },
         // Issue #260: nil keeps the pre-#260 in-memory window (tests).
@@ -423,6 +446,7 @@ public final class MenuBarStatusModel: ObservableObject {
         self.evaluator = evaluator
         self.stateProvider = stateProvider
         self.usageRefresher = usageRefresher
+        self.forecastProvider = forecastProvider
         self.thresholds = thresholds
         self.clock = clock
         self.burnWindowStore = burnWindowStore
@@ -501,6 +525,8 @@ public final class MenuBarStatusModel: ObservableObject {
                 worst = try await evaluator.evaluateWorstRemaining()
             }
             guard generation == stateGeneration else { return }
+            await loadExhaustionForecast(generation: generation)
+            guard generation == stateGeneration else { return }
             worstRemaining = worst
             hasLoadedOnce = true
             recomputeIconState()
@@ -513,6 +539,27 @@ public final class MenuBarStatusModel: ObservableObject {
             IconDebugLog.log("refresh FAILED: \(error)")
             connection = .unreachable(error.localizedDescription)
         }
+    }
+
+    /// Issue #503: the forecast read, folded into the same refresh as the
+    /// deck state. Deliberately never fatal to a refresh — a daemon without
+    /// the #497 endpoint, or a failed read, clears the forecast so rows fall
+    /// back to showing NOTHING rather than an aging estimate.
+    private func loadExhaustionForecast(generation: Int) async {
+        guard let forecastProvider else { return }
+        let loaded = try? await forecastProvider.usageExhaustionForecast()
+        guard generation == stateGeneration else { return }
+        if loaded == nil {
+            IconDebugLog.log("exhaustion forecast unavailable; rows show no dry time")
+        }
+        exhaustionForecast = loaded
+    }
+
+    /// Issue #503: what THIS row renders for time-to-dry, or nil for "no
+    /// forecast" — the popover's single seam, so both deck layouts show the
+    /// same estimate and the VoiceOver label speaks the same phrase.
+    public func exhaustionForecast(for row: DeckAccountRow) -> ExhaustionForecastPresentation? {
+        exhaustionForecast?.presentation(forAccountID: row.account.id, now: clock())
     }
 
     /// Adopt a deck state fetched elsewhere (e.g. the Activate flow's

@@ -95,6 +95,15 @@ private final class FakeProbe: DaemonReachabilityProbing, @unchecked Sendable {
     }
 }
 
+private final class FakeBundledDaemon: BundledDaemonVerifying, @unchecked Sendable {
+    var verification: BundledDaemonVerification = .valid
+    var verifyCalls = 0
+    func verifyBundledDaemon() async -> BundledDaemonVerification {
+        verifyCalls += 1
+        return verification
+    }
+}
+
 private final class FakeLaunchdControl: LaunchdServiceControlling, @unchecked Sendable {
     var probeResult: LaunchdServiceProbe = .loaded
     var bootOutCalls = 0
@@ -126,14 +135,16 @@ final class DaemonSetupDecisionTests: XCTestCase {
         launchdService: LaunchdServiceProbe = .loaded,
         legacyPresent: Bool = false,
         recordedCommit: String?,
-        bundledCommit: String?
+        bundledCommit: String?,
+        bundledDaemon: BundledDaemonVerification = .valid
     ) -> DaemonSetupDecision {
         decideDaemonSetup(
             hostSignatureAllowsServiceManagement: hostSignatureTrusted,
             probe: reachable ? DaemonProbeSnapshot(runningCommit: runningCommit) : nil,
             registration: registration, launchdService: launchdService,
             legacyPresent: legacyPresent,
-            recordedCommit: recordedCommit, bundledCommit: bundledCommit
+            recordedCommit: recordedCommit, bundledCommit: bundledCommit,
+            bundledDaemon: bundledDaemon
         )
     }
 
@@ -369,6 +380,7 @@ final class DaemonSetupModelTests: XCTestCase {
     private var marker = FakeMarker()
     private var probe = FakeProbe([false])
     private var launchd = FakeLaunchdControl()
+    private var bundledDaemon = FakeBundledDaemon()
 
     override func setUp() {
         super.setUp()
@@ -378,6 +390,7 @@ final class DaemonSetupModelTests: XCTestCase {
         marker = FakeMarker()
         probe = FakeProbe([false])
         launchd = FakeLaunchdControl()
+        bundledDaemon = FakeBundledDaemon()
     }
 
     private func makeModel(
@@ -392,6 +405,7 @@ final class DaemonSetupModelTests: XCTestCase {
                 marker: marker,
                 probe: probe,
                 launchdControl: launchd,
+                bundledDaemon: bundledDaemon,
                 bundledCommit: bundledCommit,
                 hostSignatureAllowsServiceManagement: hostSignatureTrusted
             ),
@@ -913,6 +927,7 @@ final class KeychainPromptCoachingTests: XCTestCase {
     private var marker = FakeMarker()
     private var probe = FakeProbe([false])
     private var launchd = FakeLaunchdControl()
+    private var bundledDaemon = FakeBundledDaemon()
 
     override func setUp() {
         super.setUp()
@@ -922,6 +937,7 @@ final class KeychainPromptCoachingTests: XCTestCase {
         marker = FakeMarker()
         probe = FakeProbe([false])
         launchd = FakeLaunchdControl()
+        bundledDaemon = FakeBundledDaemon()
     }
 
     private func makeModel(bundledCommit: String? = "new") -> DaemonSetupModel {
@@ -933,6 +949,7 @@ final class KeychainPromptCoachingTests: XCTestCase {
                 marker: marker,
                 probe: probe,
                 launchdControl: launchd,
+                bundledDaemon: bundledDaemon,
                 bundledCommit: bundledCommit,
                 hostSignatureAllowsServiceManagement: true
             ),
