@@ -789,6 +789,14 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
     public var lastFailureAt: String?
     public var statusCode: Int?
     public var remedy: String
+    /// Issue #539, additive: the daemon saw this member's proxy credential
+    /// signed in again AFTER the last failure it is reporting, and no request
+    /// has been through since to settle it either way. Absent on an older
+    /// daemon, which simply keeps the red state.
+    public var repairedPending: Bool?
+    /// When that sign-in was observed, so a settled outcome recorded before it
+    /// can be recognized as stale news.
+    public var repairedAt: String?
 
     public var id: String { accountId }
 
@@ -800,7 +808,9 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
         firstFailureAt: String? = nil,
         lastFailureAt: String? = nil,
         statusCode: Int? = nil,
-        remedy: String = "Sign in again to restore proxy routing."
+        remedy: String = "Sign in again to restore proxy routing.",
+        repairedPending: Bool? = nil,
+        repairedAt: String? = nil
     ) {
         self.accountId = accountId
         self.provider = provider
@@ -810,6 +820,8 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
         self.lastFailureAt = lastFailureAt
         self.statusCode = statusCode
         self.remedy = remedy
+        self.repairedPending = repairedPending
+        self.repairedAt = repairedAt
     }
 
     /// Issue #537 (Tim): plain words, no proxy jargon — "last N requests
@@ -817,6 +829,29 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
     public var statusLine: String {
         let request = consecutiveFailures == 1 ? "request" : "requests"
         return "\(label): last \(consecutiveFailures) \(request) failed"
+    }
+
+    public var isRepairedPending: Bool { repairedPending == true }
+
+    /// Issue #539: the post-repair line. Nothing is broken any more — the deck
+    /// is only waiting for a request to prove it — so the words carry no alarm
+    /// and no instruction.
+    public var repairedStatusLine: String { "\(label): \(repairedRowLine)" }
+
+    /// The same sentence without the label, for the Settings row that already
+    /// names the subscription. One copy string, two surfaces — the ruling says
+    /// both render the daemon's one answer, so neither may go quiet.
+    public var repairedRowLine: String {
+        "signed in again — waiting for the next request to confirm"
+    }
+
+    /// The rest of the story, for the tooltip and VoiceOver: what the failures
+    /// were, and that there is nothing left to do about them.
+    public var repairedDetail: String {
+        let request = consecutiveFailures == 1 ? "request" : "requests"
+        let status = statusCode.map { " (HTTP \($0))" } ?? ""
+        return "The last \(consecutiveFailures) \(request) failed\(status) before the sign-in. "
+            + "Nothing to do — the next request through this subscription will confirm it."
     }
 }
 

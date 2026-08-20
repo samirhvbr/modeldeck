@@ -83,7 +83,9 @@ struct Issue515RoutedFailurePromotionTests {
         #expect(source.contains("Button(\"Open Sign-in\", action: onConfirm)"))
         // The evidence line keeps its #395 voice and its own VoiceOver label
         // (#537: the visible line drops the remedy; VoiceOver keeps it).
-        #expect(source.contains("Label(visible, systemImage: \"exclamationmark.octagon.fill\")"))
+        // (#539 made the glyph state-dependent — red keeps the octagon.)
+        #expect(source.contains("Label(visible, systemImage: icon)"))
+        #expect(source.contains("repaired ? \"clock.arrow.circlepath\" : \"exclamationmark.octagon.fill\""))
         #expect(source.contains("Pool alert. \\(message)"))
         // Every new control names its account for VoiceOver.
         #expect(source.contains("Fix the proxy sign-in for \\(account.label)"))

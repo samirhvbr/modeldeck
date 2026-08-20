@@ -109,6 +109,34 @@ export const WAREHOUSE_INGEST_INTERVAL_MS = 15 * 60_000;
 export const MEMBER_BLACKOUT_FAILURE_THRESHOLD = 3;
 const MEMBER_BLACKOUT_REMEDY = 'Sign in again to restore proxy routing.';
 
+/// Issue #539: the pool identities the proxy reports as `active` — a finished
+/// sign-in, not a refresh in progress. Keyed exactly like
+/// `proxyCredentialHealthFromAuthFiles` (Claude by lowercased email, Codex by
+/// remembered account id) so membership, health, and this can never disagree
+/// about who they describe. Healthy-wins, the same as the health fold: one
+/// live active file for an identity is enough.
+function proxyCredentialActiveIdentities(entries) {
+  const active = new Set();
+  for (const entry of entries) {
+    if (entry.disabled || entry.unavailable || entry.status !== 'active') continue;
+    if ((entry.provider === 'claude' || entry.provider === 'anthropic') && entry.email) {
+      active.add(`claude:${entry.email}`);
+    } else if ((entry.provider === 'codex' || entry.provider === 'openai') && entry.codexAccountId) {
+      active.add(`codex:${entry.codexAccountId}`);
+    }
+  }
+  return active;
+}
+
+/// True when both instants parse and `later` is strictly after `earlier`.
+/// Anything unparseable answers false, so a comparison that cannot be made
+/// never softens an alert.
+function isLaterInstant(later, earlier) {
+  const a = Date.parse(later ?? '');
+  const b = Date.parse(earlier ?? '');
+  return Number.isFinite(a) && Number.isFinite(b) && a > b;
+}
+
 // Issue #377. A model-scoped weekly window this used is the reason the
 // session fell off that model. Not 100: the window observation is at most one
 // statusline render old, and Claude Code stops routing the model a shade
@@ -601,6 +629,10 @@ export class ModelDeckService {
     this.proxyReloginStarts = new Map();
     this.proxyReloginNow = options.proxyReloginNow || (() => Date.now());
     this.proxyCredentialHealthCache = null;
+    // Issue #539: the last credential verdict this daemon saw per pool
+    // identity, and when that verdict last CHANGED to ok. Presentation
+    // metadata only — it never enters the streak math (doctrine 0034).
+    this.proxyCredentialObservations = new Map();
     // A plain service fixture never receives a live management-key path. The
     // production server wires src/paths.mjs explicitly; tests wire only temp
     // key files and loopback stubs. Credential material is read inside pull().
@@ -3899,20 +3931,88 @@ export class ModelDeckService {
     if (!force && cached && now - cached.at < PROXY_CREDENTIAL_HEALTH_TTL_MS) {
       return cached.pending ? cached.pending : cached.value;
     }
-    const pending = (async () => {
+    // Issue #539: the observation needs the proxy's raw `status` as well as
+    // the three-word health, because only `active` is a finished sign-in.
+    // proxy-relogin.mjs is untouched (#398) — the extra read happens here,
+    // over the same already-allowlisted fields.
+    const probe = (async () => {
       try {
-        return proxyCredentialHealthFromAuthFiles(await this.proxyReloginDriver.authFiles());
+        const entries = await this.proxyReloginDriver.authFiles();
+        return {
+          health: proxyCredentialHealthFromAuthFiles(entries),
+          active: proxyCredentialActiveIdentities(entries),
+        };
       } catch {
         return null;
       }
     })();
+    const pending = probe.then((result) => result?.health ?? null);
     // Concurrent /api/state reads share one probe rather than each dialing.
     this.proxyCredentialHealthCache = { at: now, value: null, pending };
     const value = await pending;
     if (this.proxyCredentialHealthCache?.pending === pending) {
       this.proxyCredentialHealthCache = { at: this.proxyReloginNow(), value, pending: null };
+      this.observeProxyCredentialHealth(await probe);
     }
     return value;
+  }
+
+  // Issue #539 (RULED by Tim, 2026-08-19) — WHEN the proxy's verdict flipped
+  // back to ok, recorded beside the measured streak and never inside it.
+  //
+  // Doctrine 0034 still decides red versus clear: only a routed request can
+  // do that. This exists because the state in between was unspeakable. Tim
+  // repaired a credential, the proxy marked it active again, and the banner
+  // kept shouting that the last N requests had failed — which reads as "the
+  // sign-in didn't take". With this fact the daemon can say instead: signed
+  // in again, waiting for the next request.
+  //
+  // A flip is a CHANGE. A verdict first SEEN as ok — a restarted daemon, a
+  // member that was never broken — is not a repair and marks nothing, so the
+  // soft state can only ever follow an observed recovery.
+  //
+  // TWO RULES THE REVIEW OF PR #543 BOUGHT, both about not overclaiming:
+  //
+  // 1. The repair is stamped with the LAST MOMENT THE DAEMON KNEW THE
+  //    CREDENTIAL WAS BROKEN, never with the probe that noticed the recovery.
+  //    The probe is cached for 15s and only runs on a state read, so "now"
+  //    could be long after the real sign-in — and a request that failed in
+  //    that gap would have been softened by a repair it actually preceded.
+  //    Dating the repair to the last bad observation makes every failure the
+  //    daemon cannot place before the sign-in keep the alert red.
+  // 2. Only `active` is a finished sign-in. `refreshing` and `pending` map to
+  //    the same three-word health (nothing is broken yet), but claiming
+  //    "signed in again" for a refresh nobody performed is exactly the false
+  //    reassurance this issue exists to remove.
+  observeProxyCredentialHealth(probe) {
+    if (!probe?.health) return; // unknown: remember nothing rather than invent a flip
+    const seenAt = new Date(this.proxyReloginNow()).toISOString();
+    const record = (provider, records) => {
+      for (const [value, entry] of records) {
+        const key = `${provider}:${value}`;
+        const seen = this.proxyCredentialObservations.get(key);
+        let lastBrokenAt = seen?.lastBrokenAt ?? null;
+        let repairedAt = seen?.repairedAt ?? null;
+        if (entry.health !== 'ok') {
+          lastBrokenAt = seenAt;
+          repairedAt = null;
+        } else if (repairedAt == null && lastBrokenAt != null && probe.active.has(key)) {
+          repairedAt = lastBrokenAt;
+        }
+        this.proxyCredentialObservations.set(key, { lastBrokenAt, repairedAt });
+      }
+    };
+    record('claude', probe.health.byClaudeEmail);
+    record('codex', probe.health.byCodexAccountId);
+  }
+
+  /// When this account's proxy credential was last observed flipping from
+  /// broken to ok, or null when this daemon has never seen that happen.
+  proxyCredentialRepairedAt(account) {
+    const identity = this.proxyPoolIdentityFor(account);
+    if (!identity) return null;
+    const key = `${identity.provider}:${identity.value}`;
+    return this.proxyCredentialObservations.get(key)?.repairedAt || null;
   }
 
   /// Join an account to its health record using the SAME identity keys the
@@ -5055,11 +5155,23 @@ export class ModelDeckService {
       if (!selector) continue;
       const streak = this.store.requestFailureStreak(selector);
       if (streak.consecutiveFailures < MEMBER_BLACKOUT_FAILURE_THRESHOLD) continue;
+      // Issue #539, additive (the #149/#174 discipline — an older daemon
+      // simply omits it): the credential this streak blames has since been
+      // signed in again, and no request has been through to prove it either
+      // way. The streak above is untouched. A NEW measured failure moves
+      // lastFailureAt past the repair and the mark disappears by arithmetic;
+      // a measured success clears the whole alert, as it always did. No
+      // timer ever changes it.
+      const repairedAt = account.proxyCredential === 'ok'
+        ? this.proxyCredentialRepairedAt(account)
+        : null;
+      const repairedPending = isLaterInstant(repairedAt, streak.lastFailureAt);
       alerts.push({
         accountId: account.id,
         provider: account.provider,
         label: account.label,
         ...streak,
+        ...(repairedPending ? { repairedPending: true, repairedAt } : {}),
         remedy: MEMBER_BLACKOUT_REMEDY,
       });
     }

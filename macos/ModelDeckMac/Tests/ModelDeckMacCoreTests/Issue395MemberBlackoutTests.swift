@@ -65,9 +65,11 @@ struct MemberBlackoutTests {
         #expect(positions.allSatisfy { $0 != nil })
         #expect(positions.compactMap { $0 } == positions.compactMap { $0 }.sorted())
         // #537: the visible line is the evidence alone; the remedy sentence
-        // lives only in the tooltip/VoiceOver message.
-        #expect(source.contains("Label(visible, systemImage: \"exclamationmark.octagon.fill\")"))
-        #expect(source.contains(#"let visible = "\(alert.statusLine)\(httpStatus)""#))
+        // lives only in the tooltip/VoiceOver message. (#539 made the line and
+        // the glyph state-dependent; the red state's own text is unchanged.)
+        #expect(source.contains("Label(visible, systemImage: icon)"))
+        #expect(source.contains("\"exclamationmark.octagon.fill\""))
+        #expect(source.contains(#"alert.repairedStatusLine : "\(alert.statusLine)\(httpStatus)""#))
         #expect(source.contains("Pool alert. \\(message)"))
     }
 }

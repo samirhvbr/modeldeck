@@ -1,0 +1,33 @@
+name: pr-review-settled
+
+# Merge gate: waits until CodeRabbit has reviewed the current head commit and
+# every review thread is resolved, so merges can't race the bot's incremental
+# pass (the PR #494-era gap, now enforced in CI instead of protocol). Reusable
+# gate lives in timharris707/skills.
+#
+# Two shapes tested on PR #544 and rejected by GitHub, do not re-add:
+# a pull_request_review_thread trigger (workflow stops loading entirely), and
+# contents: none (startup_failure: the called workflow declares contents: read
+# and a caller cannot grant less). Thread resolution after a gate timeout
+# therefore needs a manual re-run (gh run rerun <run-id>), as the gate's
+# failure message says.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: review-settled-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review-settled:
+    uses: timharris707/skills/.github/workflows/review-settled.yml@main

@@ -102,8 +102,40 @@ public enum ProxyRelogin {
         routedFailures alert: MemberBlackoutAlert?
     ) -> Bool {
         if credentialIsBroken(account) { return true }
-        guard alert != nil else { return false }
+        // Issue #539: the daemon says this member was signed in again after
+        // the last failure in the streak. The streak still stands as measured
+        // evidence — the banner stays up, softened — but there is nothing to
+        // fix, so it promotes no repair on either surface.
+        guard let alert, !alert.isRepairedPending else { return false }
         return account.proxyCredential?.lowercased() != "disabled"
+    }
+
+    /// Issue #539: a settled sign-in outcome recorded BEFORE the credential
+    /// was repaired is stale news. It must not tell the user to act — the
+    /// live incident was an expired session's "Start it again…" sitting on a
+    /// banner whose credential was already good. A newer outcome (a fresh
+    /// attempt, after the repair) still speaks.
+    public static func settledOutcomeIsStale(
+        recordedAt: Date?,
+        routedFailures alert: MemberBlackoutAlert?
+    ) -> Bool {
+        guard let alert, alert.isRepairedPending else { return false }
+        // Fail towards SHOWING it (PR #543 review). Suppression needs positive
+        // evidence that the outcome predates the repair; a daemon that sent no
+        // `repairedAt`, or one this build cannot parse, is not that evidence,
+        // and silently eating a sentence the user may need is the worse error.
+        guard let recordedAt, let repairedAt = alert.repairedAt, let repaired = instant(repairedAt) else {
+            return false
+        }
+        return recordedAt < repaired
+    }
+
+    /// The daemon's instants, with and without fractional seconds — the same
+    /// two-formatter shape `ModelDropAlert.parseTimestamp` uses.
+    static func instant(_ iso: String) -> Date? {
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return withFraction.date(from: iso) ?? ISO8601DateFormatter().date(from: iso)
     }
 
     /// The row's honest one-liner about a non-ok credential, or nil.
@@ -130,6 +162,12 @@ public enum ProxyRelogin {
         for account: DeckAccount,
         routedFailures alert: MemberBlackoutAlert?
     ) -> String? {
+        // Issue #539: the Settings row speaks the same soft sentence the deck
+        // banner does rather than going quiet — one daemon answer, two
+        // surfaces. Text only; the repair is not promoted here either.
+        if let alert, alert.isRepairedPending, !credentialIsBroken(account) {
+            return alert.repairedRowLine
+        }
         if let recorded = credentialText(for: account) { return recorded }
         guard let alert, credentialIsBroken(account, routedFailures: alert) else { return nil }
         return routedFailureText(alert)
@@ -214,6 +252,13 @@ public struct ProxyReloginRowPresentation: Equatable, Sendable {
         case unavailable(reason: String)
         /// Nothing actionable — the credential line, if any, stands alone.
         case quiet
+
+        /// Issue #539: the deck's soft repaired state hides the repair
+        /// controls, but never a sign-in that is actually running.
+        public var isRunning: Bool {
+            if case .running = self { return true }
+            return false
+        }
     }
 
     /// The credential one-liner beside the pool's own status text, or nil.
@@ -250,7 +295,12 @@ public final class ProxyReloginModel: ObservableObject {
     private let browser: any BrowserOpening
     private let pollInterval: Duration
     private let sleep: @Sendable (Duration) async throws -> Void
+    private let now: @Sendable () -> Date
     private var generations: [String: Int] = [:]
+    /// Issue #539: when each account's settled outcome was recorded, so an
+    /// outcome older than the daemon's observed repair can be recognized as
+    /// stale rather than repeated at a user with nothing left to do.
+    private var outcomeAt: [String: Date] = [:]
     /// Held so a cancel can stop the local poll immediately, without waiting
     /// for the next tick.
     private(set) var tasks: [String: Task<Void, Never>] = [:]
@@ -260,13 +310,15 @@ public final class ProxyReloginModel: ObservableObject {
         stateProvider: any DeckStateProviding,
         browser: any BrowserOpening,
         pollInterval: Duration = .seconds(2),
-        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }
+        sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) },
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.manager = manager
         self.stateProvider = stateProvider
         self.browser = browser
         self.pollInterval = pollInterval
         self.sleep = sleep
+        self.now = now
     }
 
     public func phase(for accountID: String) -> ProxyRelogin.Phase? { phases[accountID] }
@@ -291,15 +343,22 @@ public final class ProxyReloginModel: ObservableObject {
         guard ProxyRelogin.isOffered(for: account) || phase != nil || note != nil || error != nil else {
             return nil
         }
+        // Issue #539: an outcome recorded before the daemon saw this member
+        // signed in again is stale — the repaired state outranks it, so it is
+        // not repeated at a user whose credential is already good.
+        let staleOutcome = ProxyRelogin.settledOutcomeIsStale(
+            recordedAt: outcomeAt[account.id],
+            routedFailures: alert
+        )
         let display: ProxyReloginRowPresentation.Display
         if let phase, phase.isRunning {
             display = .running(
                 text: phase == .starting ? ProxyRelogin.startingText : ProxyRelogin.awaitingBrowserText,
                 canCancel: phase == .awaitingBrowser
             )
-        } else if let error {
+        } else if let error, !staleOutcome {
             display = .error(error)
-        } else if let note {
+        } else if let note, !staleOutcome {
             display = .note(note)
         } else if let reason = ProxyRelogin.unavailableReason(for: account) {
             display = .unavailable(reason: reason)
@@ -326,6 +385,7 @@ public final class ProxyReloginModel: ObservableObject {
         phases[accountID] = .starting
         notes[accountID] = nil
         errors[accountID] = nil
+        outcomeAt[accountID] = nil
         generations[accountID, default: 0] += 1
         let generation = generations[accountID]
         tasks[accountID] = Task { [weak self] in
@@ -347,6 +407,7 @@ public final class ProxyReloginModel: ObservableObject {
                     // polling a flow whose error the running row would hide.
                     self.phases[accountID] = nil
                     self.errors[accountID] = ProxyRelogin.browserOpenFailedText
+                    self.outcomeAt[accountID] = self.now()
                     _ = try? await self.manager.cancelProxyRelogin(accountID: accountID)
                     guard self.generations[accountID] == generation else { return }
                     self.tasks[accountID] = nil
@@ -366,6 +427,7 @@ public final class ProxyReloginModel: ObservableObject {
                 // 409 (no key / already running) and 502 land here with the
                 // daemon's sanitized sentence.
                 self.errors[accountID] = SettingsSyncModel.message(for: error)
+                self.outcomeAt[accountID] = self.now()
             }
             guard self.generations[accountID] == generation else { return }
             self.tasks[accountID] = nil
@@ -390,6 +452,7 @@ public final class ProxyReloginModel: ObservableObject {
                 guard isCurrent(accountID, generation) else { return }
                 phases[accountID] = nil
                 errors[accountID] = SettingsSyncModel.message(for: error)
+                outcomeAt[accountID] = now()
                 return
             }
             guard isCurrent(accountID, generation) else { return }
@@ -404,6 +467,7 @@ public final class ProxyReloginModel: ObservableObject {
 
     private func settle(accountID: String, phase: ProxyRelogin.Phase, detail: String?) {
         phases[accountID] = nil
+        outcomeAt[accountID] = now()
         let text = ProxyRelogin.settledText(phase: phase, detail: detail)
         if phase == .failed {
             errors[accountID] = text
@@ -424,6 +488,7 @@ public final class ProxyReloginModel: ObservableObject {
         tasks.removeValue(forKey: accountID)?.cancel()
         phases[accountID] = nil
         notes[accountID] = ProxyRelogin.cancelledText
+        outcomeAt[accountID] = now()
         Task { [weak self] in
             guard let self else { return }
             _ = try? await self.manager.cancelProxyRelogin(accountID: accountID)
@@ -436,6 +501,7 @@ public final class ProxyReloginModel: ObservableObject {
         guard phases[accountID] == nil else { return }
         notes[accountID] = nil
         errors[accountID] = nil
+        outcomeAt[accountID] = nil
     }
 
     private var refreshGeneration = 0
@@ -453,12 +519,23 @@ public final class ProxyReloginModel: ObservableObject {
         } catch {
             guard generation == refreshGeneration else { return }
             let line = ProxyPool.stateRefreshFailedText
+            // Every branch here writes text the user has not seen yet, so every
+            // branch re-dates the outcome (PR #543 review). The M7 rule is that
+            // a failed re-read is SAID; the #539 staleness gate must not be the
+            // thing that swallows it.
             if let existing = errors[accountID] {
-                if !existing.contains(line) { errors[accountID] = existing + " " + line }
+                if !existing.contains(line) {
+                    errors[accountID] = existing + " " + line
+                    outcomeAt[accountID] = now()
+                }
             } else if let existing = notes[accountID] {
-                if !existing.contains(line) { notes[accountID] = existing + " " + line }
+                if !existing.contains(line) {
+                    notes[accountID] = existing + " " + line
+                    outcomeAt[accountID] = now()
+                }
             } else {
                 notes[accountID] = line
+                outcomeAt[accountID] = now()
             }
         }
     }

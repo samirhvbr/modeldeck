@@ -339,6 +339,22 @@ test('TRIPWIRE #476: transcript ingest skips unchanged files and re-parses only 
       'the full-file replay issues no no-op session or subagent updates',
     );
   });
+
+  await t.test('TRIPWIRE PR #513: a parser-version bump replays an unchanged file', async () => {
+    store.db.prepare('UPDATE ingest_file_state SET parser_version = 0 WHERE path = ?').run(currentFile);
+
+    const summary = await ingestTranscriptArchive({
+      store,
+      directory: root,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 2, 'the file whose stored parser version is stale is not skipped');
+    assert.deepEqual(
+      { ...store.db.prepare('SELECT parser, parser_version FROM ingest_file_state WHERE path = ?').get(currentFile) },
+      { parser: 'claude-transcript', parser_version: 1 },
+      'the replay records the current parser provenance',
+    );
+  });
 });
 
 test('blank custom titles still block later last-prompt titles', (t) => {

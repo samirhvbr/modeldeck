@@ -363,7 +363,9 @@ export async function ingestTranscriptArchive({
     const fileStat = fs.statSync(file.path);
     const ingestState = store.getIngestFileState(file.path);
     if (ingestState?.size === fileStat.size && ingestState.mtimeMs === fileStat.mtimeMs
-      && ingestState.ino === fileStat.ino) {
+      && ingestState.ino === fileStat.ino
+      && ingestState.parser === TRANSCRIPT_PARSER
+      && ingestState.parserVersion === TRANSCRIPT_PARSER_VERSION) {
       summary.filesSkipped += 1;
       continue;
     }

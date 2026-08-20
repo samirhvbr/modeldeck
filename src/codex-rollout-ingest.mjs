@@ -423,7 +423,9 @@ export async function ingestCodexRollouts({
         const fileStat = fs.statSync(item.file);
         const ingestState = store.getIngestFileState(item.file);
         if (ingestState?.size === fileStat.size && ingestState.mtimeMs === fileStat.mtimeMs
-          && ingestState.ino === fileStat.ino) {
+          && ingestState.ino === fileStat.ino
+          && ingestState.parser === CODEX_ROLLOUT_PARSER
+          && ingestState.parserVersion === CODEX_ROLLOUT_PARSER_VERSION) {
           summary.filesSkipped += 1;
           continue;
         }

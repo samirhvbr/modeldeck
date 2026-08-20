@@ -304,6 +304,23 @@ test('TRIPWIRE #476: Codex rollout ingest skips unchanged files and re-parses on
     assert.equal(summary.filesSkipped, 1, 'only the untouched file is skipped');
     assert.equal(summary.sessions, 1, 'the replaced file was parsed instead of skipped');
   });
+
+  await t.test('TRIPWIRE PR #513: a parser-version bump replays an unchanged file', async () => {
+    store.db.prepare('UPDATE ingest_file_state SET parser_version = 0 WHERE path = ?').run(archivedFile);
+
+    const summary = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 1, 'the file whose stored parser version is stale is not skipped');
+    assert.equal(summary.sessions, 1, 'the stale-parser file was re-parsed despite unchanged stats');
+    assert.deepEqual(
+      { ...store.db.prepare('SELECT parser, parser_version FROM ingest_file_state WHERE path = ?').get(archivedFile) },
+      { parser: 'codex-rollout', parser_version: 1 },
+      'the replay records the current parser provenance',
+    );
+  });
 });
 
 test('TRIPWIRE codex-cached-input-subset — rollout cache reads are split from input exactly once', async (t) => {

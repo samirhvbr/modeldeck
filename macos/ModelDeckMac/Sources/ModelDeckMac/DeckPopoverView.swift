@@ -1158,15 +1158,23 @@ struct MemberBlackoutBannerRow: View {
 
     var body: some View {
         let httpStatus = alert.statusCode.map { " (HTTP \($0))" } ?? ""
+        // Issue #539 (RULED by Tim): the daemon has seen this member signed in
+        // again since the last failure. Same one line, no new row — it just
+        // stops shouting, drops the remedy it no longer needs, and says what
+        // it is actually waiting for.
+        let repaired = alert.isRepairedPending
         // Issue #537 (Tim): one line, no remedy sentence — the inline action
         // IS the remedy. The full story stays in the tooltip and the
         // accessibility label, where it costs no deck space.
-        let visible = "\(alert.statusLine)\(httpStatus)"
-        let message = "\(visible). \(alert.remedy)"
+        let visible = repaired ? alert.repairedStatusLine : "\(alert.statusLine)\(httpStatus)"
+        let message = repaired
+            ? "\(alert.repairedStatusLine). \(alert.repairedDetail)"
+            : "\(visible). \(alert.remedy)"
+        let icon = repaired ? "clock.arrow.circlepath" : "exclamationmark.octagon.fill"
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Label(visible, systemImage: "exclamationmark.octagon.fill")
+            Label(visible, systemImage: icon)
                 .font(.caption)
-                .foregroundStyle(.red)
+                .foregroundStyle(repaired ? Color.secondary : Color.red)
                 // CodeRabbit (PR #538): statusLine embeds the account label,
                 // which is unbounded — without a limit a long label wraps the
                 // banner back into the multi-line shape #537 removed. The
@@ -1178,7 +1186,12 @@ struct MemberBlackoutBannerRow: View {
                 .help(message)
                 .accessibilityLabel("Pool alert. \(message)")
             Spacer(minLength: 0)
-            repairControl
+            // Issue #539: in the soft state there is nothing to fix, so no
+            // action is offered — but a sign-in actually running still shows
+            // its progress and its Stop.
+            if !repaired || relogin?.display.isRunning == true {
+                repairControl
+            }
         }
     }
 
