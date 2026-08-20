@@ -1158,14 +1158,26 @@ struct MemberBlackoutBannerRow: View {
 
     var body: some View {
         let httpStatus = alert.statusCode.map { " (HTTP \($0))" } ?? ""
-        let message = "\(alert.statusLine)\(httpStatus). \(alert.remedy)"
-        VStack(alignment: .leading, spacing: 2) {
-            Label(message, systemImage: "exclamationmark.octagon.fill")
+        // Issue #537 (Tim): one line, no remedy sentence — the inline action
+        // IS the remedy. The full story stays in the tooltip and the
+        // accessibility label, where it costs no deck space.
+        let visible = "\(alert.statusLine)\(httpStatus)"
+        let message = "\(visible). \(alert.remedy)"
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Label(visible, systemImage: "exclamationmark.octagon.fill")
                 .font(.caption)
                 .foregroundStyle(.red)
+                // CodeRabbit (PR #538): statusLine embeds the account label,
+                // which is unbounded — without a limit a long label wraps the
+                // banner back into the multi-line shape #537 removed. The
+                // tooltip and VoiceOver sentence carry the untruncated text.
+                .lineLimit(1)
+                .truncationMode(.tail)
                 .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(1)
                 .help(message)
                 .accessibilityLabel("Pool alert. \(message)")
+            Spacer(minLength: 0)
             repairControl
         }
     }
@@ -1194,7 +1206,11 @@ struct MemberBlackoutBannerRow: View {
                     // Settings' verbatim `ProxyRelogin.confirmation` — one
                     // copy, one seam, so no path reaches the daemon without
                     // the same words first.
+                    // Issue #537 (Tim): link-weight, inline — a bordered
+                    // button here cost a whole deck row.
                     Button(ProxyRelogin.actionTitle) { isConfirming = true }
+                        .buttonStyle(.link)
+                        .font(.caption)
                         .controlSize(.small)
                         .help(ProxyRelogin.confirmation(label: account.label))
                         .accessibilityLabel("Fix the proxy sign-in for \(account.label)")

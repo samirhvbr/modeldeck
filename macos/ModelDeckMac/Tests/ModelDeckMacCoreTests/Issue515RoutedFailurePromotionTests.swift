@@ -5,7 +5,8 @@ import Testing
 // Issue #515 — the state Tim hit on 2026-08-18 must be unrepresentable.
 //
 // The deck shouted "7 routed requests failed in a row (HTTP 401). Sign in
-// again to restore proxy routing." while Settings showed the same account
+// again to restore proxy routing." (the copy of the day; #537 later
+// shortened it) while Settings showed the same account
 // green and kept the #396 repair in the hover-only ⋯ menu: the banner reads
 // MEASURED request outcomes, the promotion read the RECORDED credential the
 // proxy had not marked broken yet. Doctrine 0034 breaks the tie in favour of
@@ -66,7 +67,7 @@ struct Issue515RoutedFailurePromotionTests {
         let promoted = model.presentation(for: account, routedFailures: alert)
         #expect(promoted?.display == .action(prominent: true))
         #expect(promoted?.credentialIsBroken == true)
-        #expect(promoted?.credentialText == "7 routed requests failed in a row (HTTP 401)")
+        #expect(promoted?.credentialText == "last 7 requests failed (HTTP 401)")
     }
 
     @Test func theDeckBannerRendersTheRepairItNames() throws {
@@ -80,8 +81,9 @@ struct Issue515RoutedFailurePromotionTests {
         // The disclosure is Settings' own sentence, never a second copy.
         #expect(source.contains("Text(ProxyRelogin.confirmation(label: label))"))
         #expect(source.contains("Button(\"Open Sign-in\", action: onConfirm)"))
-        // The evidence line keeps its #395 voice and its own VoiceOver label.
-        #expect(source.contains("Label(message, systemImage: \"exclamationmark.octagon.fill\")"))
+        // The evidence line keeps its #395 voice and its own VoiceOver label
+        // (#537: the visible line drops the remedy; VoiceOver keeps it).
+        #expect(source.contains("Label(visible, systemImage: \"exclamationmark.octagon.fill\")"))
         #expect(source.contains("Pool alert. \\(message)"))
         // Every new control names its account for VoiceOver.
         #expect(source.contains("Fix the proxy sign-in for \\(account.label)"))
@@ -179,7 +181,7 @@ struct Issue515RoutedFailurePromotionTests {
         let presentation = model.presentation(for: account, routedFailures: streak())
         #expect(presentation?.display == .unavailable(reason: reason))
         // …and the row still states the streak, so the surface is not silent.
-        #expect(presentation?.credentialText == "7 routed requests failed in a row (HTTP 401)")
+        #expect(presentation?.credentialText == "last 7 requests failed (HTTP 401)")
     }
 
     @Test func aMachineWithoutTheProxyStaysSilentEvenUnderAStreak() {
@@ -192,10 +194,10 @@ struct Issue515RoutedFailurePromotionTests {
 
     @Test func aSingleFailureReadsAsOneRequest() {
         #expect(ProxyRelogin.routedFailureText(streak(failures: 1))
-            == "1 routed request failed in a row (HTTP 401)")
+            == "last 1 request failed (HTTP 401)")
         // A daemon that reports no status code still gets a clean sentence.
         #expect(ProxyRelogin.routedFailureText(streak(failures: 4, statusCode: nil))
-            == "4 routed requests failed in a row")
+            == "last 4 requests failed")
     }
 }
 

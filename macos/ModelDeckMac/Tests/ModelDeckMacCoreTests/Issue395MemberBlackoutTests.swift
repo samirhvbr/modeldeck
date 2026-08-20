@@ -30,7 +30,7 @@ struct MemberBlackoutTests {
         let alert = try #require(state.memberBlackout?.alerts.first)
         #expect(alert.id == "placeholder-account")
         #expect(alert.statusCode == 401)
-        #expect(alert.statusLine == "Blackout Placeholder: 3 routed requests failed in a row")
+        #expect(alert.statusLine == "Blackout Placeholder: last 3 requests failed")
         #expect(alert.remedy == "Sign in again to restore proxy routing.")
     }
 
@@ -64,7 +64,10 @@ struct MemberBlackoutTests {
         let positions = anchors.map { source.range(of: $0)?.lowerBound }
         #expect(positions.allSatisfy { $0 != nil })
         #expect(positions.compactMap { $0 } == positions.compactMap { $0 }.sorted())
-        #expect(source.contains("Label(message, systemImage: \"exclamationmark.octagon.fill\")"))
+        // #537: the visible line is the evidence alone; the remedy sentence
+        // lives only in the tooltip/VoiceOver message.
+        #expect(source.contains("Label(visible, systemImage: \"exclamationmark.octagon.fill\")"))
+        #expect(source.contains(#"let visible = "\(alert.statusLine)\(httpStatus)""#))
         #expect(source.contains("Pool alert. \\(message)"))
     }
 }

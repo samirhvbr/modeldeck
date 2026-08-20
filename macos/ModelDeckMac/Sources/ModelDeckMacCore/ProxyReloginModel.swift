@@ -90,7 +90,8 @@ public enum ProxyRelogin {
     public static func routedFailureText(_ alert: MemberBlackoutAlert) -> String {
         let request = alert.consecutiveFailures == 1 ? "request" : "requests"
         let status = alert.statusCode.map { " (HTTP \($0))" } ?? ""
-        return "\(alert.consecutiveFailures) routed \(request) failed in a row\(status)"
+        // Issue #537: same plain wording as the banner's statusLine.
+        return "last \(alert.consecutiveFailures) \(request) failed\(status)"
     }
 
     /// Wire evidence outranks the recorded credential — with one exception: a

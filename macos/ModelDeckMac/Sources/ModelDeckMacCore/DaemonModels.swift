@@ -812,9 +812,11 @@ public struct MemberBlackoutAlert: Codable, Equatable, Sendable, Identifiable {
         self.remedy = remedy
     }
 
+    /// Issue #537 (Tim): plain words, no proxy jargon — "last N requests
+    /// failed" carries the streak without "routed" or "in a row".
     public var statusLine: String {
         let request = consecutiveFailures == 1 ? "request" : "requests"
-        return "\(label): \(consecutiveFailures) routed \(request) failed in a row"
+        return "\(label): last \(consecutiveFailures) \(request) failed"
     }
 }
 
