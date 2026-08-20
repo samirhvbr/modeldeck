@@ -18,6 +18,71 @@ function bumpMtime(file) {
   fs.utimesSync(file, stat.atime, new Date(stat.mtimeMs + 2_000));
 }
 
+function codexSessionMeta(sessionId) {
+  return {
+    timestamp: '2026-08-09T10:00:00.000Z',
+    type: 'session_meta',
+    payload: { id: sessionId, cwd: '/placeholder/projects/replay-merge' },
+  };
+}
+
+function codexTurnRecords({ turnId = null, timestamp, cumulativeTokens }) {
+  const turnIdentity = turnId ? { turn_id: turnId } : {};
+  const at = (offset) => new Date(Date.parse(timestamp) + offset).toISOString();
+  return [
+    {
+      timestamp: at(0),
+      type: 'event_msg',
+      payload: { type: 'task_started', ...turnIdentity },
+    },
+    {
+      timestamp: at(100),
+      type: 'turn_context',
+      payload: { ...turnIdentity },
+    },
+    {
+      timestamp: at(200),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: { total_token_usage: {
+          input_tokens: cumulativeTokens,
+          total_tokens: cumulativeTokens,
+        } },
+      },
+    },
+    {
+      timestamp: at(300),
+      type: 'event_msg',
+      payload: { type: 'task_complete', ...turnIdentity },
+    },
+  ];
+}
+
+function writeCodexJsonl(file, records, padding = 0) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `${records.map((record) => JSON.stringify(record)).join('\n')}\n${' '.repeat(padding)}\n`);
+}
+
+function duplicateCodexSources(t, sessionId, activeRecords, archivedRecords = activeRecords) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-observation-merge-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const profilesRoot = path.join(root, 'profiles');
+  const profile = path.join(profilesRoot, 'profile-placeholder');
+  const activeFile = path.join(
+    profile,
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    `rollout-placeholder-${sessionId}.jsonl`,
+  );
+  const archivedFile = path.join(profile, 'archived_sessions', 'replay-copy-placeholder.jsonl');
+  writeCodexJsonl(activeFile, activeRecords, 256);
+  writeCodexJsonl(archivedFile, archivedRecords);
+  return { profilesRoot, activeFile };
+}
+
 test('Codex rollout ingest streams nested sessions and flat archives into replay-safe warehouse rows', async (t) => {
   const store = new Store(':memory:');
   t.after(() => store.close());
@@ -172,6 +237,7 @@ test('Codex rollout ingest streams nested sessions and flat archives into replay
     'codex_turns_session_turn_id',
     'codex_turns_timestamp',
     'codex_turns_model_effort',
+    'ingest_file_state_session_parser_path',
   ]) assert.equal(indexes.has(name), true);
 });
 
@@ -213,6 +279,55 @@ test('TRIPWIRE #476: Codex rollout ingest skips unchanged files and re-parses on
     assert.equal(summary.sessionsUpdated, 0);
     assert.equal(summary.turnsUpdated, 0);
     assert.equal(store.db.prepare('SELECT total_changes() AS count').get().count, changesBefore);
+  });
+
+  await t.test('TRIPWIRE #480: upgrade skips unchanged legacy Codex files and lazily backfills one changed file', async () => {
+    store.db.exec('UPDATE ingest_file_state SET session_id = NULL, record_count = NULL');
+    const unchanged = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(unchanged.filesSkipped, 2, 'legacy rows with matching stats skip without parsing');
+    assert.equal(unchanged.sessions, 0, 'the first post-upgrade scan parses zero Codex files');
+    assert.equal(store.getIngestFileState(activeFile).sessionId, null);
+    assert.equal(store.getIngestFileState(activeFile).recordCount, null);
+    assert.equal(store.getIngestFileState(archivedFile).sessionId, null);
+    assert.equal(store.getIngestFileState(archivedFile).recordCount, null);
+
+    store.db.exec(`
+      CREATE TABLE legacy_codex_reconcile_audit(deleted_turn INTEGER NOT NULL);
+      CREATE TRIGGER legacy_codex_reconcile_delete
+      AFTER DELETE ON codex_turns
+      BEGIN
+        INSERT INTO legacy_codex_reconcile_audit(deleted_turn) VALUES (1);
+      END;
+    `);
+    bumpMtime(archivedFile);
+    const changed = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(changed.filesSkipped, 1);
+    assert.equal(changed.sessions, 1, 'only the naturally changed legacy file is parsed');
+    assert.equal(
+      store.getIngestFileState(archivedFile).sessionId,
+      '22222222-2222-4222-8222-222222222222',
+      'the natural replay records provenance needed if this non-UUID archive later becomes empty',
+    );
+    assert.ok(store.getIngestFileState(archivedFile).recordCount > 0);
+    assert.equal(store.getIngestFileState(activeFile).sessionId, null);
+    assert.equal(store.getIngestFileState(activeFile).recordCount, null);
+    assert.equal(
+      store.db.prepare('SELECT COUNT(*) AS count FROM legacy_codex_reconcile_audit').get().count,
+      0,
+      'a same-size legacy change uses size-only shrink detection until provenance is backfilled',
+    );
+    store.db.exec(`
+      DROP TRIGGER legacy_codex_reconcile_delete;
+      DROP TABLE legacy_codex_reconcile_audit;
+    `);
   });
 
   await t.test('append plus mtime bump re-parses exactly one file and lands the new turn', async () => {
@@ -268,10 +383,10 @@ test('TRIPWIRE #476: Codex rollout ingest skips unchanged files and re-parses on
     );
   });
 
-  await t.test('shrunk file re-ingests from scratch without rewriting unchanged rows', async () => {
-    const lines = fs.readFileSync(archivedFile, 'utf8').trimEnd().split('\n');
-    fs.writeFileSync(archivedFile, `${lines.slice(0, -1).join('\n')}\n`);
-    bumpMtime(archivedFile);
+  await t.test('TRIPWIRE #480: shrink replaces shifted turns and leaves unrelated sessions untouched', async () => {
+    const lines = fs.readFileSync(activeFile, 'utf8').trimEnd().split('\n');
+    fs.writeFileSync(activeFile, `${[lines[0], ...lines.slice(6)].join('\n')}\n`);
+    bumpMtime(activeFile);
 
     const summary = await ingestCodexRollouts({
       store,
@@ -280,12 +395,59 @@ test('TRIPWIRE #476: Codex rollout ingest skips unchanged files and re-parses on
     });
     assert.equal(summary.filesSkipped, 1);
     assert.equal(summary.sessions, 1, 'the shrunk file was parsed instead of skipped');
-    assert.equal(summary.turns, 1);
+    assert.equal(summary.turns, 2);
     assert.equal(summary.sessionsUpdated, 0);
     assert.equal(summary.turnsUpdated, 0);
+    assert.deepEqual(
+      store.db.prepare(`
+        SELECT turn_id FROM codex_turns
+        WHERE session_id = '11111111-1111-4111-8111-111111111111'
+        ORDER BY turn_index
+      `).all().map((row) => row.turn_id),
+      ['active-turn-two', 'active-turn-three-placeholder'],
+      'the removed first turn is gone and retained turns shift without a unique-key collision',
+    );
+    assert.deepEqual(
+      store.db.prepare(`
+        SELECT turn_id FROM codex_turns
+        WHERE session_id = '22222222-2222-4222-8222-222222222222'
+      `).all().map((row) => row.turn_id),
+      ['archived-turn'],
+      'the unrelated archived session is untouched',
+    );
+  });
+
+  await t.test('TRIPWIRE #480: a zero-byte shrink removes the file session', async () => {
+    fs.truncateSync(activeFile, 0);
+    bumpMtime(activeFile);
+
+    const summary = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 1);
+    assert.equal(summary.warnings.malformedFiles, 0);
+    assert.equal(
+      store.db.prepare(`
+        SELECT COUNT(*) AS count FROM codex_sessions
+        WHERE session_id = '11111111-1111-4111-8111-111111111111'
+      `).get().count,
+      0,
+      'an empty active rollout removes its session and cascading turns',
+    );
+    assert.equal(
+      store.db.prepare(`
+        SELECT COUNT(*) AS count FROM codex_turns
+        WHERE session_id = '22222222-2222-4222-8222-222222222222'
+      `).get().count,
+      1,
+      'the unrelated archived session is untouched',
+    );
   });
 
   await t.test('a same-size same-mtime replacement at the same path still re-ingests (inode changed)', async () => {
+    bumpMtime(archivedFile);
     const stat = fs.statSync(archivedFile);
     const replacement = `${archivedFile}.replacement`;
     fs.writeFileSync(replacement, fs.readFileSync(archivedFile));
@@ -321,6 +483,634 @@ test('TRIPWIRE #476: Codex rollout ingest skips unchanged files and re-parses on
       'the replay records the current parser provenance',
     );
   });
+
+  await t.test('TRIPWIRE #480: zero-byte archived files use stored session provenance', async () => {
+    fs.truncateSync(archivedFile, 0);
+    bumpMtime(archivedFile);
+
+    const summary = await ingestCodexRollouts({
+      store,
+      profilesRoot,
+      machine: 'placeholder-machine',
+    });
+    assert.equal(summary.filesSkipped, 1);
+    assert.equal(summary.warnings.malformedFiles, 0);
+    assert.equal(
+      store.db.prepare(`
+        SELECT COUNT(*) AS count FROM codex_sessions
+        WHERE session_id = '22222222-2222-4222-8222-222222222222'
+      `).get().count,
+      0,
+      'archived names without UUIDs reconcile from the session stored on the prior pass',
+    );
+  });
+});
+
+test('TRIPWIRE #480: an unstable Codex shrink stays pending until a stable reconcile', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-shrink-race-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const file = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-2026-08-09T10-00-00-11111111-1111-4111-8111-111111111111.jsonl',
+  );
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  const originalSize = fs.statSync(file).size;
+  const lines = fs.readFileSync(file, 'utf8').trimEnd().split('\n');
+  fs.writeFileSync(file, `${lines.slice(0, 6).join('\n')}\n`);
+  bumpMtime(file);
+
+  const statSync = fs.statSync;
+  let targetStats = 0;
+  fs.statSync = (target, ...args) => {
+    if (path.resolve(String(target)) === path.resolve(file)) {
+      targetStats += 1;
+      if (targetStats === 2) fs.appendFileSync(file, `${' '.repeat(originalSize + 50)}\n`);
+    }
+    return statSync(target, ...args);
+  };
+  try {
+    await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  } finally {
+    fs.statSync = statSync;
+  }
+
+  const pendingState = store.getIngestFileState(file);
+  const replayedPrefix = `${lines.slice(0, 6).join('\n')}\n`;
+  const paddingLength = pendingState.size - Buffer.byteLength(replayedPrefix) - 1;
+  assert.ok(paddingLength > 0);
+  fs.writeFileSync(file, `${replayedPrefix}${' '.repeat(paddingLength)}\n`);
+  fs.utimesSync(file, new Date(pendingState.mtimeMs), new Date(pendingState.mtimeMs));
+  const restoredStat = fs.statSync(file);
+  store.db.prepare('UPDATE ingest_file_state SET mtime_ms = ? WHERE path = ?')
+    .run(restoredStat.mtimeMs, file);
+  const restoredState = store.getIngestFileState(file);
+  assert.equal(restoredStat.size, pendingState.size);
+  assert.equal(restoredStat.mtimeMs, restoredState.mtimeMs);
+  assert.equal(restoredStat.ino, pendingState.ino);
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id FROM codex_turns
+      WHERE session_id = '11111111-1111-4111-8111-111111111111'
+      ORDER BY turn_index
+    `).all().map((row) => row.turn_id),
+    ['active-turn-one'],
+    'growth during the first read cannot turn an unfinished shrink into an append-only replay',
+  );
+});
+
+test('TRIPWIRE #480: a zero-byte active rollout preserves its archived session copy', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-duplicate-session-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const activeFile = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-2026-08-09T10-00-00-11111111-1111-4111-8111-111111111111.jsonl',
+  );
+  const archivedCopy = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'archived_sessions',
+    'archived-active-placeholder.jsonl',
+  );
+  fs.copyFileSync(activeFile, archivedCopy);
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  fs.truncateSync(activeFile, 0);
+  bumpMtime(activeFile);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id FROM codex_turns
+      WHERE session_id = '11111111-1111-4111-8111-111111111111'
+      ORDER BY turn_index
+    `).all().map((row) => row.turn_id),
+    ['active-turn-one', 'active-turn-two'],
+    'truncating one source cannot delete turns that still exist in another source file',
+  );
+});
+
+test('TRIPWIRE #480: a zero-byte non-UUID legacy Codex file warns once and stays handled', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-zero-byte-legacy-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const archivedFile = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'archived_sessions',
+    'archived-placeholder-session.jsonl',
+  );
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  store.db.prepare(`
+    UPDATE ingest_file_state SET session_id = NULL, record_count = NULL WHERE path = ?
+  `).run(archivedFile);
+  fs.truncateSync(archivedFile, 0);
+  bumpMtime(archivedFile);
+
+  const firstWarnings = [];
+  const first = await ingestCodexRollouts({
+    store,
+    profilesRoot,
+    machine: 'placeholder-machine',
+    warn: (message) => firstWarnings.push(message),
+  });
+  const secondWarnings = [];
+  const second = await ingestCodexRollouts({
+    store,
+    profilesRoot,
+    machine: 'placeholder-machine',
+    warn: (message) => secondWarnings.push(message),
+  });
+
+  assert.equal(first.warnings.malformedFiles, 0);
+  assert.equal(second.warnings.malformedFiles, 0);
+  assert.equal(firstWarnings.length, 1, 'the first unknowable empty file emits one warning');
+  assert.match(firstWarnings[0], /stale rows may remain/);
+  assert.deepEqual(secondWarnings, [], 'the handled empty file emits no warning on its next scan');
+  assert.equal(store.getIngestFileState(archivedFile).reconcilePending, false);
+});
+
+test('TRIPWIRE #480: duplicate Codex sources reconcile as one session group', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-source-group-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const activeFile = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-2026-08-09T10-00-00-11111111-1111-4111-8111-111111111111.jsonl',
+  );
+  const archiveDirectory = path.join(profilesRoot, 'profile-alpha', 'archived_sessions');
+  const longCopy = path.join(archiveDirectory, 'a-long-active-copy.jsonl');
+  const shortCopy = path.join(archiveDirectory, 'z-short-active-copy.jsonl');
+  const lines = fs.readFileSync(activeFile, 'utf8').trimEnd().split('\n');
+  fs.copyFileSync(activeFile, longCopy);
+  fs.writeFileSync(shortCopy, `${lines.slice(0, 6).join('\n')}\n`);
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  fs.writeFileSync(activeFile, `${lines.slice(0, 6).join('\n')}\n`);
+  bumpMtime(activeFile);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id FROM codex_turns
+      WHERE session_id = '11111111-1111-4111-8111-111111111111'
+      ORDER BY turn_index
+    `).all().map((row) => row.turn_id),
+    ['active-turn-one', 'active-turn-two'],
+    'a nonzero shrink cannot remove a turn retained by another source',
+  );
+
+  fs.truncateSync(activeFile, 0);
+  bumpMtime(activeFile);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id FROM codex_turns
+      WHERE session_id = '11111111-1111-4111-8111-111111111111'
+      ORDER BY turn_index
+    `).all().map((row) => row.turn_id),
+    ['active-turn-one', 'active-turn-two'],
+    'the shorter last-sorted copy cannot overwrite the longer surviving source',
+  );
+});
+
+test('TRIPWIRE #480: duplicate Codex replay preserves identical anonymous occurrences', async (t) => {
+  const sessionId = '33333333-3333-4333-8333-333333333333';
+  const records = [
+    codexSessionMeta(sessionId),
+    ...codexTurnRecords({
+      timestamp: '2026-08-09T10:00:01.000Z',
+      cumulativeTokens: 10,
+    }),
+    ...codexTurnRecords({
+      timestamp: '2026-08-09T10:00:01.000Z',
+      cumulativeTokens: 20,
+    }),
+  ];
+  const { profilesRoot, activeFile } = duplicateCodexSources(t, sessionId, records);
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  writeCodexJsonl(activeFile, records);
+  bumpMtime(activeFile);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id, total_tokens FROM codex_turns
+      WHERE session_id = ? ORDER BY turn_index
+    `).all(sessionId).map((row) => ({ ...row })),
+    [
+      { turn_id: null, total_tokens: 10 },
+      { turn_id: null, total_tokens: 10 },
+    ],
+    'equal anonymous turns are separate occurrences, not duplicate observations of one turn',
+  );
+});
+
+test('TRIPWIRE #480: duplicate Codex replay merges richer snapshots of one anonymous occurrence', async (t) => {
+  const sessionId = '44444444-4444-4444-8444-444444444444';
+  const activeRecords = [
+    codexSessionMeta(sessionId),
+    ...codexTurnRecords({
+      timestamp: '2026-08-09T10:00:01.000Z',
+      cumulativeTokens: 10,
+    }),
+  ];
+  const archivedRecords = [
+    codexSessionMeta(sessionId),
+    ...codexTurnRecords({
+      timestamp: '2026-08-09T10:00:01.000Z',
+      cumulativeTokens: 12,
+    }),
+  ];
+  const { profilesRoot, activeFile } = duplicateCodexSources(
+    t,
+    sessionId,
+    activeRecords,
+    archivedRecords,
+  );
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  writeCodexJsonl(activeFile, activeRecords);
+  bumpMtime(activeFile);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id, total_tokens FROM codex_turns
+      WHERE session_id = ? ORDER BY turn_index
+    `).all(sessionId).map((row) => ({ ...row })),
+    [{ turn_id: null, total_tokens: 12 }],
+    'the same anonymous occurrence is stored once using its richer observation',
+  );
+});
+
+test('TRIPWIRE #480: duplicate Codex replay keeps the richer named-turn observation', async (t) => {
+  const sessionId = '55555555-5555-4555-8555-555555555555';
+  const activeRecords = [
+    codexSessionMeta(sessionId),
+    ...codexTurnRecords({
+      turnId: 'shared-turn-placeholder',
+      timestamp: '2026-08-09T10:00:01.000Z',
+      cumulativeTokens: 0,
+    }),
+    ...codexTurnRecords({
+      turnId: 'active-only-turn-placeholder',
+      timestamp: '2026-08-09T10:00:02.000Z',
+      cumulativeTokens: 1,
+    }),
+  ];
+  const archivedRecords = [
+    codexSessionMeta(sessionId),
+    ...codexTurnRecords({
+      turnId: 'shared-turn-placeholder',
+      timestamp: '2026-08-09T10:00:01.000Z',
+      cumulativeTokens: 10,
+    }),
+  ];
+  const { profilesRoot, activeFile } = duplicateCodexSources(
+    t,
+    sessionId,
+    activeRecords,
+    archivedRecords,
+  );
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  writeCodexJsonl(activeFile, activeRecords);
+  bumpMtime(activeFile);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id, total_tokens FROM codex_turns
+      WHERE session_id = ? ORDER BY turn_index
+    `).all(sessionId).map((row) => ({ ...row })),
+    [
+      { turn_id: 'shared-turn-placeholder', total_tokens: 10 },
+      { turn_id: 'active-only-turn-placeholder', total_tokens: 1 },
+    ],
+    'a longer source cannot replace richer shared-turn usage with zeroes',
+  );
+});
+
+test('TRIPWIRE #480: shifted anonymous Codex observations still merge across sources', async (t) => {
+  const sessionId = '66666666-6666-4666-8666-666666666666';
+  const firstTurn = codexTurnRecords({
+    timestamp: '2026-08-09T10:00:01.000Z',
+    cumulativeTokens: 10,
+  });
+  const secondTurn = codexTurnRecords({
+    timestamp: '2026-08-09T10:00:02.000Z',
+    cumulativeTokens: 20,
+  });
+  const fullRecords = [codexSessionMeta(sessionId), ...firstTurn, ...secondTurn];
+  const { profilesRoot, activeFile } = duplicateCodexSources(t, sessionId, fullRecords);
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  writeCodexJsonl(activeFile, [codexSessionMeta(sessionId), ...secondTurn]);
+  bumpMtime(activeFile);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT timestamp, total_tokens FROM codex_turns
+      WHERE session_id = ? ORDER BY timestamp
+    `).all(sessionId).map((row) => ({ ...row })),
+    [
+      { timestamp: '2026-08-09T10:00:01.000Z', total_tokens: 10 },
+      { timestamp: '2026-08-09T10:00:02.000Z', total_tokens: 10 },
+    ],
+    'a shifted snapshot cannot duplicate the row or reinterpret its cumulative usage as a new baseline',
+  );
+});
+
+test('TRIPWIRE #480: fewer Codex records reconcile even when the file does not lose bytes', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-record-count-shrink-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const file = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-2026-08-09T10-00-00-11111111-1111-4111-8111-111111111111.jsonl',
+  );
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  const originalSize = fs.statSync(file).size;
+  const lines = fs.readFileSync(file, 'utf8').trimEnd().split('\n');
+  const kept = `${lines.slice(0, 6).join('\n')}\n`;
+  fs.writeFileSync(file, `${kept}${' '.repeat(originalSize - Buffer.byteLength(kept))}`);
+  bumpMtime(file);
+  store.db.prepare('UPDATE ingest_file_state SET parser_version = 0 WHERE path = ?').run(file);
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  assert.equal(fs.statSync(file).size, originalSize);
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id FROM codex_turns
+      WHERE session_id = '11111111-1111-4111-8111-111111111111'
+      ORDER BY turn_index
+    `).all().map((row) => row.turn_id),
+    ['active-turn-one'],
+    'record-count shrink and parser-version replay compose without retaining the removed turn',
+  );
+  assert.equal(store.getIngestFileState(file).parserVersion, 1);
+});
+
+test('TRIPWIRE #480: unstable Codex path repurposing never publishes the transient session', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-unstable-repurpose-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const profilesRoot = path.join(root, 'profiles');
+  const file = path.join(
+    profilesRoot,
+    'profile-placeholder',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-placeholder-77777777-7777-4777-8777-777777777777.jsonl',
+  );
+  const sessionA = '77777777-7777-4777-8777-777777777777';
+  const sessionB = '88888888-8888-4888-8888-888888888888';
+  const sessionC = '99999999-9999-4999-8999-999999999999';
+  const records = (sessionId, timestamp, turnId) => [
+    codexSessionMeta(sessionId),
+    ...codexTurnRecords({ turnId, timestamp, cumulativeTokens: 10 }),
+  ];
+  writeCodexJsonl(file, records(sessionA, '2026-08-09T10:00:01.000Z', 'turn-a-placeholder'), 512);
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  writeCodexJsonl(file, records(sessionB, '2026-08-09T10:00:02.000Z', 'turn-b-placeholder'));
+  bumpMtime(file);
+  const sessionBStat = fs.statSync(file);
+  const statSync = fs.statSync;
+  let targetStats = 0;
+  fs.statSync = (target, ...args) => {
+    if (path.resolve(String(target)) === path.resolve(file)) {
+      targetStats += 1;
+      if (targetStats === 2) {
+        writeCodexJsonl(file, records(sessionC, '2026-08-09T10:00:03.000Z', 'turn-c-placeholder'));
+        fs.utimesSync(file, sessionBStat.atime, new Date(sessionBStat.mtimeMs + 2_000));
+      }
+    }
+    return statSync(target, ...args);
+  };
+  try {
+    await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  } finally {
+    fs.statSync = statSync;
+  }
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.deepEqual(
+    store.db.prepare('SELECT session_id FROM codex_sessions ORDER BY session_id').all()
+      .map((row) => row.session_id),
+    [sessionC],
+    'a session parsed from an unstable intermediate snapshot never reaches the warehouse',
+  );
+});
+
+test('TRIPWIRE #480: zeroing a later Codex copy removes its unique turn in one pass', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-later-zero-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const activeFile = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-2026-08-09T10-00-00-11111111-1111-4111-8111-111111111111.jsonl',
+  );
+  const laterCopy = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'archived_sessions',
+    'z-active-with-third-turn.jsonl',
+  );
+  fs.copyFileSync(activeFile, laterCopy);
+  fs.appendFileSync(laterCopy, [
+    JSON.stringify({
+      timestamp: '2026-08-09T10:02:01.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_started', turn_id: 'archive-only-turn', started_at: '2026-08-09T10:02:01.000Z' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-08-09T10:02:01.100Z',
+      type: 'turn_context',
+      payload: { turn_id: 'archive-only-turn' },
+    }),
+    JSON.stringify({
+      timestamp: '2026-08-09T10:02:02.000Z',
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: {
+            input_tokens: 230,
+            cached_input_tokens: 130,
+            cache_write_input_tokens: 12,
+            output_tokens: 60,
+            reasoning_output_tokens: 25,
+            total_tokens: 290,
+          },
+        },
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-08-09T10:02:04.000Z',
+      type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'archive-only-turn', completed_at: '2026-08-09T10:02:04.000Z' },
+    }),
+  ].join('\n') + '\n');
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  fs.truncateSync(laterCopy, 0);
+  bumpMtime(laterCopy);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id FROM codex_turns
+      WHERE session_id = '11111111-1111-4111-8111-111111111111'
+      ORDER BY turn_index
+    `).all().map((row) => row.turn_id),
+    ['active-turn-one', 'active-turn-two'],
+    'a removed turn is gone after the first re-ingest even when its surviving source ran earlier',
+  );
+});
+
+test('TRIPWIRE #480: Codex reconciliation finds duplicate sources across profiles', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-cross-profile-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const activeFile = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-2026-08-09T10-00-00-11111111-1111-4111-8111-111111111111.jsonl',
+  );
+  const otherArchive = path.join(profilesRoot, 'profile-zeta', 'archived_sessions');
+  fs.mkdirSync(otherArchive, { recursive: true });
+  const laterCopy = path.join(otherArchive, 'active-copy-placeholder.jsonl');
+  fs.copyFileSync(activeFile, laterCopy);
+
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+  fs.truncateSync(laterCopy, 0);
+  bumpMtime(laterCopy);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id FROM codex_turns
+      WHERE session_id = '11111111-1111-4111-8111-111111111111'
+      ORDER BY turn_index
+    `).all().map((row) => row.turn_id),
+    ['active-turn-one', 'active-turn-two'],
+    'a globally keyed session survives while any managed profile still contains it',
+  );
+});
+
+test('TRIPWIRE #480: replacing a Codex path with another session clears stale ownership', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-repurposed-path-'));
+  const profilesRoot = path.join(root, 'profiles');
+  fs.cpSync(fixtureRoot, profilesRoot, { recursive: true });
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const activeFile = path.join(
+    profilesRoot,
+    'profile-alpha',
+    'sessions',
+    '2026',
+    '08',
+    '09',
+    'rollout-2026-08-09T10-00-00-11111111-1111-4111-8111-111111111111.jsonl',
+  );
+  const archiveDirectory = path.join(profilesRoot, 'profile-alpha', 'archived_sessions');
+  const oldSessionCopy = path.join(archiveDirectory, 'repurposed-placeholder.jsonl');
+  const otherSessionFile = path.join(archiveDirectory, 'archived-placeholder-session.jsonl');
+  fs.copyFileSync(activeFile, oldSessionCopy);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  fs.copyFileSync(otherSessionFile, oldSessionCopy);
+  fs.truncateSync(activeFile, 0);
+  bumpMtime(activeFile);
+  await ingestCodexRollouts({ store, profilesRoot, machine: 'placeholder-machine' });
+
+  assert.equal(
+    store.db.prepare(`
+      SELECT COUNT(*) AS count FROM codex_sessions
+      WHERE session_id = '11111111-1111-4111-8111-111111111111'
+    `).get().count,
+    0,
+    'stale file-state provenance cannot keep a session with no remaining source alive',
+  );
+  assert.deepEqual(
+    store.db.prepare(`
+      SELECT turn_id FROM codex_turns
+      WHERE session_id = '22222222-2222-4222-8222-222222222222'
+      ORDER BY turn_index
+    `).all().map((row) => row.turn_id),
+    ['archived-turn'],
+    'the replacement path is re-attributed to its current session',
+  );
 });
 
 test('TRIPWIRE codex-cached-input-subset — rollout cache reads are split from input exactly once', async (t) => {

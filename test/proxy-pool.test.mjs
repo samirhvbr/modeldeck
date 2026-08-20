@@ -91,8 +91,8 @@ function fixture(t, { spawn, serviceOptions = {} } = {}) {
     ...serviceOptions,
   });
 
-  t.after(() => {
-    service.stopAutoRefresh();
+  t.after(async () => {
+    await service.stopAutoRefresh();
     store.close();
     fs.rmSync(root, { recursive: true, force: true });
   });

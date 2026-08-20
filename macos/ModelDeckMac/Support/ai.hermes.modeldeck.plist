@@ -14,7 +14,10 @@
   <string>ai.hermes.modeldeck</string>
 
   <!-- Relative to the app bundle root; SMAppService resolves it. The SEA
-       binary is self-contained — no Node on PATH required. -->
+       binary is self-contained — no Node on PATH required. Its bootstrap
+       redirects fd 2 to the owner-only, size-bounded modeldeck.err.log under
+       the per-user ModelDeck data directory before loading the server. This
+       is the HOME-aware equivalent of StandardErrorPath for the static plist. -->
   <key>BundleProgram</key>
   <string>Contents/Resources/daemon/modeldeckd</string>
 

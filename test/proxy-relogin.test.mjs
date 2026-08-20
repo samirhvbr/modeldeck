@@ -485,7 +485,7 @@ async function fixture(t, serviceOptions = {}) {
     proxyReloginFetch: fetcher,
   });
   service.codexAccountIdentifiers.set(codex.id, CODEX_ACCOUNT_ID);
-  t.after(() => { service.stopAutoRefresh(); store.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => { await service.stopAutoRefresh(); store.close(); fs.rmSync(root, { recursive: true, force: true }); });
   return {
     root, store, service, claude, codex, managementKeyPath, cliproxyAuthDir,
     proxy: fetcher.state,

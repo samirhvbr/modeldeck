@@ -808,6 +808,46 @@ test('renewal waits for an in-flight manual activation before flipping the profi
   } finally { data.close(); }
 });
 
+test('renewal keeps its legitimate queue wait when activation uses the short starvation budget', async () => {
+  let releaseActivation;
+  let activationStarted;
+  const started = new Promise((resolve) => { activationStarted = resolve; });
+  const blocked = new Promise((resolve) => { releaseActivation = resolve; });
+  let activationCalls = 0;
+  const data = fixture({
+    statusOutput: JSON.stringify({ email: 'other@example.invalid' }),
+    serviceOptions: {
+      claudeActivationQueueTimeoutMs: 15,
+      claudeActivationOperationTimeoutMs: 200,
+      activateClaude: async (options) => {
+        activationCalls += 1;
+        if (activationCalls === 1) {
+          activationStarted();
+          await blocked;
+        }
+        return activateClaudeProfile(options);
+      },
+    },
+  });
+  try {
+    data.expire();
+    const activation = data.service.activateAccount(data.target.id);
+    await started;
+    const renewalOutcome = data.service.renewClaudeAccount(data.target.id).then(
+      (value) => ({ value }),
+      (error) => ({ error }),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(data.calls.length, 0, 'renewal remains serialized behind the legitimate activation');
+    releaseActivation();
+    await activation;
+    const outcome = await renewalOutcome;
+    assert.equal(outcome.error, undefined);
+    assert.equal(outcome.value.outcome, 'renewed');
+  } finally { data.close(); }
+});
+
 test('scheduled pre-expiry renewal requires the credential lifetime to advance (issue #265)', async () => {
   const timestamp = Date.parse('2026-08-08T12:00:00Z');
   const originalExpiresAt = timestamp + 40 * 60_000;

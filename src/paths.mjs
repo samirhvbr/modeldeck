@@ -10,6 +10,10 @@ export const DATA_DIR = path.resolve(
   process.env.MODELDECK_DATA_DIR || path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck'),
 );
 export const DB_PATH = process.env.MODELDECK_DB_PATH || path.join(DATA_DIR, 'modeldeck.sqlite');
+// The bundled launchd job cannot expand a per-user home path in its static
+// plist. The SEA bootstrap redirects fd 2 here before server imports, with
+// one bounded rotation managed by src/daemon-error-log.mjs.
+export const DAEMON_ERROR_LOG_PATH = path.join(DATA_DIR, 'modeldeck.err.log');
 // Issue #347: the lane runner's append-only run manifest
 // (.claude/lane-logs/manifest.jsonl in the orchestrated repo). Read-only, and
 // only ever to TAG sessions with a plausible issue number — a missing file

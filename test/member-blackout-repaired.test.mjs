@@ -102,7 +102,7 @@ function fixture(t) {
     listProviderProcesses: async () => [],
     platform: 'linux',
   });
-  t.after(() => { service.stopAutoRefresh(); store.close(); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(async () => { await service.stopAutoRefresh(); store.close(); fs.rmSync(root, { recursive: true, force: true }); });
 
   /// Write failures straight into the request archive the streak reads. The
   /// queue consumer's own path is covered by the #395 tripwire; this suite is

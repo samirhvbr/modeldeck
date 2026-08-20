@@ -72,7 +72,7 @@ test('daemon build check-only reports the complete plan without requiring build 
   });
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /version:\s+9\.8\.7/);
-  assert.match(result.stdout, /would bundle src\/server\.mjs/);
+  assert.match(result.stdout, /would bundle src\/daemon-entry\.mjs/);
   assert.match(result.stdout, /inject a Node SEA/);
   assert.match(result.stdout, /smoke-check GET \/api\/health/);
 });
@@ -144,7 +144,7 @@ test('daemon CJS bundle inlines its version and has no import.meta warnings', (t
   t.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
   const bundle = path.join(temporary, 'modeldeckd.cjs');
   const result = spawnSync(fileURLToPath(esbuild), [
-    fileURLToPath(new URL('../src/server.mjs', import.meta.url)),
+    fileURLToPath(new URL('../src/daemon-entry.mjs', import.meta.url)),
     '--bundle', '--platform=node', '--target=node24', '--format=cjs',
     '--define:__MODELDECK_VERSION__="9.8.7"',
     '--define:__MODELDECK_GIT_COMMIT__="cafe42"',
@@ -155,6 +155,7 @@ test('daemon CJS bundle inlines its version and has no import.meta warnings', (t
   assert.equal(result.status, 0, result.stderr || `esbuild exited with status ${result.status}`);
   assert.doesNotMatch(result.stderr, /import\.meta.*not available/i);
   const content = fs.readFileSync(bundle, 'utf8');
+  assert.match(content, /MODELDECK_DAEMON_STDERR_BOOTSTRAP_PID/);
   assert.match(content, /VERSION = true \? "9\.8\.7"/);
   // The self-reported build commit inlines the same way (stale-daemon
   // verification: the app compares this against the bundle manifest).

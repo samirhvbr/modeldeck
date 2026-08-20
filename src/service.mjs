@@ -145,6 +145,15 @@ function isLaterInstant(later, earlier) {
 export const MODEL_DROP_QUOTA_PERCENT = 95;
 
 const CLAUDE_RENEWAL_TIMEOUT_MS = 60_000;
+// Issue #484: the longest existing credential budget is the five-minute
+// browser OAuth watcher, and renewal can stack several bounded 60-second
+// CLI/probe stages close to that. Six minutes preserves the established auth
+// ceiling plus one minute of cleanup margin while guaranteeing a deadline.
+const DEFAULT_CLAUDE_ACTIVATION_OPERATION_TIMEOUT_MS = 6 * 60_000;
+// The Mac client's plain activation request has a five-second transport
+// timeout. Fail a starved queue one second earlier so the daemon can return a
+// typed response instead of making the app guess from a network timeout.
+const DEFAULT_CLAUDE_ACTIVATION_QUEUE_TIMEOUT_MS = 4_000;
 const CLAUDE_RENEWAL_BACKOFF_MS = 30 * 60_000;
 const CLAUDE_RENEWAL_PRE_EXPIRY_WINDOW_MS = 45 * 60_000;
 const CLAUDE_RENEWAL_DAY_MS = 24 * 60 * 60_000;
@@ -451,6 +460,46 @@ class ClaudeProxyRoutingConflictError extends Error {
   constructor(operation) {
     super(`cannot change proxy routing while this account's Claude ${operation} is in progress`);
     this.statusCode = 409;
+  }
+}
+
+class ClaudeActivationQueueTimeoutError extends Error {
+  constructor() {
+    super('This Claude activation request timed out while queued behind earlier account work. It did not start; retry after the earlier operation finishes.');
+    this.statusCode = 503;
+    this.code = 'claude-activation-queue-timeout';
+  }
+}
+
+class ClaudeActivationOperationTimeoutError extends Error {
+  constructor() {
+    super('Claude account work exceeded its safety limit. The underlying operation may still be running, so ModelDeck is refusing overlapping credential changes until it stops.');
+    this.statusCode = 504;
+    this.code = 'claude-activation-operation-timeout';
+  }
+}
+
+class ClaudeActivationOperationStillRunningError extends Error {
+  constructor() {
+    super('A timed-out Claude account operation is still running. This request did not start because overlapping credential changes are unsafe; retry after the earlier operation stops.');
+    this.statusCode = 503;
+    this.code = 'claude-activation-operation-still-running';
+  }
+}
+
+class ClaudeProfileSettingsOperationTimeoutError extends Error {
+  constructor() {
+    super('Claude profile settings work exceeded its safety limit. The underlying settings operation may still be running; retry later.');
+    this.statusCode = 504;
+    this.code = 'claude-profile-settings-operation-timeout';
+  }
+}
+
+function logClaudeActivationWatchdog(message) {
+  try {
+    console.error(message);
+  } catch {
+    // A broken stderr sink must not change lock safety or the API response.
   }
 }
 
@@ -801,6 +850,8 @@ export class ModelDeckService {
     this.autoRefreshTimer = null;
     this.autoRefreshGeneration = 0;
     this.autoRefreshStarted = false;
+    this.autoRefreshStartupTasks = new Set();
+    this.autoRefreshTickTasks = new Set();
     this.lastCompletedRefreshAt = null;
     this.pausedForActiveSessions = false;
     this.activeProviderSessionPresent = false;
@@ -808,7 +859,36 @@ export class ModelDeckService {
     // Issue #176: every operation that flips ~/.claude shares this queue.
     // Renewal additionally has an immediate conflict guard because its HTTP
     // contract returns 409 for a second renewal instead of silently queuing it.
+    const activationOperationTimeoutMs = Number(
+      options.claudeActivationOperationTimeoutMs ?? DEFAULT_CLAUDE_ACTIVATION_OPERATION_TIMEOUT_MS,
+    );
+    const activationQueueTimeoutMs = Number(
+      options.claudeActivationQueueTimeoutMs ?? DEFAULT_CLAUDE_ACTIVATION_QUEUE_TIMEOUT_MS,
+    );
+    this.claudeActivationOperationTimeoutMs = Number.isFinite(activationOperationTimeoutMs)
+      && activationOperationTimeoutMs > 0
+      ? activationOperationTimeoutMs
+      : DEFAULT_CLAUDE_ACTIVATION_OPERATION_TIMEOUT_MS;
+    this.claudeActivationQueueTimeoutMs = Number.isFinite(activationQueueTimeoutMs)
+      && activationQueueTimeoutMs > 0
+      ? activationQueueTimeoutMs
+      : DEFAULT_CLAUDE_ACTIVATION_QUEUE_TIMEOUT_MS;
+    const profileSettingsOperationTimeoutMs = Number(
+      options.claudeProfileSettingsOperationTimeoutMs ?? this.claudeActivationOperationTimeoutMs,
+    );
+    this.claudeProfileSettingsOperationTimeoutMs = Number.isFinite(profileSettingsOperationTimeoutMs)
+      && profileSettingsOperationTimeoutMs > 0
+      ? profileSettingsOperationTimeoutMs
+      : this.claudeActivationOperationTimeoutMs;
+    // Dedicated clock: many service fixtures replace the scheduler timer with
+    // an inert stub. That must never disable this safety boundary by accident.
+    this.claudeActivationSetTimeout = options.claudeActivationSetTimeout || globalThis.setTimeout;
+    this.claudeActivationClearTimeout = options.claudeActivationClearTimeout || globalThis.clearTimeout;
     this.claudeActivationTail = Promise.resolve();
+    // A watchdog can stop waiting, but JavaScript cannot cancel arbitrary
+    // credential work. Keep newer work fenced until the timed-out operation
+    // itself settles so serialization never degrades into overlap.
+    this.claudeActivationSafetyFence = null;
     this.claudeRenewalPromise = null;
     this.claudeRenewalAccountId = null;
     // Issue #265: credential expiry is deliberately ephemeral. It must reach
@@ -868,34 +948,34 @@ export class ModelDeckService {
     if (this.demoFixtures) return;
     this.autoRefreshStarted = true;
     // Local, credential-free startup migration for pre-#62 Claude rows.
-    void this.backfillClaudeIdentities();
+    void this.trackAutoRefreshStartup(this.backfillClaudeIdentities()).catch(() => {});
     // Issue #203: every managed Claude home carries the same inert profile
     // explainer. Reconcile alongside the #190/#189 statusline startup repair
     // so upgrades to the pinned block reach profiles created by older builds.
-    void this.reconcileClaudeProfileExplainers().catch(() => {});
+    void this.trackAutoRefreshStartup(this.reconcileClaudeProfileExplainers()).catch(() => {});
     // Issue #189: before anything else statusline, repair tees still
     // pointing at a daemon binary that has since moved or been deleted
     // (same bug class as #185's dead release-worktree daemon).
-    void this.reconcileClaudeStatuslineInstalls().catch(() => {});
+    void this.trackAutoRefreshStartup(this.reconcileClaudeStatuslineInstalls()).catch(() => {});
     // Issue #174: pick up statusline captures written while the daemon was
     // down, then watch for new ones — server-truth windows should not wait
     // for the next scheduled provider refresh.
-    void this.ingestClaudeStatuslineCaptures().catch(() => {});
+    void this.trackAutoRefreshStartup(this.ingestClaudeStatuslineCaptures()).catch(() => {});
     // Issue #377: same for the per-session model markers, so a drop that
     // happened while the daemon was down is still on the deck at startup.
-    void this.ingestClaudeStatuslineSessionModels().catch(() => {});
+    void this.trackAutoRefreshStartup(this.ingestClaudeStatuslineSessionModels()).catch(() => {});
     // #282 adversarial review, major 2: a crash between the settings.json
     // write and the shell pin write leaves the two split-brained until the
     // next activation or routing change. Reconcile the pin from the active
     // profile's ACTUAL routing state at startup, like the other repairs
     // above — the write path is idempotent, so a consistent state is a
     // no-op.
-    void this.reconcileClaudeShellEnvFile().catch(() => {});
+    void this.trackAutoRefreshStartup(this.reconcileClaudeShellEnvFile()).catch(() => {});
     this.startClaudeStatuslineWatcher();
     const generation = ++this.autoRefreshGeneration;
     const settings = this.store.getSettings();
     if (settings.sharedUserScopeEnabled) {
-      void this.sharedScope.start().catch(() => {
+      void this.trackAutoRefreshStartup(this.sharedScope.start()).catch(() => {
         // Provider paths can contain account labels; never echo them into the
         // daemon log from a filesystem exception.
         console.error('[modeldeck] shared-scope startup reconcile failed');
@@ -905,6 +985,14 @@ export class ModelDeckService {
       if (this.lastCompletedRefreshAt == null) this.lastCompletedRefreshAt = this.now();
       this.armAutoRefresh(this.autoRefreshInitialDelayMs, generation);
     }
+  }
+
+  trackAutoRefreshStartup(task) {
+    const tracked = Promise.resolve(task);
+    this.autoRefreshStartupTasks.add(tracked);
+    const clear = () => this.autoRefreshStartupTasks.delete(tracked);
+    void tracked.then(clear, clear);
+    return tracked;
   }
 
   stopAutoRefresh() {
@@ -921,6 +1009,13 @@ export class ModelDeckService {
       this.statuslineWatcher = null;
     }
     this.sharedScope.stopWatchers();
+    const pendingTasks = [...this.autoRefreshStartupTasks, ...this.autoRefreshTickTasks]
+      .map((task) => task.catch(() => {}));
+    return Promise.all([...pendingTasks, this.sharedScope.stop()]).finally(() => {
+      // A startup shared-scope pass may have reached startWatchers() while
+      // shutdown was draining it. Close that late watcher before returning.
+      this.sharedScope.stopWatchers();
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -1885,14 +1980,19 @@ export class ModelDeckService {
     const current = previous.catch(() => {}).then(() => gate);
     this.claudeProfileSettingsTails.set(profileRef, current);
     await previous.catch(() => {});
-    try {
-      return await operation();
-    } finally {
+    const operationPromise = Promise.resolve().then(operation);
+    const releaseWhenSettled = () => {
       release();
       if (this.claudeProfileSettingsTails.get(profileRef) === current) {
         this.claudeProfileSettingsTails.delete(profileRef);
       }
-    }
+    };
+    void operationPromise.finally(releaseWhenSettled).catch(() => {});
+    return this.awaitClaudeActivationBound(
+      operationPromise,
+      this.claudeProfileSettingsOperationTimeoutMs,
+      () => new ClaudeProfileSettingsOperationTimeoutError(),
+    );
   }
 
   // Issue #204 — shared Claude user scope. The engine owns the operation
@@ -1994,7 +2094,11 @@ export class ModelDeckService {
       const settings = this.store.getSettings();
       if (!settings.autoRefreshEnabled) return;
 
-      this.runAutoRefreshTick(settings, generation).catch((error) => {
+      const tick = this.runAutoRefreshTick(settings, generation);
+      this.autoRefreshTickTasks.add(tick);
+      const clearTick = () => this.autoRefreshTickTasks.delete(tick);
+      void tick.then(clearTick, clearTick);
+      void tick.catch((error) => {
         console.error(`[modeldeck] scheduled refresh failed: ${error?.message || error}`);
       }).finally(() => {
         if (!this.autoRefreshStarted || generation !== this.autoRefreshGeneration) return;
@@ -3465,14 +3569,60 @@ export class ModelDeckService {
     return outcomes;
   }
 
-  async withClaudeActivationLock(operation) {
+  async awaitClaudeActivationBound(promise, timeoutMs, timeoutError) {
+    let timer = null;
+    const deadline = new Promise((_, reject) => {
+      timer = this.claudeActivationSetTimeout(() => reject(timeoutError()), timeoutMs);
+    });
+    try {
+      return await Promise.race([promise, deadline]);
+    } finally {
+      if (timer != null) this.claudeActivationClearTimeout(timer);
+    }
+  }
+
+  async withClaudeActivationLock(
+    operation,
+    { queueTimeoutMs = this.claudeActivationOperationTimeoutMs } = {},
+  ) {
     const previous = this.claudeActivationTail;
     let release;
     const gate = new Promise((resolve) => { release = resolve; });
     this.claudeActivationTail = previous.catch(() => {}).then(() => gate);
-    await previous.catch(() => {});
     try {
-      return await operation();
+      await this.awaitClaudeActivationBound(
+        previous.catch(() => {}),
+        queueTimeoutMs,
+        () => new ClaudeActivationQueueTimeoutError(),
+      );
+      if (this.claudeActivationSafetyFence) {
+        throw new ClaudeActivationOperationStillRunningError();
+      }
+      const operationPromise = Promise.resolve().then(operation);
+      try {
+        return await this.awaitClaudeActivationBound(
+          operationPromise,
+          this.claudeActivationOperationTimeoutMs,
+          () => new ClaudeActivationOperationTimeoutError(),
+        );
+      } catch (error) {
+        if (error instanceof ClaudeActivationOperationTimeoutError) {
+          const fence = { operationPromise };
+          this.claudeActivationSafetyFence = fence;
+          const clearFence = () => {
+            if (this.claudeActivationSafetyFence !== fence) return;
+            this.claudeActivationSafetyFence = null;
+            logClaudeActivationWatchdog('[modeldeck] Timed-out Claude account operation settled; serialized account work is eligible again');
+          };
+          void operationPromise.then(clearFence, clearFence);
+          // Stable and credential-free. The installed daemon redirects stderr
+          // to its bounded managed log, so this field failure survives launchd.
+          logClaudeActivationWatchdog(
+            `[modeldeck] Claude account operation timed out after ${this.claudeActivationOperationTimeoutMs}ms; refusing overlapping account work until it settles`,
+          );
+        }
+        throw error;
+      }
     } finally {
       release();
     }
@@ -3524,7 +3674,7 @@ export class ModelDeckService {
           await this.activateClaude({ profileRef: latest.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
           await this.scopeClaudeSecureStorage(latest.profileRef);
           return { account: this.setDefaultAccount(latest.provider, latest.id), warnings };
-        });
+        }, { queueTimeoutMs: this.claudeActivationQueueTimeoutMs });
       } finally {
         this.endClaudeActivation(id);
       }

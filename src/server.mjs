@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import packageMetadata from '../package.json' with { type: 'json' };
 import { DASHBOARD_APP_HTML } from './dashboard-app.mjs';
 import { Store } from './db.mjs';
+import { startDaemonErrorLogMaintenance } from './daemon-error-log.mjs';
 import { scopeFindings } from './diagnostician.mjs';
 import { ModelDeckService } from './service.mjs';
 import { readLaneRuns, tagSessionsWithLaneRuns } from './lane-manifest.mjs';
@@ -17,7 +18,7 @@ import { runProbeCli as runClaudeUsageProbe } from './adapters/claude-usage-prob
 import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from './adapters/claude-statusline.mjs';
 import { resetCalendarReport } from './capacity.mjs';
 import {
-  HOST, PORT, DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
+  HOST, PORT, DB_PATH, DAEMON_ERROR_LOG_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
   GROK_SESSIONS_DIR,
   CLIPROXY_AUTH_DIR, CLIPROXY_BIN, CLIPROXY_BASE_URL, CLIPROXY_CONFIG_DIR,
@@ -40,6 +41,14 @@ const VERSION = typeof __MODELDECK_VERSION__ === 'string'
 const GIT_COMMIT = typeof __MODELDECK_GIT_COMMIT__ === 'string' && __MODELDECK_GIT_COMMIT__ !== ''
   ? __MODELDECK_GIT_COMMIT__
   : null;
+
+const EXPOSED_ERROR_CODES = new Set([
+  'active-link-blocked',
+  'claude-activation-operation-timeout',
+  'claude-activation-operation-still-running',
+  'claude-activation-queue-timeout',
+  'claude-profile-settings-operation-timeout',
+]);
 
 function json(res, status, payload, extraHeaders = {}) {
   const body = JSON.stringify(payload);
@@ -611,7 +620,7 @@ export function createApp({
     } catch (error) {
       json(res, error.statusCode || 400, {
         error: error.message,
-        ...(error.code === 'active-link-blocked' ? { code: error.code } : {}),
+        ...(EXPOSED_ERROR_CODES.has(error.code) ? { code: error.code } : {}),
       });
     }
   });
@@ -636,8 +645,8 @@ export function createApp({
       });
     },
     async close() {
-      ownedService.stopAutoRefresh();
       await Promise.all([
+        ownedService.stopAutoRefresh(),
         ownedService.stopUsageSnapshotRetention?.() || Promise.resolve(),
         ownedService.stopUsageQueueConsumer?.() || Promise.resolve(),
         ownedService.stopWarehouseIngest?.() || Promise.resolve(),
@@ -665,6 +674,21 @@ async function main() {
     return;
   }
 
+  // daemon-entry.mjs redirected fd 2 before this module loaded. Keep that
+  // active inode bounded in place so native/runtime diagnostics and direct
+  // fs.writeSync(2, ...) calls rotate with ordinary process.stderr writes.
+  let stopErrorLogMaintenance = () => {};
+  if (isSea()) {
+    try {
+      stopErrorLogMaintenance = startDaemonErrorLogMaintenance({ logPath: DAEMON_ERROR_LOG_PATH });
+    } catch (error) {
+      try {
+        process.stderr.write(`[modeldeck] managed stderr log unavailable: ${error?.message || error}\n`);
+      } catch {
+        // Logging failure does not block the daemon from serving.
+      }
+    }
+  }
   const app = createApp();
   app.listen(() => {
     const actualPort = app.server.address()?.port || PORT;
@@ -673,6 +697,7 @@ async function main() {
   const shutdown = async () => {
     await app.close();
     app.store.close();
+    stopErrorLogMaintenance();
     process.exit(0);
   };
   process.on('SIGINT', shutdown);

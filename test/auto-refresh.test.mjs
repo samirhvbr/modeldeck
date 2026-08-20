@@ -82,6 +82,55 @@ function fixture({
   return { store, clock, service, close: () => { service.stopAutoRefresh(); store.close(); } };
 }
 
+test('TRIPWIRE api-shutdown-drains-startup-writers — shutdown waits for startup filesystem work', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-shutdown-'));
+  const profilesDir = path.join(root, 'claude-profiles');
+  const profileRef = path.join(profilesDir, 'work');
+  fs.mkdirSync(profileRef, { recursive: true, mode: 0o700 });
+  const store = new Store(':memory:');
+  store.saveSettings({ autoRefreshEnabled: false });
+  store.saveAccount({ provider: 'claude', label: 'Work', profileRef });
+  const service = new ModelDeckService(store, {
+    claudeProfilesDir: profilesDir,
+    claudeActiveLink: path.join(root, 'active', '.claude'),
+    claudeStatuslineDir: path.join(root, 'statusline'),
+    platform: 'linux',
+  });
+
+  let releaseWriter;
+  const writerGate = new Promise((resolve) => { releaseWriter = resolve; });
+  let markWriterEntered;
+  const writerEntered = new Promise((resolve) => { markWriterEntered = resolve; });
+  let markWriterFinished;
+  const writerFinished = new Promise((resolve) => { markWriterFinished = resolve; });
+  service.backfillClaudeIdentities = async () => {};
+  service.reconcileClaudeProfileExplainers = async () => {
+    markWriterEntered();
+    await writerGate;
+    fs.writeFileSync(path.join(profileRef, 'startup-write'), 'done');
+    markWriterFinished();
+  };
+  service.reconcileClaudeStatuslineInstalls = async () => {};
+  service.ingestClaudeStatuslineCaptures = async () => {};
+  service.ingestClaudeStatuslineSessionModels = async () => {};
+  service.reconcileClaudeShellEnvFile = async () => {};
+  service.startClaudeStatuslineWatcher = () => {};
+
+  service.startAutoRefresh();
+  await writerEntered;
+  let stopped = false;
+  const stopping = Promise.resolve(service.stopAutoRefresh()).then(() => { stopped = true; });
+  await Promise.resolve();
+  try {
+    assert.equal(stopped, false, 'shutdown must not finish while a startup writer is still in flight');
+  } finally {
+    releaseWriter();
+    await Promise.all([stopping, writerFinished]);
+    store.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('auto-refresh fires shortly after boot and once per configured interval', async () => {
   const data = fixture();
   let refreshes = 0;
@@ -177,6 +226,43 @@ test('manual refresh coalesces with an in-flight scheduled refresh', async () =>
     assert.equal(claudePasses, 1);
     assert.equal(codexPasses, 1);
   } finally { data.close(); }
+});
+
+test('TRIPWIRE api-shutdown-drains-scheduled-refresh — shutdown waits for an active refresh tick', async () => {
+  const data = fixture();
+  let releaseRefresh;
+  const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
+  let markRefreshEntered;
+  const refreshEntered = new Promise((resolve) => { markRefreshEntered = resolve; });
+  let markRefreshFinished;
+  const refreshFinished = new Promise((resolve) => { markRefreshFinished = resolve; });
+  data.service.backfillClaudeIdentities = async () => {};
+  data.service.reconcileClaudeProfileExplainers = async () => {};
+  data.service.reconcileClaudeStatuslineInstalls = async () => {};
+  data.service.ingestClaudeStatuslineCaptures = async () => {};
+  data.service.ingestClaudeStatuslineSessionModels = async () => {};
+  data.service.reconcileClaudeShellEnvFile = async () => {};
+  data.service.startClaudeStatuslineWatcher = () => {};
+  data.service.refreshAll = async () => {
+    markRefreshEntered();
+    await refreshGate;
+    markRefreshFinished();
+    return {};
+  };
+
+  data.service.startAutoRefresh();
+  await data.clock.advance(100);
+  await refreshEntered;
+  let stopped = false;
+  const stopping = Promise.resolve(data.service.stopAutoRefresh()).then(() => { stopped = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  try {
+    assert.equal(stopped, false, 'shutdown must not finish while a scheduled refresh is still in flight');
+  } finally {
+    releaseRefresh();
+    await Promise.all([stopping, refreshFinished]);
+    data.store.close();
+  }
 });
 
 test('a long sleep drops missed ticks instead of firing a catch-up burst', async () => {

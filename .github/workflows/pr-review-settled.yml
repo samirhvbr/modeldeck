@@ -11,6 +11,21 @@ name: pr-review-settled
 # and a caller cannot grant less). Thread resolution after a gate timeout
 # therefore needs a manual re-run (gh run rerun <run-id>), as the gate's
 # failure message says.
+#
+# Concurrency is deliberately absent (#546). cancel-in-progress left every
+# superseded run as a check SUITE concluded cancelled on the head commit, and
+# the merge ruleset evaluates every suite carrying the required check name,
+# so a fully green PR read BLOCKED until each cancelled run was manually
+# rerun. Queued concurrency (cancel-in-progress: false) is no fix either:
+# GitHub keeps at most one running plus one pending run per group and cancels
+# the displaced pending run, so three rapid triggers (CodeRabbit resolving
+# threads seconds apart) still mint cancelled suites. With no concurrency
+# block every trigger runs to completion: the gate polls live PR state, so a
+# superseded run also concludes green once threads settle, and the job is
+# seconds long, so one run per review-comment event is cheap. Tripwire for
+# #546 — two gate triggers within a second must reach mergeStateStatus CLEAN
+# with no manual reruns — holds by construction: nothing here can produce a
+# cancelled conclusion anymore.
 
 on:
   pull_request:
@@ -23,10 +38,6 @@ on:
 permissions:
   contents: read
   pull-requests: read
-
-concurrency:
-  group: review-settled-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
 
 jobs:
   review-settled:

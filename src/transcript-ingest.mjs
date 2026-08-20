@@ -312,14 +312,19 @@ function queueSession(batch, session) {
   batch.sessions.set(key, mergeSession(batch.sessions.get(key), session));
 }
 
-function flushBatch(store, batch, summary) {
+function flushBatch(store, batch, summary, reconcile = false) {
   if (batchSize(batch) === 0) return createBatch();
-  const inserted = store.ingestTranscriptBatch({
+  const rows = {
     sessions: [...batch.sessions.values()],
     requests: batch.requests,
     subagents: batch.subagents,
     skills: batch.skills,
-  });
+  };
+  if (reconcile) {
+    store.stageTranscriptReplayBatch(rows);
+    return createBatch();
+  }
+  const inserted = store.ingestTranscriptBatch(rows);
   summary.sessions += inserted.sessions;
   summary.requests += inserted.requests;
   summary.subagents += inserted.subagents;
@@ -359,11 +364,74 @@ export async function ingestTranscriptArchive({
     warn(`transcript-ingest: ${message}`);
   }
 
-  for (const file of enumeration.files) {
+  let work = enumeration.files;
+  let suppressedPaths = null;
+  let activeGroup = null;
+  const filesByPath = new Map(enumeration.files.map((file) => [file.path, file]));
+
+  function beginReconcileGroup(file, sourceSessionId, workIndex) {
+    const affectedSessions = [{
+      sessionId: sourceSessionId,
+      profileSlug: file.profileSlug,
+    }];
+    const replayPaths = new Set(enumeration.files
+      .filter((candidate) => (
+        candidate.profileSlug === file.profileSlug
+        && candidate.fallbackSessionId === file.fallbackSessionId
+      ))
+      .map((candidate) => candidate.path));
+    for (const affected of affectedSessions) {
+      for (const storedPath of store.getIngestFilePathsForSession(
+        affected.sessionId,
+        TRANSCRIPT_PARSER,
+      )) {
+        const storedFile = filesByPath.get(storedPath);
+        if (storedFile?.profileSlug === affected.profileSlug) replayPaths.add(storedPath);
+      }
+    }
+    const files = enumeration.files.filter((candidate) => replayPaths.has(candidate.path));
+    const group = { files, remaining: files.length, stableStates: [] };
+    store.markIngestFilesReconcilePending(files.map((member) => member.path));
+    store.beginTranscriptReconcile(affectedSessions);
+    activeGroup = group;
+    const siblings = files.filter((candidate) => candidate.path !== file.path);
+    if (work === enumeration.files) work = [...work];
+    work.splice(workIndex + 1, 0, ...siblings.map((sibling) => ({
+      file: sibling,
+      group,
+    })));
+    const itemOriginalIndex = enumeration.files.indexOf(file);
+    suppressedPaths ??= new Set();
+    for (const sibling of siblings) {
+      if (enumeration.files.indexOf(sibling) > itemOriginalIndex) suppressedPaths.add(sibling.path);
+    }
+    return group;
+  }
+
+  try {
+    for (let workIndex = 0; workIndex < work.length; workIndex += 1) {
+    const item = work[workIndex];
+    const file = item.group ? item.file : item;
+    if (!item.group && suppressedPaths?.delete(file.path)) continue;
     const fileStat = fs.statSync(file.path);
     const ingestState = store.getIngestFileState(file.path);
-    if (ingestState?.size === fileStat.size && ingestState.mtimeMs === fileStat.mtimeMs
-      && ingestState.ino === fileStat.ino
+    const sourceSessionId = ingestState?.sessionId || file.fallbackSessionId;
+    let group = item.group || null;
+    const sameStats = ingestState?.size === fileStat.size
+      && ingestState.mtimeMs === fileStat.mtimeMs
+      && ingestState.ino === fileStat.ino;
+    const hasReconcileProvenance = Boolean(ingestState?.sessionId)
+      && ingestState.recordCount != null;
+    const shrinking = ingestState?.reconcilePending
+      || (ingestState != null && (
+        fileStat.size < ingestState.size
+        || (hasReconcileProvenance && !sameStats && fileStat.size === ingestState.size)
+      ));
+    if (!group && shrinking) {
+      group = beginReconcileGroup(file, sourceSessionId, workIndex);
+    }
+    if (!group
+      && sameStats
       && ingestState.parser === TRANSCRIPT_PARSER
       && ingestState.parserVersion === TRANSCRIPT_PARSER_VERSION) {
       summary.filesSkipped += 1;
@@ -374,11 +442,15 @@ export async function ingestTranscriptArchive({
     const input = fs.createReadStream(file.path, { encoding: 'utf8', highWaterMark: 1024 * 1024 });
     const lines = readline.createInterface({ input, crlfDelay: Number.POSITIVE_INFINITY });
     let lineNumber = 0;
+    let recordCount = 0;
+    let observedSessionId = null;
+    let mixedSessionIds = false;
     try {
       for await (const line of lines) {
         lineNumber += 1;
         linesSinceFlush += 1;
         if (!line.trim()) continue;
+        recordCount += 1;
         let record;
         try { record = JSON.parse(line); }
         catch {
@@ -392,6 +464,11 @@ export async function ingestTranscriptArchive({
 
         const sessionId = recordSessionId(record, file);
         if (!sessionId) continue;
+        if (!group && ingestState && observedSessionId == null && sessionId !== sourceSessionId) {
+          group = beginReconcileGroup(file, sourceSessionId, workIndex);
+        }
+        if (observedSessionId == null) observedSessionId = sessionId;
+        else if (sessionId !== observedSessionId) mixedSessionIds = true;
         const timestamp = canonicalTimestamp(record.timestamp);
         queueSession(batch, sessionRecord(record, file, text(machine), sessionId, timestamp));
 
@@ -497,7 +574,7 @@ export async function ingestTranscriptArchive({
         }
 
         if (linesSinceFlush >= batchLines) {
-          batch = flushBatch(store, batch, summary);
+          batch = flushBatch(store, batch, summary, Boolean(group));
           linesSinceFlush = 0;
         }
       }
@@ -505,16 +582,66 @@ export async function ingestTranscriptArchive({
       try { lines.close(); }
       finally { input.destroy(); }
     }
-    batch = flushBatch(store, batch, summary);
+    batch = flushBatch(store, batch, summary, Boolean(group));
     linesSinceFlush = 0;
     const finalStat = fs.statSync(file.path);
-    if (finalStat.size === fileStat.size && finalStat.mtimeMs === fileStat.mtimeMs
-      && finalStat.ino === fileStat.ino) {
-      store.recordIngestFileState(file.path, finalStat, {
-        parser: TRANSCRIPT_PARSER,
-        parserVersion: TRANSCRIPT_PARSER_VERSION,
-      });
+    const stable = finalStat.size === fileStat.size && finalStat.mtimeMs === fileStat.mtimeMs
+      && finalStat.ino === fileStat.ino;
+    const fileSessionId = observedSessionId != null && !mixedSessionIds
+      ? observedSessionId
+      : sourceSessionId;
+    const shrankByRecords = !group && hasReconcileProvenance
+      && recordCount < ingestState.recordCount;
+    if (stable) {
+      if (group) group.stableStates.push({ file, finalStat, recordCount, sessionId: fileSessionId });
+      else if (shrankByRecords) {
+        store.markIngestFileReconcilePending(file.path);
+        if (work === enumeration.files) work = [...work];
+        work.splice(workIndex + 1, 0, file);
+      }
+      else {
+        store.recordIngestFileState(file.path, finalStat, {
+          parser: TRANSCRIPT_PARSER,
+          parserVersion: TRANSCRIPT_PARSER_VERSION,
+          sessionId: fileSessionId,
+          recordCount,
+        });
+      }
+    } else if (shrankByRecords) {
+      store.markIngestFileReconcilePending(file.path);
+      if (work === enumeration.files) work = [...work];
+      work.splice(workIndex + 1, 0, file);
     }
+    if (group) {
+      group.remaining -= 1;
+      if (group.remaining === 0) {
+        if (group.stableStates.length === group.files.length) {
+          activeGroup = null;
+          store.finishTranscriptReconcile();
+          store.recordIngestFileStates(group.stableStates.map((stable) => ({
+            filePath: stable.file.path,
+            stat: stable.finalStat,
+            sessionId: stable.sessionId,
+            recordCount: stable.recordCount,
+          })), {
+            parser: TRANSCRIPT_PARSER,
+            parserVersion: TRANSCRIPT_PARSER_VERSION,
+          });
+        } else {
+          activeGroup = null;
+          store.cancelTranscriptReconcile();
+          store.markIngestFilesReconcilePending(group.files.map((member) => member.path));
+        }
+      }
+    }
+  }
+  } catch (error) {
+    if (activeGroup) {
+      const files = activeGroup.files.map((member) => member.path);
+      store.cancelTranscriptReconcile();
+      store.markIngestFilesReconcilePending(files);
+    }
+    throw error;
   }
   flushBatch(store, batch, summary);
   return summary;

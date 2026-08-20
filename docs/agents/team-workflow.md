@@ -143,6 +143,16 @@ Bound 2026-08-14 (full-binding re-run).
   only by Tim's explicit say-so; supersedes any older handoff note that
   merge authorization was session-only.
 
+- **Standing release authorization** (Tim, 2026-08-19, recorded from chat —
+  approved via in-session decision prompt): agent sessions may cut and publish
+  releases on their own judgment whenever merged work is user-visible — the
+  full `docs/RELEASE.md` runbook every time (both-sources bump PR through its
+  gates, pristine-worktree build, suites green on the exact head, pin check
+  recorded, notarize+staple both layers, all three assets on the public
+  mirror, source-mirror sync). This authorizes the release DECISION and the
+  publish; it lowers no gate. Tim's only touchpoint is "vX.Y.Z is live, hit
+  Update Now". Revocable by Tim's explicit say-so.
+
 ## Glossary & non-negotiables (dispositions)
 
 - **Never-compromise list**: accepted, all four harvested items (Tim, 2026-08-14) — written into the repo `CLAUDE.md` (no quota spend · destructive usage-queue read · auth always substantial · regression tripwire).

@@ -950,6 +950,18 @@ export class SharedScopeEngine {
     this.watchers.clear();
   }
 
+  async stop() {
+    this.stopWatchers();
+    await Promise.all([
+      this.operation,
+      this.reconcilePromise,
+      this.deferredTail,
+    ].filter(Boolean).map((task) => task.catch(() => {})));
+    // Work already in flight can legitimately finish by re-arming its
+    // watchers. Shutdown owns the final close after that work settles.
+    this.stopWatchers();
+  }
+
   status() {
     return {
       enabled: this.store.getSettings().sharedUserScopeEnabled,

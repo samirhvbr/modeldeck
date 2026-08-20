@@ -35,8 +35,8 @@ function fixture(options = {}) {
   });
   return {
     root, profilesDir, firstHome, secondHome, sharedDir, store, service, first, second,
-    close() {
-      service.stopAutoRefresh();
+    async close() {
+      await service.stopAutoRefresh();
       store.close();
       fs.rmSync(root, { recursive: true, force: true });
     },
@@ -448,6 +448,42 @@ test('watcher feedback from reconcile writes converges without a write loop', as
   assert.equal(reconcileCalls, 2);
   await new Promise((resolve) => setTimeout(resolve, 30));
   assert.equal(reconcileCalls, 2);
+});
+
+test('TRIPWIRE shared-scope-shutdown-drains-watcher — cleanup waits for an active watcher reconcile', async () => {
+  const callbacks = new Map();
+  const data = fixture({
+    sharedScopeDebounceMs: 0,
+    sharedScopeWatch: (home, callback) => {
+      callbacks.set(home, callback);
+      return { close() {}, on() {}, unref() {} };
+    },
+  });
+  writeClaude(data.firstHome, JSON.stringify({ mcpServers: {} }));
+  writeClaude(data.secondHome, JSON.stringify({ mcpServers: {} }));
+  await data.service.enableSharedScope();
+
+  let releaseReconcile;
+  const reconcileGate = new Promise((resolve) => { releaseReconcile = resolve; });
+  let markReconcileEntered;
+  const reconcileEntered = new Promise((resolve) => { markReconcileEntered = resolve; });
+  data.service.sharedScope.afterMcpRead = async () => {
+    markReconcileEntered();
+    await reconcileGate;
+  };
+  writeClaude(data.firstHome, JSON.stringify({ mcpServers: { added: { command: 'one' } } }));
+  callbacks.get(fs.realpathSync(data.firstHome))('change', '.claude.json');
+  await reconcileEntered;
+  const reconcile = data.service.sharedScope.reconcilePromise;
+  let closed = false;
+  const closing = data.close().then(() => { closed = true; });
+  await Promise.resolve();
+  try {
+    assert.equal(closed, false, 'fixture cleanup must not remove the root during watcher reconciliation');
+  } finally {
+    releaseReconcile();
+    await Promise.all([closing, reconcile]);
+  }
 });
 
 test('startup reconciliation propagates an edit made while the daemon was down', async (t) => {

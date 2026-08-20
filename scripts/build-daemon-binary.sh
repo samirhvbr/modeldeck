@@ -164,7 +164,7 @@ echo "    binary:     $OUTPUT_BINARY"
 echo "    manifest:   $OUTPUT_MANIFEST"
 
 if [[ "$CHECK_ONLY" == 1 ]]; then
-  echo "==> check-only: would bundle src/server.mjs, inject a Node SEA, ad-hoc sign on macOS, write the manifest, and smoke-check GET /api/health"
+  echo "==> check-only: would bundle src/daemon-entry.mjs, inject a Node SEA, ad-hoc sign on macOS, write the manifest, and smoke-check GET /api/health"
   exit 0
 fi
 
@@ -193,7 +193,7 @@ VERSION_DEFINE="$("$RUNNING_NODE_BINARY" -e 'process.stdout.write(JSON.stringify
 GIT_COMMIT_DEFINE="$("$RUNNING_NODE_BINARY" -e 'process.stdout.write(JSON.stringify(process.argv[1] || ""))' "$GIT_COMMIT")"
 
 echo "==> bundling daemon and embedded usage probe"
-"$ESBUILD" "$REPO_ROOT/src/server.mjs" \
+"$ESBUILD" "$REPO_ROOT/src/daemon-entry.mjs" \
   --bundle --platform=node --target=node24 --format=cjs \
   --define:__MODELDECK_VERSION__="$VERSION_DEFINE" \
   --define:__MODELDECK_GIT_COMMIT__="$GIT_COMMIT_DEFINE" \

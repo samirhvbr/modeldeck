@@ -142,6 +142,7 @@ export async function parseCodexRolloutFile({
   let firstTimestamp = null;
   let lastTimestamp = null;
   let lineNumber = 0;
+  let recordCount = 0;
   let malformedLines = 0;
   let unattachedTokenCounts = 0;
   let previousCumulative = null;
@@ -276,6 +277,7 @@ export async function parseCodexRolloutFile({
   for await (const line of lines) {
     lineNumber += 1;
     if (!line.trim()) continue;
+    recordCount += 1;
     let record;
     try {
       record = JSON.parse(line);
@@ -363,6 +365,198 @@ export async function parseCodexRolloutFile({
     malformedLines,
     unattachedTokenCounts,
     lines: lineNumber,
+    recordCount,
+  };
+}
+
+function sameFileStat(left, right) {
+  return left.size === right.size && left.mtimeMs === right.mtimeMs && left.ino === right.ino;
+}
+
+function sourceFromStoredPath(profilesRoot, file) {
+  const relative = path.relative(profilesRoot, file);
+  if (!relative || path.isAbsolute(relative) || relative.startsWith(`..${path.sep}`)) return null;
+  const [profileSlug, directory] = relative.split(path.sep);
+  if (!profileSlug || !['sessions', 'archived_sessions'].includes(directory)) return null;
+  return { file, profileSlug, archived: directory === 'archived_sessions' };
+}
+
+function richerCodexTurn(left, right) {
+  const rankedFields = [
+    'totalTokens',
+    'inputTokens',
+    'cachedInputTokens',
+    'cacheWriteInputTokens',
+    'outputTokens',
+    'reasoningOutputTokens',
+  ];
+  let preferred = left;
+  let fallback = right;
+  if (!left.turnId && !right.turnId && left.sourceTurnCount !== right.sourceTurnCount) {
+    if (right.sourceTurnCount > left.sourceTurnCount) {
+      preferred = right;
+      fallback = left;
+    }
+  } else {
+    for (const field of rankedFields) {
+      if (left[field] === right[field]) continue;
+      if (right[field] > left[field]) {
+        preferred = right;
+        fallback = left;
+      }
+      break;
+    }
+  }
+  return {
+    ...fallback,
+    ...preferred,
+    model: preferred.model ?? fallback.model,
+    reasoningEffort: preferred.reasoningEffort ?? fallback.reasoningEffort,
+    durationMs: preferred.durationMs ?? fallback.durationMs,
+    timeToFirstTokenMs: preferred.timeToFirstTokenMs ?? fallback.timeToFirstTokenMs,
+    timestamp: preferred.timestamp ?? fallback.timestamp,
+    sourceOrder: Math.min(left.sourceOrder, right.sourceOrder),
+  };
+}
+
+function mergedCodexReplay(sources) {
+  const ranked = [...sources].sort((left, right) => (
+    right.parsed.turns.length - left.parsed.turns.length
+    || right.parsed.session.lastTimestamp.localeCompare(left.parsed.session.lastTimestamp)
+    || left.source.file.localeCompare(right.source.file)
+  ));
+  const session = {
+    ...ranked[0].parsed.session,
+    firstTimestamp: ranked.reduce(
+      (earliest, source) => Math.min(earliest, Date.parse(source.parsed.session.firstTimestamp)),
+      Date.parse(ranked[0].parsed.session.firstTimestamp),
+    ),
+    lastTimestamp: ranked.reduce(
+      (latest, source) => Math.max(latest, Date.parse(source.parsed.session.lastTimestamp)),
+      Date.parse(ranked[0].parsed.session.lastTimestamp),
+    ),
+    archived: ranked.some((source) => source.parsed.session.archived),
+  };
+  session.firstTimestamp = new Date(session.firstTimestamp).toISOString();
+  session.lastTimestamp = new Date(session.lastTimestamp).toISOString();
+
+  const turns = new Map();
+  for (const source of ranked) {
+    const anonymousCounts = new Map();
+    for (const turn of source.parsed.turns) {
+      let key;
+      if (turn.turnId) {
+        key = `turn:${turn.turnId}`;
+      } else {
+        const timestamp = turn.timestamp || null;
+        const ordinal = anonymousCounts.get(timestamp) || 0;
+        anonymousCounts.set(timestamp, ordinal + 1);
+        key = `anonymous:${JSON.stringify([timestamp, ordinal])}`;
+      }
+      const observation = {
+        ...turn,
+        sourceOrder: turns.size,
+        sourceTurnCount: source.parsed.turns.length,
+      };
+      const existing = turns.get(key);
+      turns.set(key, existing ? richerCodexTurn(existing, observation) : observation);
+    }
+  }
+  return {
+    session,
+    turns: [...turns.values()]
+      .sort((left, right) => (
+        (left.timestamp || '').localeCompare(right.timestamp || '')
+        || left.sourceOrder - right.sourceOrder
+      ))
+      .map(({ sourceOrder, sourceTurnCount, ...turn }, turnIndex) => ({ ...turn, turnIndex })),
+  };
+}
+
+async function reconcileCodexSessionSources({
+  store,
+  profilesRoot,
+  sourceSessionId,
+  currentSource,
+  currentStat,
+  currentParsed,
+  machine,
+  warn,
+}) {
+  const candidates = new Map();
+  for (const file of store.getIngestFilePathsForSession(
+    sourceSessionId,
+    CODEX_ROLLOUT_PARSER,
+  )) {
+    const source = sourceFromStoredPath(profilesRoot, file);
+    if (source && fs.existsSync(file)) candidates.set(file, source);
+  }
+  candidates.set(currentSource.file, currentSource);
+
+  const observations = [];
+  for (const source of candidates.values()) {
+    const before = source.file === currentSource.file ? currentStat : fs.statSync(source.file);
+    if (!before.isFile()) continue;
+    if (before.size === 0) {
+      observations.push({ source, before, parsed: null, matchesSession: true });
+      continue;
+    }
+    let parsed = source.file === currentSource.file ? currentParsed : null;
+    if (!parsed) {
+      const deferredWarnings = [];
+      parsed = await parseCodexRolloutFile({
+        ...source,
+        machine,
+        warn: (message) => deferredWarnings.push(message),
+      });
+      if (parsed.session.sessionId === sourceSessionId) {
+        for (const message of deferredWarnings) warn(message);
+      }
+    }
+    observations.push({
+      source,
+      before,
+      parsed,
+      matchesSession: parsed.session.sessionId === sourceSessionId,
+    });
+  }
+
+  let stable = true;
+  for (const observation of observations) {
+    const finalStat = fs.statSync(observation.source.file);
+    if (!sameFileStat(observation.before, finalStat)) stable = false;
+    observation.finalStat = finalStat;
+  }
+  const observedPaths = observations.map((observation) => observation.source.file);
+  const matches = observations.filter((observation) => observation.matchesSession);
+  const matchingPaths = matches.map((match) => match.source.file);
+  const parsedSources = matches.filter((match) => match.parsed);
+  if (!stable) {
+    store.markIngestFilesReconcilePending(observedPaths);
+    return { handledPaths: observedPaths, currentHandled: observedPaths.includes(currentSource.file) };
+  }
+
+  let stored = null;
+  if (parsedSources.length) {
+    const replay = mergedCodexReplay(parsedSources);
+    stored = store.ingestCodexSession(replay.session, replay.turns, { reconcile: true });
+  } else {
+    store.removeCodexSession(sourceSessionId);
+  }
+  store.recordIngestFileStates(matches.map((match) => ({
+    filePath: match.source.file,
+    stat: match.finalStat,
+    recordCount: match.parsed?.recordCount || 0,
+  })), {
+    parser: CODEX_ROLLOUT_PARSER,
+    parserVersion: CODEX_ROLLOUT_PARSER_VERSION,
+    sessionId: sourceSessionId,
+  });
+  return {
+    handledPaths: matchingPaths,
+    currentHandled: matchingPaths.includes(currentSource.file),
+    parsedSources,
+    stored,
   };
 }
 
@@ -404,6 +598,7 @@ export async function ingestCodexRollouts({
     warn(`codex-rollout-ingest: skipped unreadable directory ${directory}: ${error.message}`);
   };
 
+  let reconciledPaths = null;
   for (const profile of profileEntries) {
     const profilePath = path.join(resolvedRoot, profile.name);
     let files;
@@ -419,35 +614,100 @@ export async function ingestCodexRollouts({
     }
     summary.files += files.length;
     for (const item of files) {
+      if (reconciledPaths?.delete(item.file)) continue;
       try {
         const fileStat = fs.statSync(item.file);
         const ingestState = store.getIngestFileState(item.file);
-        if (ingestState?.size === fileStat.size && ingestState.mtimeMs === fileStat.mtimeMs
-          && ingestState.ino === fileStat.ino
+        const filenameSessionId = sessionIdFromFilename(item.file);
+        const sameStats = ingestState?.size === fileStat.size
+          && ingestState.mtimeMs === fileStat.mtimeMs
+          && ingestState.ino === fileStat.ino;
+        const hasReconcileProvenance = Boolean(ingestState?.sessionId)
+          && ingestState.recordCount != null;
+        let shrinking = ingestState?.reconcilePending
+          || (ingestState != null && (
+            fileStat.size < ingestState.size
+            || (hasReconcileProvenance && !sameStats && fileStat.size === ingestState.size)
+          ));
+        if (!shrinking
+          && sameStats
           && ingestState.parser === CODEX_ROLLOUT_PARSER
           && ingestState.parserVersion === CODEX_ROLLOUT_PARSER_VERSION) {
           summary.filesSkipped += 1;
           continue;
         }
-        const parsed = await parseCodexRolloutFile({
-          ...item,
-          profileSlug: profile.name,
-          machine,
-          warn,
-        });
+        if (fileStat.size === 0 && !ingestState?.sessionId && !filenameSessionId) {
+          // Stale rows cannot be removed when an empty file has no session provenance.
+          store.recordIngestFileState(item.file, fileStat, {
+            parser: CODEX_ROLLOUT_PARSER,
+            parserVersion: CODEX_ROLLOUT_PARSER_VERSION,
+            recordCount: 0,
+          });
+          warn(`codex-rollout-ingest: handled empty rollout without session provenance ${item.file}; stale rows may remain`);
+          continue;
+        }
+        const source = { ...item, profileSlug: profile.name };
+        let parsed = null;
+        if (fileStat.size > 0) {
+          parsed = await parseCodexRolloutFile({
+            ...source,
+            machine,
+            warn,
+          });
+          if (!shrinking && hasReconcileProvenance
+            && parsed.recordCount < ingestState.recordCount) {
+            shrinking = true;
+          }
+        }
+        if (shrinking) {
+          store.markIngestFileReconcilePending(item.file);
+          const sourceSessionId = ingestState.sessionId
+            || filenameSessionId
+            || parsed?.session.sessionId;
+          if (!sourceSessionId) throw new Error('empty rollout has no session id in filename');
+          const reconciled = await reconcileCodexSessionSources({
+            store,
+            profilesRoot: resolvedRoot,
+            sourceSessionId,
+            currentSource: source,
+            currentStat: fileStat,
+            currentParsed: parsed,
+            machine,
+            warn,
+          });
+          for (const parsedSource of reconciled.parsedSources || []) {
+            summary.warnings.malformedLines += parsedSource.parsed.malformedLines;
+            summary.warnings.unattachedTokenCounts += parsedSource.parsed.unattachedTokenCounts;
+            summary.sessions += 1;
+            summary.turns += parsedSource.parsed.turns.length;
+          }
+          if (reconciled.stored) {
+            for (const [key, value] of Object.entries(reconciled.stored)) summary[key] += value;
+          }
+          reconciledPaths ??= new Set();
+          for (const file of reconciled.handledPaths) {
+            if (file !== item.file) reconciledPaths.add(file);
+          }
+          if (reconciled.currentHandled) continue;
+        }
+        parsed ??= await parseCodexRolloutFile({ ...source, machine, warn });
         summary.warnings.malformedLines += parsed.malformedLines;
         summary.warnings.unattachedTokenCounts += parsed.unattachedTokenCounts;
         summary.sessions += 1;
         summary.turns += parsed.turns.length;
+        const finalStat = fs.statSync(item.file);
+        const stable = sameFileStat(fileStat, finalStat);
         const stored = store.ingestCodexSession(parsed.session, parsed.turns);
         for (const [key, value] of Object.entries(stored)) summary[key] += value;
-        const finalStat = fs.statSync(item.file);
-        if (finalStat.size === fileStat.size && finalStat.mtimeMs === fileStat.mtimeMs
-          && finalStat.ino === fileStat.ino) {
+        if (stable) {
           store.recordIngestFileState(item.file, finalStat, {
             parser: CODEX_ROLLOUT_PARSER,
             parserVersion: CODEX_ROLLOUT_PARSER_VERSION,
+            sessionId: parsed.session.sessionId,
+            recordCount: parsed.recordCount,
           });
+        } else if (shrinking) {
+          store.markIngestFileReconcilePending(item.file);
         }
       } catch (error) {
         summary.warnings.malformedFiles += 1;

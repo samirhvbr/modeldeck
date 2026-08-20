@@ -963,6 +963,9 @@ export class Store {
         ino INTEGER NOT NULL,
         parser TEXT,
         parser_version INTEGER,
+        session_id TEXT,
+        record_count INTEGER,
+        reconcile_pending INTEGER NOT NULL DEFAULT 0 CHECK(reconcile_pending IN (0,1)),
         last_ingested_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS transcript_sessions (
@@ -1298,6 +1301,22 @@ export class Store {
       if (!ingestFileStateColumns.has('parser_version')) {
         this.db.exec('ALTER TABLE ingest_file_state ADD COLUMN parser_version INTEGER');
       }
+      if (!ingestFileStateColumns.has('reconcile_pending')) {
+        this.db.exec(`
+          ALTER TABLE ingest_file_state ADD COLUMN reconcile_pending INTEGER NOT NULL DEFAULT 0
+            CHECK(reconcile_pending IN (0,1))
+        `);
+      }
+      if (!ingestFileStateColumns.has('session_id')) {
+        this.db.exec('ALTER TABLE ingest_file_state ADD COLUMN session_id TEXT');
+      }
+      if (!ingestFileStateColumns.has('record_count')) {
+        this.db.exec('ALTER TABLE ingest_file_state ADD COLUMN record_count INTEGER');
+      }
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS ingest_file_state_session_parser_path
+          ON ingest_file_state(session_id, parser, path)
+      `);
       const estimateFitColumns = new Set(
         this.db.prepare('PRAGMA table_info(usage_estimate_fits)').all().map((column) => column.name),
       );
@@ -1886,7 +1905,9 @@ export class Store {
 
   getIngestFileState(filePath) {
     const row = this.db.prepare(`
-      SELECT size, mtime_ms, ino, parser, parser_version FROM ingest_file_state WHERE path = ?
+      SELECT size, mtime_ms, ino, parser, parser_version, session_id, record_count,
+        reconcile_pending
+      FROM ingest_file_state WHERE path = ?
     `).get(filePath);
     return row ? {
       size: row.size,
@@ -1894,22 +1915,117 @@ export class Store {
       ino: row.ino,
       parser: row.parser || null,
       parserVersion: row.parser_version == null ? null : Number(row.parser_version),
+      sessionId: row.session_id || null,
+      recordCount: row.record_count == null ? null : Number(row.record_count),
+      reconcilePending: Boolean(row.reconcile_pending),
     } : null;
   }
 
-  recordIngestFileState(filePath, { size, mtimeMs, ino }, { parser = null, parserVersion = null } = {}) {
+  getIngestFilePathsForSession(sessionId, parser) {
+    return this.db.prepare(`
+      SELECT path FROM ingest_file_state
+      WHERE session_id = ? AND parser = ?
+      ORDER BY path
+    `).all(sessionId, parser).map((row) => row.path);
+  }
+
+  recordIngestFileState(filePath, { size, mtimeMs, ino }, {
+    parser = null,
+    parserVersion = null,
+    sessionId = null,
+    recordCount = null,
+  } = {}) {
     this.db.prepare(`
       INSERT INTO ingest_file_state(
-        path, size, mtime_ms, ino, parser, parser_version, last_ingested_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        path, size, mtime_ms, ino, parser, parser_version, session_id, record_count,
+        reconcile_pending, last_ingested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
       ON CONFLICT(path) DO UPDATE SET
         size = excluded.size,
         mtime_ms = excluded.mtime_ms,
         ino = excluded.ino,
         parser = excluded.parser,
         parser_version = excluded.parser_version,
+        session_id = excluded.session_id,
+        record_count = excluded.record_count,
+        reconcile_pending = 0,
         last_ingested_at = excluded.last_ingested_at
-    `).run(filePath, size, mtimeMs, ino, parser, parserVersion, now());
+    `).run(filePath, size, mtimeMs, ino, parser, parserVersion, sessionId, recordCount, now());
+  }
+
+  recordIngestFileStates(entries, {
+    parser = null,
+    parserVersion = null,
+    sessionId = null,
+  } = {}) {
+    if (!entries.length) return;
+    const record = this.db.prepare(`
+      INSERT INTO ingest_file_state(
+        path, size, mtime_ms, ino, parser, parser_version, session_id, record_count,
+        reconcile_pending, last_ingested_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+      ON CONFLICT(path) DO UPDATE SET
+        size = excluded.size,
+        mtime_ms = excluded.mtime_ms,
+        ino = excluded.ino,
+        parser = excluded.parser,
+        parser_version = excluded.parser_version,
+        session_id = excluded.session_id,
+        record_count = excluded.record_count,
+        reconcile_pending = 0,
+        last_ingested_at = excluded.last_ingested_at
+    `);
+    const ingestedAt = now();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const {
+        filePath,
+        stat: { size, mtimeMs, ino },
+        recordCount = null,
+        sessionId: entrySessionId = sessionId,
+      } of entries) {
+        record.run(
+          filePath,
+          size,
+          mtimeMs,
+          ino,
+          parser,
+          parserVersion,
+          entrySessionId,
+          recordCount,
+          ingestedAt,
+        );
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  markIngestFileReconcilePending(filePath) {
+    this.db.prepare(`
+      UPDATE ingest_file_state
+      SET reconcile_pending = 1
+      WHERE path = ?
+    `).run(filePath);
+  }
+
+  markIngestFilesReconcilePending(filePaths) {
+    if (!filePaths.length) return;
+    const markPending = this.db.prepare(`
+      UPDATE ingest_file_state
+      SET reconcile_pending = 1
+      WHERE path = ?
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const filePath of filePaths) markPending.run(filePath);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   /// Upsert one streamed Codex rollout summary. Active rollout files grow in
@@ -1917,7 +2033,7 @@ export class Store {
   /// existing turn aggregates must advance on later scans. The stable
   /// (session_id, turn_index) key keeps the operation idempotent, while the
   /// partial turn_id index preserves the provider identifier when present.
-  ingestCodexSession(session, turns) {
+  ingestCodexSession(session, turns, { reconcile = false } = {}) {
     turns = [...turns];
     validateCodexSessionRecord(session, turns);
     const insertSession = this.db.prepare(`
@@ -2007,6 +2123,9 @@ export class Store {
       );
       if (!sessionExists) summary.sessionsInserted += 1;
       else if (sessionResult.changes > 0) summary.sessionsUpdated += 1;
+      if (reconcile) {
+        this.db.prepare('DELETE FROM codex_turns WHERE session_id = ?').run(session.sessionId);
+      }
       for (const turn of turns) {
         const turnExists = Boolean(existingTurn.get(session.sessionId, turn.turnIndex));
         const turnResult = insertTurn.run(
@@ -2034,6 +2153,10 @@ export class Store {
       this.db.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  removeCodexSession(sessionId) {
+    this.db.prepare('DELETE FROM codex_sessions WHERE session_id = ?').run(sessionId);
   }
 
   /// Upsert one read-only Grok updates stream. The source file may grow in
@@ -2430,6 +2553,341 @@ export class Store {
       }
       this.db.exec('COMMIT');
       return summary;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /// A Claude session can span one main transcript and several subagent files.
+  /// Shrink callers stage the whole group in temporary tables using short
+  /// transactions. One synchronous publish then replaces the affected session,
+  /// so awaited file reads never own unrelated writes on the shared connection.
+  /// This staging design assumes one Store and its single SQLite connection own the reconcile.
+  beginTranscriptReconcile(affectedSessions = []) {
+    this.db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS transcript_reconcile_sessions (
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        PRIMARY KEY(session_id, profile_slug)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS transcript_replay_sessions (
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        machine TEXT NOT NULL,
+        cwd TEXT,
+        git_branch TEXT,
+        entrypoint TEXT,
+        client_version TEXT,
+        first_at TEXT,
+        last_at TEXT,
+        title TEXT,
+        title_source TEXT,
+        PRIMARY KEY(session_id, profile_slug)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS transcript_replay_requests (
+        dedupe_key TEXT NOT NULL,
+        request_id TEXT,
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        message_id TEXT,
+        record_uuid TEXT,
+        model TEXT NOT NULL,
+        effort TEXT,
+        observed_at TEXT NOT NULL,
+        input_tokens INTEGER NOT NULL,
+        cache_creation_input_tokens INTEGER NOT NULL,
+        cache_read_input_tokens INTEGER NOT NULL,
+        output_tokens INTEGER NOT NULL,
+        cache_creation_ephemeral_5m_input_tokens INTEGER NOT NULL,
+        cache_creation_ephemeral_1h_input_tokens INTEGER NOT NULL,
+        is_sidechain INTEGER NOT NULL,
+        agent_id TEXT,
+        PRIMARY KEY(dedupe_key, profile_slug)
+      ) WITHOUT ROWID;
+      CREATE UNIQUE INDEX IF NOT EXISTS temp.transcript_replay_requests_request_id
+        ON transcript_replay_requests(request_id, profile_slug) WHERE request_id IS NOT NULL;
+      CREATE TEMP TABLE IF NOT EXISTS transcript_replay_subagents (
+        agent_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        agent_type TEXT,
+        resolved_model TEXT,
+        total_tokens INTEGER,
+        tool_stats_json TEXT,
+        duration_ms INTEGER,
+        observed_at TEXT,
+        PRIMARY KEY(agent_id, profile_slug)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS transcript_replay_skills (
+        event_key TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        skill TEXT,
+        command_name TEXT,
+        observed_at TEXT NOT NULL,
+        PRIMARY KEY(event_key, profile_slug)
+      ) WITHOUT ROWID;
+    `);
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO transcript_reconcile_sessions(session_id, profile_slug) VALUES (?, ?)
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.exec(`
+        DELETE FROM transcript_reconcile_sessions;
+        DELETE FROM transcript_replay_sessions;
+        DELETE FROM transcript_replay_requests;
+        DELETE FROM transcript_replay_subagents;
+        DELETE FROM transcript_replay_skills;
+      `);
+      for (const session of affectedSessions) insert.run(session.sessionId, session.profileSlug);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  stageTranscriptReplayBatch({ sessions = [], requests = [], subagents = [], skills = [] } = {}) {
+    const upsertSession = this.db.prepare(`
+      INSERT INTO transcript_replay_sessions(
+        session_id, profile_slug, machine, cwd, git_branch, entrypoint,
+        client_version, first_at, last_at, title, title_source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id, profile_slug) DO UPDATE SET
+        cwd = COALESCE(excluded.cwd, transcript_replay_sessions.cwd),
+        git_branch = COALESCE(excluded.git_branch, transcript_replay_sessions.git_branch),
+        entrypoint = COALESCE(excluded.entrypoint, transcript_replay_sessions.entrypoint),
+        client_version = COALESCE(excluded.client_version, transcript_replay_sessions.client_version),
+        first_at = CASE
+          WHEN excluded.first_at IS NULL THEN transcript_replay_sessions.first_at
+          WHEN transcript_replay_sessions.first_at IS NULL
+            OR excluded.first_at < transcript_replay_sessions.first_at THEN excluded.first_at
+          ELSE transcript_replay_sessions.first_at
+        END,
+        last_at = CASE
+          WHEN excluded.last_at IS NULL THEN transcript_replay_sessions.last_at
+          WHEN transcript_replay_sessions.last_at IS NULL
+            OR excluded.last_at > transcript_replay_sessions.last_at THEN excluded.last_at
+          ELSE transcript_replay_sessions.last_at
+        END,
+        title = CASE
+          WHEN excluded.title IS NULL THEN transcript_replay_sessions.title
+          WHEN transcript_replay_sessions.title_source = 'custom-title'
+            AND excluded.title_source <> 'custom-title' THEN transcript_replay_sessions.title
+          ELSE excluded.title
+        END,
+        title_source = CASE
+          WHEN excluded.title_source IS NULL THEN transcript_replay_sessions.title_source
+          WHEN transcript_replay_sessions.title_source = 'custom-title'
+            AND excluded.title_source <> 'custom-title' THEN transcript_replay_sessions.title_source
+          ELSE excluded.title_source
+        END
+    `);
+    const insertRequest = this.db.prepare(`
+      INSERT OR IGNORE INTO transcript_replay_requests(
+        dedupe_key, request_id, session_id, profile_slug, message_id, record_uuid,
+        model, effort, observed_at, input_tokens,
+        cache_creation_input_tokens, cache_read_input_tokens, output_tokens,
+        cache_creation_ephemeral_5m_input_tokens,
+        cache_creation_ephemeral_1h_input_tokens, is_sidechain, agent_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const upsertSubagent = this.db.prepare(`
+      INSERT INTO transcript_replay_subagents(
+        agent_id, session_id, profile_slug, agent_type, resolved_model, total_tokens,
+        tool_stats_json, duration_ms, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(agent_id, profile_slug) DO UPDATE SET
+        agent_type = COALESCE(excluded.agent_type, transcript_replay_subagents.agent_type),
+        resolved_model = COALESCE(excluded.resolved_model, transcript_replay_subagents.resolved_model),
+        total_tokens = COALESCE(excluded.total_tokens, transcript_replay_subagents.total_tokens),
+        tool_stats_json = COALESCE(excluded.tool_stats_json, transcript_replay_subagents.tool_stats_json),
+        duration_ms = COALESCE(excluded.duration_ms, transcript_replay_subagents.duration_ms),
+        observed_at = COALESCE(excluded.observed_at, transcript_replay_subagents.observed_at)
+    `);
+    const insertSkill = this.db.prepare(`
+      INSERT OR IGNORE INTO transcript_replay_skills(
+        event_key, session_id, profile_slug, skill, command_name, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const session of sessions) {
+        upsertSession.run(
+          session.sessionId,
+          session.profileSlug,
+          session.machine,
+          session.cwd ?? null,
+          session.gitBranch ?? null,
+          session.entrypoint ?? null,
+          session.clientVersion ?? null,
+          session.firstAt ?? null,
+          session.lastAt ?? null,
+          session.title ?? null,
+          session.titleSource ?? null,
+        );
+      }
+      for (const request of requests) {
+        insertRequest.run(
+          request.dedupeKey,
+          request.requestId ?? null,
+          request.sessionId,
+          request.profileSlug,
+          request.messageId ?? null,
+          request.recordUuid ?? null,
+          request.model,
+          request.effort ?? null,
+          request.observedAt,
+          request.inputTokens,
+          request.cacheCreationInputTokens,
+          request.cacheReadInputTokens,
+          request.outputTokens,
+          request.cacheCreationEphemeral5mInputTokens,
+          request.cacheCreationEphemeral1hInputTokens,
+          request.isSidechain ? 1 : 0,
+          request.agentId ?? null,
+        );
+      }
+      for (const subagent of subagents) {
+        upsertSubagent.run(
+          subagent.agentId,
+          subagent.sessionId,
+          subagent.profileSlug,
+          subagent.agentType ?? null,
+          subagent.resolvedModel ?? null,
+          subagent.totalTokens ?? null,
+          subagent.toolStatsJson ?? null,
+          subagent.durationMs ?? null,
+          subagent.observedAt ?? null,
+        );
+      }
+      for (const skill of skills) {
+        insertSkill.run(
+          skill.eventKey,
+          skill.sessionId,
+          skill.profileSlug,
+          skill.skill ?? null,
+          skill.commandName ?? null,
+          skill.observedAt,
+        );
+      }
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  finishTranscriptReconcile() {
+    const deleteAffected = this.db.prepare(`
+      DELETE FROM transcript_sessions
+      WHERE EXISTS (
+        SELECT 1 FROM transcript_reconcile_sessions replay
+        WHERE replay.session_id = transcript_sessions.session_id
+          AND replay.profile_slug = transcript_sessions.profile_slug
+      )
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      deleteAffected.run();
+      this.db.exec(`
+        INSERT INTO transcript_sessions(
+          session_id, profile_slug, machine, cwd, git_branch, entrypoint,
+          client_version, first_at, last_at, title, title_source
+        )
+        SELECT
+          session_id, profile_slug, machine, cwd, git_branch, entrypoint,
+          client_version, first_at, last_at, title, title_source
+        FROM transcript_replay_sessions WHERE true
+        ON CONFLICT(session_id, profile_slug) DO UPDATE SET
+          cwd = COALESCE(excluded.cwd, transcript_sessions.cwd),
+          git_branch = COALESCE(excluded.git_branch, transcript_sessions.git_branch),
+          entrypoint = COALESCE(excluded.entrypoint, transcript_sessions.entrypoint),
+          client_version = COALESCE(excluded.client_version, transcript_sessions.client_version),
+          first_at = CASE
+            WHEN excluded.first_at IS NULL THEN transcript_sessions.first_at
+            WHEN transcript_sessions.first_at IS NULL
+              OR excluded.first_at < transcript_sessions.first_at THEN excluded.first_at
+            ELSE transcript_sessions.first_at
+          END,
+          last_at = CASE
+            WHEN excluded.last_at IS NULL THEN transcript_sessions.last_at
+            WHEN transcript_sessions.last_at IS NULL
+              OR excluded.last_at > transcript_sessions.last_at THEN excluded.last_at
+            ELSE transcript_sessions.last_at
+          END,
+          title = CASE
+            WHEN excluded.title IS NULL THEN transcript_sessions.title
+            WHEN transcript_sessions.title_source = 'custom-title'
+              AND excluded.title_source <> 'custom-title' THEN transcript_sessions.title
+            ELSE excluded.title
+          END,
+          title_source = CASE
+            WHEN excluded.title_source IS NULL THEN transcript_sessions.title_source
+            WHEN transcript_sessions.title_source = 'custom-title'
+              AND excluded.title_source <> 'custom-title' THEN transcript_sessions.title_source
+            ELSE excluded.title_source
+          END;
+
+        INSERT OR IGNORE INTO transcript_requests(
+          dedupe_key, request_id, session_id, profile_slug, message_id, record_uuid,
+          model, effort, observed_at, input_tokens,
+          cache_creation_input_tokens, cache_read_input_tokens, output_tokens,
+          cache_creation_ephemeral_5m_input_tokens,
+          cache_creation_ephemeral_1h_input_tokens, is_sidechain, agent_id
+        )
+        SELECT
+          dedupe_key, request_id, session_id, profile_slug, message_id, record_uuid,
+          model, effort, observed_at, input_tokens,
+          cache_creation_input_tokens, cache_read_input_tokens, output_tokens,
+          cache_creation_ephemeral_5m_input_tokens,
+          cache_creation_ephemeral_1h_input_tokens, is_sidechain, agent_id
+        FROM transcript_replay_requests;
+
+        INSERT INTO transcript_subagents(
+          agent_id, session_id, profile_slug, agent_type, resolved_model, total_tokens,
+          tool_stats_json, duration_ms, observed_at
+        )
+        SELECT
+          agent_id, session_id, profile_slug, agent_type, resolved_model, total_tokens,
+          tool_stats_json, duration_ms, observed_at
+        FROM transcript_replay_subagents WHERE true
+        ON CONFLICT(agent_id, profile_slug) DO UPDATE SET
+          agent_type = COALESCE(excluded.agent_type, transcript_subagents.agent_type),
+          resolved_model = COALESCE(excluded.resolved_model, transcript_subagents.resolved_model),
+          total_tokens = COALESCE(excluded.total_tokens, transcript_subagents.total_tokens),
+          tool_stats_json = COALESCE(excluded.tool_stats_json, transcript_subagents.tool_stats_json),
+          duration_ms = COALESCE(excluded.duration_ms, transcript_subagents.duration_ms),
+          observed_at = COALESCE(excluded.observed_at, transcript_subagents.observed_at);
+
+        INSERT OR IGNORE INTO transcript_skill_events(
+          event_key, session_id, profile_slug, skill, command_name, observed_at
+        )
+        SELECT event_key, session_id, profile_slug, skill, command_name, observed_at
+        FROM transcript_replay_skills;
+      `);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    } finally {
+      this.cancelTranscriptReconcile();
+    }
+  }
+
+  cancelTranscriptReconcile() {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.exec(`
+        DELETE FROM transcript_reconcile_sessions;
+        DELETE FROM transcript_replay_sessions;
+        DELETE FROM transcript_replay_requests;
+        DELETE FROM transcript_replay_subagents;
+        DELETE FROM transcript_replay_skills;
+      `);
+      this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;
