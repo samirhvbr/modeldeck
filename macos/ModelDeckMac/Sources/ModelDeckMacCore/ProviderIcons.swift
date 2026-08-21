@@ -13,11 +13,24 @@ public enum ProviderIcons {
     /// covers the UI's 13-20 pt slots at 1x and 2x with headroom.
     public static let pixelSizes: [Int] = [32, 64, 128]
 
-    /// Bundled resource base name for a provider's icon.
-    public static func resourceBaseName(for provider: DeckProvider) -> String {
+    /// Providers whose artwork actually ships in the resource bundle. The
+    /// bundle-shape tripwires iterate THIS, not `allCases`, so a provider
+    /// that claims a base name must ship every declared pixel size — while a
+    /// provider that ships none (Grok) is a stated fact, not a broken test.
+    public static var bundledProviders: [DeckProvider] {
+        DeckProvider.allCases.filter { resourceBaseName(for: $0) != nil }
+    }
+
+    /// Bundled resource base name for a provider's icon, or nil for a
+    /// provider whose artwork ModelDeck does not ship. Grok is nil: there is
+    /// no installed Grok desktop app to take an `.icns` from the way #103
+    /// took Claude's and ChatGPT's, and shipping a redrawn mark would be
+    /// inventing a logo. `ProviderMarkView` renders its initial instead.
+    public static func resourceBaseName(for provider: DeckProvider) -> String? {
         switch provider {
         case .claude: return "provider-claude"
         case .codex: return "provider-codex"
+        case .grok: return nil
         }
     }
 
@@ -28,6 +41,7 @@ public enum ProviderIcons {
         switch provider {
         case .claude: return claudeImage
         case .codex: return codexImage
+        case .grok: return nil
         }
     }
 
@@ -42,8 +56,8 @@ public enum ProviderIcons {
         // traps when both miss (the v0.3.3/v0.3.4 field crash). The
         // explicit resolver checks Contents/Resources first and degrades
         // to nil (callers keep their fallback glyphs) instead of trapping.
-        guard let bundle = CoreResourceBundle.bundle else { return nil }
-        let base = resourceBaseName(for: provider)
+        guard let bundle = CoreResourceBundle.bundle,
+              let base = resourceBaseName(for: provider) else { return nil }
         // Shared point size; drawing scales it anyway. 16 keeps 1 pt = 2-8 px.
         let pointSize = NSSize(width: 16, height: 16)
         let image = NSImage(size: pointSize)

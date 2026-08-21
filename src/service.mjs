@@ -24,6 +24,7 @@ import {
   claudeCredentialsPresent,
 } from './adapters/claude-keychain.mjs';
 import { reconcileClaudeProfileExplainer } from './adapters/claude-profile-explainer.mjs';
+import { assertGrokHomeDirectory, fetchGrokUsage } from './adapters/grok.mjs';
 import {
   buildStatuslineCommand,
   chainCommandFromStatuslineCommand,
@@ -62,6 +63,7 @@ import {
   proxyReloginNextPhase,
 } from './proxy-relogin.mjs';
 import {
+  MAX_AUTO_REFRESH_INTERVAL_SECONDS,
   REQUEST_USAGE_PRUNE_BATCH_SIZE,
   REQUEST_USAGE_RETENTION_DAYS,
   USAGE_SNAPSHOT_PRUNE_BATCH_SIZE,
@@ -760,6 +762,7 @@ export class ModelDeckService {
     this.grokSessionsDir = options.grokSessionsDir || null;
     this.fetchClaude = options.fetchClaude || fetchClaudeUsage;
     this.fetchCodex = options.fetchCodex || fetchCodexRateLimits;
+    this.fetchGrok = options.fetchGrok || fetchGrokUsage;
     this.activateClaude = options.activateClaude || activateClaudeProfile;
     this.createClaudeProfile = options.createClaudeProfile || createClaudeProfileHome;
     this.ensureClaudeProfileExplainer = options.reconcileClaudeProfileExplainer
@@ -796,7 +799,10 @@ export class ModelDeckService {
       return String(result?.stdout ?? result)
         .split(/\r?\n/)
         .map((command) => path.basename(command.trim()))
-        .filter((command) => command === 'claude' || command === 'codex');
+        // Decision 0022's pause/cap discipline covers every provider the deck
+        // refreshes — a live grok session is exactly as much "active" as a
+        // live claude or codex one.
+        .filter((command) => command === 'claude' || command === 'codex' || command === 'grok');
     });
     this.registryFetch = options.registryFetch || options.fetcher || globalThis.fetch;
     this.toolProbeTtlMs = Number(options.toolProbeTtlMs ?? 30 * 60_000);
@@ -891,12 +897,16 @@ export class ModelDeckService {
     this.claudeActivationSafetyFence = null;
     this.claudeRenewalPromise = null;
     this.claudeRenewalAccountId = null;
-    // Issue #265: credential expiry is deliberately ephemeral. It must reach
-    // the scheduler, but never account metadata, usage detail, logs, or API
-    // state. The second map is an exact in-process per-token retry floor; a
-    // persisted ordinary attempt time below carries the floor across restarts
-    // without storing the credential-derived timestamp.
+    // Issues #265/#564: credential expiry is deliberately ephemeral. It must
+    // reach the scheduler, but never account metadata, usage detail, logs, or
+    // API state. Keep the last successfully observed expiry through a failed
+    // refresh so a superseded-expiry error cannot erase newer renewal proof.
+    // A separately proven renewal expiry prevents a successful stale read
+    // from lowering that evidence. The attempted-expiry map is the exact
+    // in-process per-token retry floor; an ordinary persisted attempt time
+    // carries that floor across restarts without storing credential expiry.
     this.claudeCredentialExpiries = new Map();
+    this.claudeProvenCredentialExpiries = new Map();
     this.claudePreExpiryAttemptedExpiries = new Map();
     this.claudeActivationAccountCounts = new Map();
     this.claudeIdentityVerificationPromises = new Map();
@@ -2175,8 +2185,9 @@ export class ModelDeckService {
   }
 
   // Issue #89: persist per-account refresh outcomes so /api/state can surface
-  // them (success clears; failure records message + timestamp). The tool
-  // probe payload caches provider-level authState for up to toolProbeTtlMs;
+  // them. Success clears; failure records message + timestamp unless a
+  // still-future proven renewal makes a stale expired result impossible. The
+  // tool probe payload caches provider-level authState for up to toolProbeTtlMs;
   // a credentials-expired transition must not hide behind it — mirror the
   // duplicate-token invalidation.
   recordAccountRefreshResults(results) {
@@ -2195,7 +2206,11 @@ export class ModelDeckService {
       if (!enabledIds.has(accountId)) this.accountRefreshErrors.delete(accountId);
     }
     for (const result of results) {
-      if (result.ok) this.accountRefreshErrors.delete(result.accountId);
+      const maskedByProvenRenewal = !result.ok
+        && SIGN_IN_REQUIRED_ERROR_PATTERN.test(result.error)
+        && SIGN_IN_EXPIRED_ERROR_PATTERN.test(result.error)
+        && this.currentClaudeProvenCredentialExpiry(result.accountId) != null;
+      if (result.ok || maskedByProvenRenewal) this.accountRefreshErrors.delete(result.accountId);
       else this.accountRefreshErrors.set(result.accountId, { message: result.error, at });
     }
     const after = this.signInRequiredByRefreshError();
@@ -2219,13 +2234,15 @@ export class ModelDeckService {
         refreshedSnapshots.set(account.id, snapshots);
         return { accountId: account.id, ok: true, snapshotCount: snapshots.length };
       } catch (error) {
-        this.claudeCredentialExpiries.delete(account.id);
         return { accountId: account.id, ok: false, error: error.message };
       }
     }));
     const enabledIds = new Set(accounts.map((account) => account.id));
     for (const accountId of [...this.claudeCredentialExpiries.keys()]) {
       if (!enabledIds.has(accountId)) this.claudeCredentialExpiries.delete(accountId);
+    }
+    for (const accountId of [...this.claudeProvenCredentialExpiries.keys()]) {
+      if (!enabledIds.has(accountId)) this.claudeProvenCredentialExpiries.delete(accountId);
     }
     for (const accountId of [...this.claudePreExpiryAttemptedExpiries.keys()]) {
       if (!enabledIds.has(accountId)) this.claudePreExpiryAttemptedExpiries.delete(accountId);
@@ -2272,7 +2289,6 @@ export class ModelDeckService {
       refreshedSnapshots.set(account.id, snapshots);
       result = { accountId: account.id, ok: true, snapshotCount: snapshots.length };
     } catch (error) {
-      this.claudeCredentialExpiries.delete(account.id);
       result = { accountId: account.id, ok: false, error: error.message };
     }
     const enabled = this.store.listAccounts()
@@ -2284,11 +2300,26 @@ export class ModelDeckService {
 
   rememberClaudeCredentialExpiry(accountId, snapshots) {
     const expiresAt = snapshots?.expiresAt;
+    const provenExpiresAt = this.currentClaudeProvenCredentialExpiry(accountId);
     if (typeof expiresAt === 'number' && Number.isFinite(expiresAt) && expiresAt > 0) {
-      this.claudeCredentialExpiries.set(accountId, expiresAt);
+      this.claudeCredentialExpiries.set(
+        accountId,
+        provenExpiresAt != null && expiresAt < provenExpiresAt ? provenExpiresAt : expiresAt,
+      );
+    } else if (provenExpiresAt != null) {
+      this.claudeCredentialExpiries.set(accountId, provenExpiresAt);
     } else {
       this.claudeCredentialExpiries.delete(accountId);
     }
+  }
+
+  currentClaudeProvenCredentialExpiry(accountId, timestamp = this.now()) {
+    const expiresAt = this.claudeProvenCredentialExpiries.get(accountId);
+    if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= timestamp) {
+      this.claudeProvenCredentialExpiries.delete(accountId);
+      return null;
+    }
+    return expiresAt;
   }
 
   claudePreExpiryRenewalEligible(expiresAt, timestamp = this.now()) {
@@ -2296,6 +2327,26 @@ export class ModelDeckService {
       && Number.isFinite(expiresAt)
       && expiresAt > timestamp
       && expiresAt - timestamp <= CLAUDE_RENEWAL_PRE_EXPIRY_WINDOW_MS;
+  }
+
+  claudePostExpiryRenewalEligible(accountId, timestamp = this.now()) {
+    this.currentClaudeProvenCredentialExpiry(accountId, timestamp);
+    const expiresAt = this.claudeCredentialExpiries.get(accountId);
+    if (expiresAt != null && expiresAt > timestamp) return false;
+
+    // A daemon restart loses the exact in-memory expiry. The ordinary action
+    // time and outcome are persisted, though, so keep rejecting the one stale
+    // post-expiry tick that can follow a successful pre-expiry renewal. The
+    // guard deadline is action-derived, not a credential expiry, and is only
+    // recorded when the refreshed credential was proven to outlive it.
+    const renewal = this.store.getAccount(accountId)?.metadata?.claudeRenewal;
+    const preExpiryAttemptAt = Date.parse(renewal?.lastPreExpiryAttemptAt);
+    const postExpiryGuardUntil = Date.parse(renewal?.postExpiryGuardUntil);
+    const recentSuccessfulPreExpiryRenewal = Number.isFinite(preExpiryAttemptAt)
+      && preExpiryAttemptAt <= timestamp
+      && Number.isFinite(postExpiryGuardUntil)
+      && timestamp <= postExpiryGuardUntil;
+    return !recentSuccessfulPreExpiryRenewal;
   }
 
   async refreshClaudeProfileMetadata(account) {
@@ -2531,6 +2582,46 @@ export class ModelDeckService {
     return { ...input, metadata: this.mergeDaemonMetadataAtPersist(input.id, input.metadata) };
   }
 
+  /// Decision 0035: the grok CLI owns its home, so — unlike Claude and Codex
+  /// profiles — a Grok profileRef is NOT required to sit inside a
+  /// ModelDeck-managed profiles directory. That freedom has one sharp edge.
+  /// A profileRef pointing at an already-registered Codex home passes every
+  /// refresh-time check (the directory exists, `auth.json` is a regular
+  /// owner-owned file) and would send that account's OpenAI bearer token to
+  /// xAI's billing endpoint. Registration is the only place that can catch
+  /// it, because by refresh time the two homes are indistinguishable.
+  ///
+  /// Both sides are canonicalized before comparison, so a symlink or a `..`
+  /// path cannot walk around the check.
+  async validatedGrokProfileRef(input) {
+    if (!input.profileRef?.trim()) throw new Error('Grok profile home is required');
+    const requested = path.resolve(input.profileRef.trim());
+    const canonical = await fs.promises.realpath(requested).catch((error) => {
+      if (error.code === 'ENOENT') throw new Error(`Grok profile home does not exist: ${requested}`);
+      throw error;
+    });
+    // CodeRabbit (PR #559): registration used to accept any directory and
+    // leave permissions to refresh time. A group- or other-WRITABLE home lets
+    // another local user swap in their own `auth.json` — a regular file, so
+    // the symlink guard never fires — and the probe would send that token
+    // instead. Refuse at the door, and again on every refresh
+    // (`assertGrokProfileHome`) in case it is made writable later. Read
+    // access is not the vector and is not policed: a stock `~/.grok` is 0755
+    // with the credential itself at 0600.
+    await assertGrokHomeDirectory(canonical);
+    for (const account of this.store.listAccounts()) {
+      if (account.provider === 'grok' || account.id === input.id) continue;
+      const other = await fs.promises.realpath(account.profileRef).catch(() => null);
+      if (other === canonical) {
+        throw serviceError(
+          `this directory is already registered as a ${account.provider} subscription's home; a Grok subscription needs its own`,
+          400,
+        );
+      }
+    }
+    return canonical;
+  }
+
   async saveAccount(input) {
     // Every `store.saveAccount` below re-reads the daemon-owned keys
     // IMMEDIATELY before writing, so nothing that lands during the awaits in
@@ -2541,6 +2632,12 @@ export class ModelDeckService {
       // Caller-supplied Codex homes get the same containment contract as
       // Claude: they must live inside ModelDeck's managed profiles directory.
       const profileRef = await validateCodexProfileHome({ profileRef: input.profileRef, profilesDir: this.codexProfilesDir });
+      const account = this.store.saveAccount(this.preserveDaemonMetadata({ ...input, profileRef }));
+      if (input.isDefault) this.invalidateToolProbe();
+      return account;
+    }
+    if (input.provider === 'grok') {
+      const profileRef = await this.validatedGrokProfileRef(input);
       const account = this.store.saveAccount(this.preserveDaemonMetadata({ ...input, profileRef }));
       if (input.isDefault) this.invalidateToolProbe();
       return account;
@@ -2558,6 +2655,11 @@ export class ModelDeckService {
       console.error(`[modeldeck] profile explainer install failed during Claude profile registration: ${error?.message || error}`);
     }
     let account = this.store.saveAccount(this.preserveDaemonMetadata({ ...input, profileRef }));
+    if (!account.enabled) {
+      this.claudeCredentialExpiries.delete(account.id);
+      this.claudeProvenCredentialExpiries.delete(account.id);
+      this.claudePreExpiryAttemptedExpiries.delete(account.id);
+    }
     account = await this.refreshClaudeProfileMetadata(account);
     if (input.isDefault) this.invalidateToolProbe();
     await this.accountProfileSetChanged();
@@ -2793,6 +2895,30 @@ export class ModelDeckService {
     return results;
   }
 
+  // Decision 0035, stage two. Deliberately the plainest of the three refresh
+  // passes: no plan side-read, no duplicate-token fingerprint, no activation —
+  // none of that exists for Grok yet. It records the same usage snapshots and
+  // the same per-account refresh outcomes, and it runs inside the SAME pass
+  // as the other two, so it adds no background polling of its own.
+  async refreshGrok() {
+    const accounts = this.store.listAccounts().filter((account) => account.provider === 'grok' && account.enabled);
+    // Accounts with no Grok profile can't be probed; skipping the whole pass
+    // keeps refreshAll's shape identical for the (overwhelmingly common)
+    // no-Grok install.
+    if (!accounts.length) return [];
+    const results = await Promise.all(accounts.map(async (account) => {
+      try {
+        const snapshots = await this.fetchGrok({ grokHome: account.profileRef });
+        for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
+        return { accountId: account.id, ok: true, snapshotCount: snapshots.length };
+      } catch (error) {
+        return { accountId: account.id, ok: false, error: error.message };
+      }
+    }));
+    this.recordAccountRefreshResults(results);
+    return results;
+  }
+
   // Issue #108: refresh one account's remembered auth.json identifier.
   // Evidence memory (the PR #77 lesson): a missing/unreadable auth.json or an
   // absent account_id is NOT evidence a duplicate resolved — the prior
@@ -2831,11 +2957,11 @@ export class ModelDeckService {
     // refresh could only fail (placeholder accounts hold no credentials)
     // and would wrongly degrade auth chips. Report a truthful no-op.
     if (this.demoFixtures) {
-      return { demoFixtures: true, claude: null, codex: null, checkedAt: new Date().toISOString() };
+      return { demoFixtures: true, claude: null, codex: null, grok: null, checkedAt: new Date().toISOString() };
     }
     if (this.refreshPromise) return this.refreshPromise;
     this.refreshPromise = (async () => {
-      const result = { claude: null, codex: null, checkedAt: new Date().toISOString() };
+      const result = { claude: null, codex: null, grok: null, checkedAt: new Date().toISOString() };
       // Issue #377: a local file read, no provider traffic. The recursive
       // watcher above is the fast path (about a second); this is the backstop
       // for platforms without recursive fs.watch and for a watcher that died.
@@ -2847,6 +2973,15 @@ export class ModelDeckService {
       catch (error) { result.claude = { ok: false, error: error.message }; }
       result.codex = { ok: true, profiles: await this.refreshCodex() };
       if (result.codex.profiles.some((item) => !item.ok)) result.codex.ok = false;
+      // Decision 0035: additive and last. A Grok failure can never change what
+      // the other two report, and an install with no Grok accounts leaves the
+      // key null — exactly what an older app already ignores.
+      try {
+        const profiles = await this.refreshGrok();
+        if (profiles.length) {
+          result.grok = { ok: !profiles.some((item) => !item.ok), profiles };
+        }
+      } catch (error) { result.grok = { ok: false, error: error.message }; }
       return result;
     })();
     try { return await this.refreshPromise; }
@@ -2907,19 +3042,29 @@ export class ModelDeckService {
     });
   }
 
-  recordClaudeRenewalAttempt(accountId, attempt) {
+  recordClaudeRenewalAttempt(accountId, attempt, { preExpiry = false } = {}) {
     const account = this.store.getAccount(accountId);
     if (!account) return attempt;
     const timestamp = Date.parse(attempt.at);
     const attempts = this.renewalAttemptHistory(account, Number.isFinite(timestamp) ? timestamp : this.now());
     if (CLAUDE_RENEWAL_BUDGET_OUTCOMES.has(attempt.outcome)) attempts.push(attempt.at);
+    const claudeRenewal = {
+      ...account.metadata?.claudeRenewal,
+      attempts,
+      lastAttempt: attempt,
+    };
+    if (preExpiry && attempt.outcome === 'renewed' && Number.isFinite(timestamp)) {
+      const guardUntil = timestamp
+        + CLAUDE_RENEWAL_PRE_EXPIRY_WINDOW_MS
+        + MAX_AUTO_REFRESH_INTERVAL_SECONDS * 1_000;
+      const renewedExpiresAt = this.claudeCredentialExpiries.get(accountId);
+      if (typeof renewedExpiresAt === 'number' && renewedExpiresAt > guardUntil) {
+        claudeRenewal.postExpiryGuardUntil = new Date(guardUntil).toISOString();
+      }
+    }
     const metadata = {
       ...account.metadata,
-      claudeRenewal: {
-        ...account.metadata?.claudeRenewal,
-        attempts,
-        lastAttempt: attempt,
-      },
+      claudeRenewal,
     };
     this.store.saveAccount({
       id: account.id,
@@ -2938,14 +3083,16 @@ export class ModelDeckService {
   recordClaudePreExpiryAttempt(accountId, at = new Date(this.now()).toISOString()) {
     const account = this.store.getAccount(accountId);
     if (!account) return;
+    const claudeRenewal = {
+      ...account.metadata?.claudeRenewal,
+      // This is when ModelDeck acted, not when the credential expires. It
+      // is safe to persist alongside the existing renewal attempt times.
+      lastPreExpiryAttemptAt: at,
+    };
+    delete claudeRenewal.postExpiryGuardUntil;
     const metadata = {
       ...account.metadata,
-      claudeRenewal: {
-        ...account.metadata?.claudeRenewal,
-        // This is when ModelDeck acted, not when the credential expires. It
-        // is safe to persist alongside the existing renewal attempt times.
-        lastPreExpiryAttemptAt: at,
-      },
+      claudeRenewal,
     };
     this.store.saveAccount({
       id: account.id,
@@ -3161,6 +3308,19 @@ export class ModelDeckService {
         claudeConfigDir: account.profileRef,
         profilesDir: this.claudeProfilesDir,
       });
+      const latestAccount = this.store.getAccount(account.id);
+      if (!latestAccount
+        || latestAccount.provider !== 'claude'
+        || !latestAccount.enabled
+        || latestAccount.profileRef !== account.profileRef) {
+        return { ok: false, expired: false, valid: false };
+      }
+      const provenRenewal = previousExpiresAt != null
+        && typeof snapshots.expiresAt === 'number'
+        && snapshots.expiresAt > previousExpiresAt;
+      if (provenRenewal) {
+        this.claudeProvenCredentialExpiries.set(account.id, snapshots.expiresAt);
+      }
       this.rememberClaudeCredentialExpiry(account.id, snapshots);
       for (const snapshot of snapshots) this.store.recordUsage(account.id, snapshot);
       this.updateClaudeWeeklyFingerprints(
@@ -3169,11 +3329,9 @@ export class ModelDeckService {
       );
       this.authPresenceCache.delete(`claude:${account.profileRef}`);
       this.recordAccountRefreshResults([{ accountId: account.id, ok: true, snapshotCount: snapshots.length }]);
-      const renewed = previousExpiresAt == null
-        || (typeof snapshots.expiresAt === 'number' && snapshots.expiresAt > previousExpiresAt);
+      const renewed = previousExpiresAt == null || provenRenewal;
       return { ok: renewed, expired: false, valid: true };
     } catch (error) {
-      this.claudeCredentialExpiries.delete(account.id);
       return {
         ok: false,
         valid: false,
@@ -3354,10 +3512,14 @@ export class ModelDeckService {
       && this.claudeCredentialExpiries.get(accountId) === preExpiryExpiresAt
       && this.claudePreExpiryRenewalEligible(preExpiryExpiresAt)
       && authState === 'ok';
-    if ((!preExpiry && this.signinReason(account, authState) !== 'expired')
+    const postExpiryAuthorized = !preExpiry
+      && this.signinReason(account, authState) === 'expired'
+      && this.claudePostExpiryRenewalEligible(accountId);
+    if ((!preExpiry && !postExpiryAuthorized)
       || (preExpiry && !preExpiryAuthorized)) {
       return decided('signin-required', null, 'This account requires an explicit Claude sign-in; automatic renewal was not attempted.');
     }
+    this.claudeProvenCredentialExpiries.delete(accountId);
     if (preExpiry) {
       // Ownership and the fresh in-window evidence have both been rechecked
       // inside the renewal lock. Only now consume this token lifetime; doing
@@ -3387,7 +3549,7 @@ export class ModelDeckService {
     if (claudeRenewalIdentityMatches(latestAccount, reportedIdentity)) {
       this.promoteSeededClaudeIdentity(account.id, account.profileRef, reportedIdentity);
       const result = await this.finishClaudeRenewal(latestAccount, at, 'no-flip', preExpiryExpiresAt);
-      return this.recordClaudeRenewalAttempt(accountId, result);
+      return this.recordClaudeRenewalAttempt(accountId, result, { preExpiry });
     }
 
     // Issue #263: WHY the cheap rung was declined is the single fact that
@@ -3415,7 +3577,11 @@ export class ModelDeckService {
     }
 
     const result = await this.performClaudeFlipRenewal(latestAccount, at, preExpiryExpiresAt);
-    return this.recordClaudeRenewalAttempt(accountId, { ...result, identityDecline });
+    return this.recordClaudeRenewalAttempt(
+      accountId,
+      { ...result, identityDecline },
+      { preExpiry },
+    );
   }
 
   async renewClaudeAccount(accountId, renewalOptions) {
@@ -3536,7 +3702,12 @@ export class ModelDeckService {
       const expired = !item.ok
         && SIGN_IN_REQUIRED_ERROR_PATTERN.test(item.error)
         && SIGN_IN_EXPIRED_ERROR_PATTERN.test(item.error);
-      if (expired) return [{ item, preExpiryExpiresAt: null }];
+      if (expired) {
+        if (this.claudePostExpiryRenewalEligible(item.accountId)) {
+          return [{ item, preExpiryExpiresAt: null }];
+        }
+        return [];
+      }
       const preExpiryExpiresAt = this.claudeCredentialExpiries.get(item.accountId);
       return item.ok === true && this.claudePreExpiryRenewalEligible(preExpiryExpiresAt)
         ? [{ item, preExpiryExpiresAt }]
@@ -3823,6 +3994,7 @@ export class ModelDeckService {
     if (deleted) {
       this.accountRefreshErrors.delete(accountId);
       this.claudeCredentialExpiries.delete(accountId);
+      this.claudeProvenCredentialExpiries.delete(accountId);
       this.claudePreExpiryAttemptedExpiries.delete(accountId);
     }
     if (deleted && account?.isDefault) this.invalidateToolProbe();
@@ -3932,6 +4104,11 @@ export class ModelDeckService {
       return this.claudeProfileAuthState(account.profileRef);
     }
     if (account.provider === 'codex') {
+      return fs.existsSync(path.join(account.profileRef, 'auth.json')) ? 'ok' : 'signin-required';
+    }
+    // Decision 0035: same presence-only check as Codex. The grok CLI stores
+    // its OAuth tokens in `<home>/auth.json`; ModelDeck never opens it here.
+    if (account.provider === 'grok') {
       return fs.existsSync(path.join(account.profileRef, 'auth.json')) ? 'ok' : 'signin-required';
     }
     return 'unknown';
@@ -5034,8 +5211,9 @@ export class ModelDeckService {
       const proxyRelogin = proxyPool
         ? this.proxyReloginAvailabilityFor(account, proxyManagementKeyPresent)
         : null;
+      const publicAccount = this.accountForPublicResponse(account);
       return {
-        ...account,
+        ...publicAccount,
         authState,
         ...(signinReason ? { signinReason } : {}),
         ...(lastRefreshError ? { lastRefreshError } : {}),
@@ -5061,6 +5239,15 @@ export class ModelDeckService {
           : {}),
       };
     }));
+  }
+
+  accountForPublicResponse(account) {
+    const metadata = { ...account.metadata };
+    if (metadata.claudeRenewal && typeof metadata.claudeRenewal === 'object') {
+      metadata.claudeRenewal = { ...metadata.claudeRenewal };
+      delete metadata.claudeRenewal.postExpiryGuardUntil;
+    }
+    return { ...account, metadata };
   }
 
   async providerActivationState(provider, activeLink, accounts) {

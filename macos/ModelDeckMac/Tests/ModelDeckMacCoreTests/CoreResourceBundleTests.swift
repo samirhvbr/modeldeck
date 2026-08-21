@@ -94,8 +94,8 @@ struct CoreResourceBundleTests {
             CoreResourceBundle.resolve(searching: CoreResourceBundle.defaultCandidateDirectories()),
             "default candidate directories should find the resource bundle in a dev (swift test) build")
         #expect(bundle.bundleURL.lastPathComponent == CoreResourceBundle.bundleFileName)
-        for provider in DeckProvider.allCases {
-            let base = ProviderIcons.resourceBaseName(for: provider)
+        for provider in ProviderIcons.bundledProviders {
+            let base = try #require(ProviderIcons.resourceBaseName(for: provider))
             for pixels in ProviderIcons.pixelSizes {
                 #expect(bundle.url(forResource: "\(base)-\(pixels)", withExtension: "png") != nil,
                         "\(base)-\(pixels).png missing from the resolved bundle")
@@ -106,7 +106,7 @@ struct CoreResourceBundleTests {
     /// End-to-end through the consumer: every provider image loads via the
     /// resolver (ProviderIcons no longer touches Bundle.module).
     @Test func providerIconsLoadThroughTheResolver() {
-        for provider in DeckProvider.allCases {
+        for provider in ProviderIcons.bundledProviders {
             #expect(ProviderIcons.image(for: provider) != nil,
                     "\(provider) icon should load through CoreResourceBundle")
         }

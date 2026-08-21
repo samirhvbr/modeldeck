@@ -412,9 +412,18 @@ test('a rewrite after the read is skipped until a stable reconcile', async (t) =
 
 test('watcher feedback from reconcile writes converges without a write loop', async (t) => {
   const callbacks = new Map();
+  const scheduledReconciles = [];
   let feedbackWrites = 0;
   const data = fixture({
-    sharedScopeDebounceMs: 5,
+    sharedScopeSetTimeout: (callback) => {
+      const timer = { callback, unref() {} };
+      scheduledReconciles.push(timer);
+      return timer;
+    },
+    sharedScopeClearTimeout: (timer) => {
+      const index = scheduledReconciles.indexOf(timer);
+      if (index !== -1) scheduledReconciles.splice(index, 1);
+    },
     sharedScopeWatch: (home, callback) => {
       callbacks.set(home, callback);
       return { close() {}, on() {}, unref() {} };
@@ -433,21 +442,38 @@ test('watcher feedback from reconcile writes converges without a write loop', as
   await data.service.enableSharedScope();
 
   let reconcileCalls = 0;
+  const pendingWatcherReconciles = [];
   const engine = data.service.sharedScope;
   const reconcile = engine.reconcile.bind(engine);
   engine.reconcile = (options) => {
     reconcileCalls += 1;
-    return reconcile(options);
+    const result = reconcile(options);
+    pendingWatcherReconciles.shift()?.(result);
+    return result;
   };
+  const nextWatcherReconcile = () => new Promise((resolve, reject) => {
+    pendingWatcherReconciles.push((result) => result.then(resolve, reject));
+  });
+  const runNextScheduledReconcile = () => {
+    const timer = scheduledReconciles.shift();
+    assert.ok(timer, 'expected a watcher reconcile to be scheduled');
+    timer.callback();
+  };
+
   writeClaude(data.firstHome, JSON.stringify({ mcpServers: { added: { command: 'one' } } }));
   callbacks.get(fs.realpathSync(data.firstHome))('change', '.claude.json');
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  const firstReconcile = nextWatcherReconcile();
+  runNextScheduledReconcile();
+  await firstReconcile;
+
+  const feedbackReconcile = nextWatcherReconcile();
+  runNextScheduledReconcile();
+  await feedbackReconcile;
 
   assert.deepEqual(readClaude(data.secondHome).mcpServers, { added: { command: 'one' } });
   assert.equal(feedbackWrites, 1);
   assert.equal(reconcileCalls, 2);
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  assert.equal(reconcileCalls, 2);
+  assert.equal(scheduledReconciles.length, 0);
 });
 
 test('TRIPWIRE shared-scope-shutdown-drains-watcher — cleanup waits for an active watcher reconcile', async () => {

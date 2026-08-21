@@ -162,7 +162,7 @@ struct ToolsStatusModelTests {
 
         #expect(backend.toolsCalls == [false, true])
         #expect(model.probe?.tools.claude.healthChip == .healthy)
-        #expect(model.probe?.probe(for: .codex).healthChip == .signInAgain)
+        #expect(model.probe?.probe(for: .codex)?.healthChip == .signInAgain)
         #expect(model.lastError == nil)
     }
 

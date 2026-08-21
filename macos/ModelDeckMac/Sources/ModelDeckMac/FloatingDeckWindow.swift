@@ -42,9 +42,12 @@ final class FloatingDeckWindowController: NSObject, NSWindowDelegate {
         let hosting = NSHostingController(rootView: content())
         let window = NSWindow(contentViewController: hosting)
         // Tim's decisions: draggable, closable, NOT resizable — the deck
-        // sizes itself (two-column 640 / single 420) exactly like the
-        // popover. Miniaturizable stays: minimizing a parked window is
-        // normal macOS behavior, and forbidding it buys nothing.
+        // sizes itself exactly like the popover, from the same
+        // `DeckLayoutMetrics` derivation: single-column 420, and in column
+        // mode 300 pt per rendered column plus chrome (two → 640, three →
+        // 940 once decision 0035's Grok column is present). Miniaturizable
+        // stays: minimizing a parked window is normal macOS behavior, and
+        // forbidding it buys nothing.
         window.styleMask = [.titled, .closable, .miniaturizable]
         window.title = FloatingDeckModel.windowTitle
         // Tim's decision: a NORMAL window among the others — never

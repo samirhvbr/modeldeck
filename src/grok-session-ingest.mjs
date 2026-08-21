@@ -203,6 +203,7 @@ export async function parseGrokUpdatesFile({ file, cwdKey, sessionId, machine = 
   const turns = [];
   let cwd = null;
   let lineNumber = 0;
+  let recordCount = 0;
   let malformedLines = 0;
   let schemaDriftFields = 0;
   let firstTimestamp = null;
@@ -213,6 +214,7 @@ export async function parseGrokUpdatesFile({ file, cwdKey, sessionId, machine = 
     for await (const sourceLine of lines) {
       lineNumber += 1;
       if (!sourceLine.trim()) continue;
+      recordCount += 1;
       let record;
       try {
         record = JSON.parse(sourceLine);
@@ -251,6 +253,7 @@ export async function parseGrokUpdatesFile({ file, cwdKey, sessionId, machine = 
       parserVersion: GROK_UPDATES_PARSER_VERSION,
     },
     turns,
+    recordCount,
     malformedLines,
     schemaDriftFields,
   };
@@ -310,6 +313,166 @@ function updateFiles(root, summary, warn) {
   return files;
 }
 
+function sameFileStat(left, right) {
+  return left.size === right.size && left.mtimeMs === right.mtimeMs && left.ino === right.ino;
+}
+
+function richerGrokTurn(left, right) {
+  const rankedFields = ['totalTokens', 'inputTokens', 'outputTokens', 'cachedReadTokens'];
+  let preferred = left;
+  let fallback = right;
+  for (const field of rankedFields) {
+    if (left[field] === right[field]) continue;
+    if (right[field] > left[field]) {
+      preferred = right;
+      fallback = left;
+    }
+    break;
+  }
+  return {
+    ...fallback,
+    ...preferred,
+    turnId: preferred.turnId ?? fallback.turnId,
+    timestamp: preferred.timestamp ?? fallback.timestamp,
+    modelUsage: preferred.modelUsage.length ? preferred.modelUsage : fallback.modelUsage,
+    sourceOrder: Math.min(left.sourceOrder, right.sourceOrder),
+  };
+}
+
+function mergedGrokReplay(sources) {
+  const ranked = [...sources].sort((left, right) => (
+    right.parsed.turns.length - left.parsed.turns.length
+    || (right.parsed.session.lastTimestamp || '').localeCompare(left.parsed.session.lastTimestamp || '')
+    || left.source.file.localeCompare(right.source.file)
+  ));
+  const session = { ...ranked[0].parsed.session };
+  session.cwd = ranked.map((source) => source.parsed.session.cwd).find(Boolean) || null;
+  const firstTimestamps = ranked.map((source) => source.parsed.session.firstTimestamp).filter(Boolean);
+  const lastTimestamps = ranked.map((source) => source.parsed.session.lastTimestamp).filter(Boolean);
+  session.firstTimestamp = firstTimestamps.length ? firstTimestamps.sort()[0] : null;
+  session.lastTimestamp = lastTimestamps.length ? lastTimestamps.sort().at(-1) : null;
+
+  const turns = new Map();
+  for (const source of ranked) {
+    const anonymousCounts = new Map();
+    for (const turn of source.parsed.turns) {
+      let key;
+      if (turn.turnId) {
+        key = `turn:${turn.turnId}`;
+      } else {
+        const timestamp = turn.timestamp || null;
+        const ordinal = anonymousCounts.get(timestamp) || 0;
+        anonymousCounts.set(timestamp, ordinal + 1);
+        key = `anonymous:${JSON.stringify([timestamp, ordinal])}`;
+      }
+      const observation = { ...turn, sourceOrder: turns.size };
+      const existing = turns.get(key);
+      turns.set(key, existing ? richerGrokTurn(existing, observation) : observation);
+    }
+  }
+  return {
+    session,
+    turns: [...turns.values()]
+      .sort((left, right) => (
+        (left.timestamp || '').localeCompare(right.timestamp || '')
+        || left.sourceOrder - right.sourceOrder
+      ))
+      .map(({ sourceOrder, ...turn }, turnIndex) => ({ ...turn, turnIndex })),
+  };
+}
+
+async function reconcileGrokSessionSources({
+  store,
+  files,
+  sourceSessionId,
+  profileSlug,
+  currentSource,
+  currentStat,
+  currentParsed,
+  machine,
+  warn,
+}) {
+  const filesByPath = new Map(files.map((source) => [source.file, source]));
+  const candidates = new Map(files
+    .filter((source) => source.sessionId === sourceSessionId)
+    .map((source) => [source.file, source]));
+  for (const storedPath of store.getIngestFilePathsForSession(
+    sourceSessionId,
+    GROK_UPDATES_PARSER,
+  )) {
+    const source = filesByPath.get(storedPath);
+    if (source) candidates.set(storedPath, source);
+  }
+  candidates.set(currentSource.file, currentSource);
+  const candidatePaths = [...candidates.keys()];
+  store.markIngestFilesReconcilePending(candidatePaths);
+  store.beginGrokReconcile([{ sessionId: sourceSessionId, profileSlug }]);
+
+  try {
+    const observations = [];
+    for (const source of candidates.values()) {
+      const before = source.file === currentSource.file ? currentStat : fs.statSync(source.file);
+      if (!before.isFile()) continue;
+      let parsed = source.file === currentSource.file ? currentParsed : null;
+      if (before.size > 0 && !parsed) {
+        parsed = await parseGrokUpdatesFile({ ...source, machine, warn });
+      }
+      observations.push({
+        source,
+        before,
+        parsed,
+        matchesSession: source.sessionId === sourceSessionId,
+      });
+    }
+
+    let stable = true;
+    for (const observation of observations) {
+      const finalStat = fs.statSync(observation.source.file);
+      if (!sameFileStat(observation.before, finalStat)) stable = false;
+      observation.finalStat = finalStat;
+    }
+    const observedPaths = observations.map((observation) => observation.source.file);
+    const matches = observations.filter((observation) => observation.matchesSession);
+    const matchingPaths = matches.map((match) => match.source.file);
+    const parsedSources = matches.filter((match) => match.parsed);
+    if (!stable) {
+      store.cancelGrokReconcile();
+      store.markIngestFilesReconcilePending(observedPaths);
+      return {
+        handledPaths: observedPaths,
+        currentHandled: observedPaths.includes(currentSource.file),
+        parsedSources: [],
+        stored: null,
+      };
+    }
+
+    if (parsedSources.length) {
+      const replay = mergedGrokReplay(parsedSources);
+      store.stageGrokReplay(replay.session, replay.turns);
+    }
+    const stored = store.finishGrokReconcile();
+    store.recordIngestFileStates(matches.map((match) => ({
+      filePath: match.source.file,
+      stat: match.finalStat,
+      recordCount: match.parsed?.recordCount || 0,
+    })), {
+      parser: GROK_UPDATES_PARSER,
+      parserVersion: GROK_UPDATES_PARSER_VERSION,
+      sessionId: sourceSessionId,
+    });
+    return {
+      handledPaths: matchingPaths,
+      currentHandled: matchingPaths.includes(currentSource.file),
+      parsedSources,
+      stored,
+    };
+  } catch (error) {
+    store.cancelGrokReconcile();
+    store.markIngestFilesReconcilePending(candidatePaths);
+    throw error;
+  }
+}
+
 /// Stream the external Grok store read-only; all writes go to ModelDeck's DB.
 export async function ingestGrokSessions({ store, sessionsRoot, machine = 'studio', warn = () => {} } = {}) {
   if (!store?.ingestGrokSession) throw new Error('Grok session ingest requires a Store');
@@ -321,16 +484,78 @@ export async function ingestGrokSessions({ store, sessionsRoot, machine = 'studi
 
   const files = updateFiles(root, summary, warn);
   summary.files = files.length;
+  let reconciledPaths = null;
   for (const item of files) {
+    if (reconciledPaths?.delete(item.file)) continue;
     try {
       const before = fs.statSync(item.file);
       const state = store.getIngestFileState(item.file);
-      if (state?.size === before.size && state.mtimeMs === before.mtimeMs && state.ino === before.ino
+      const sameStats = state?.size === before.size
+        && state.mtimeMs === before.mtimeMs
+        && state.ino === before.ino;
+      const hasReconcileProvenance = Boolean(state?.sessionId) && state.recordCount != null;
+      const knownAtAnotherPath = state == null && store.getIngestFilePathsForSession(
+        item.sessionId,
+        GROK_UPDATES_PARSER,
+      ).some((filePath) => filePath !== item.file);
+      let shrinking = knownAtAnotherPath || state?.reconcilePending
+        || (state != null && (
+          before.size < state.size
+          || (hasReconcileProvenance && !sameStats && before.size === state.size)
+        ));
+      if (!shrinking
+          && sameStats
           && state.parser === GROK_UPDATES_PARSER && state.parserVersion === GROK_UPDATES_PARSER_VERSION) {
         summary.filesSkipped += 1;
         continue;
       }
-      const parsed = await parseGrokUpdatesFile({ ...item, machine, warn });
+      if (before.size === 0 && !state?.sessionId) {
+        store.recordIngestFileState(item.file, before, {
+          parser: GROK_UPDATES_PARSER,
+          parserVersion: GROK_UPDATES_PARSER_VERSION,
+          recordCount: 0,
+        });
+        warn(`grok-session-ingest: handled empty Grok updates without session provenance ${item.file}; stale rows may remain`);
+        continue;
+      }
+      let parsed = null;
+      if (before.size > 0) parsed = await parseGrokUpdatesFile({ ...item, machine, warn });
+      if (!shrinking && hasReconcileProvenance && parsed?.recordCount < state.recordCount) {
+        shrinking = true;
+      }
+      if (shrinking) {
+        store.markIngestFileReconcilePending(item.file);
+        const reconciled = await reconcileGrokSessionSources({
+          store,
+          files,
+          sourceSessionId: state?.sessionId || item.sessionId,
+          profileSlug: item.cwdKey,
+          currentSource: item,
+          currentStat: before,
+          currentParsed: parsed,
+          machine,
+          warn,
+        });
+        for (const parsedSource of reconciled.parsedSources) {
+          summary.warnings.malformedLines += parsedSource.parsed.malformedLines;
+          summary.warnings.schemaDriftFields += parsedSource.parsed.schemaDriftFields;
+          if (parsedSource.parsed.turns.length) {
+            summary.sessions += 1;
+            summary.turns += parsedSource.parsed.turns.length;
+            summary.modelUsageRows += parsedSource.parsed.turns.reduce(
+              (total, turn) => total + turn.modelUsage.length,
+              0,
+            );
+          }
+        }
+        for (const [key, value] of Object.entries(reconciled.stored || {})) summary[key] += value;
+        reconciledPaths ??= new Set();
+        for (const file of reconciled.handledPaths) {
+          if (file !== item.file) reconciledPaths.add(file);
+        }
+        if (reconciled.currentHandled) continue;
+      }
+      parsed ??= await parseGrokUpdatesFile({ ...item, machine, warn });
       summary.warnings.malformedLines += parsed.malformedLines;
       summary.warnings.schemaDriftFields += parsed.schemaDriftFields;
       if (parsed.turns.length) {
@@ -345,6 +570,8 @@ export async function ingestGrokSessions({ store, sessionsRoot, machine = 'studi
         store.recordIngestFileState(item.file, after, {
           parser: GROK_UPDATES_PARSER,
           parserVersion: GROK_UPDATES_PARSER_VERSION,
+          sessionId: parsed.session.sessionId,
+          recordCount: parsed.recordCount,
         });
       }
     } catch (error) {

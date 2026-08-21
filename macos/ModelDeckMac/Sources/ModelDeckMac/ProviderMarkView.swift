@@ -22,10 +22,17 @@ struct ProviderMarkView: View {
                     .interpolation(.high)
                     .scaledToFit()
             } else {
-                // Bundle missing the resource (should not happen in a built
-                // app): keep the layout slot stable instead of collapsing.
+                // No bundled artwork (Grok ships none — see ProviderIcons),
+                // or a built app somehow missing the resource. Either way the
+                // slot keeps its size and carries the provider's initial, so
+                // the header reads as a provider mark rather than a gap.
                 RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
                     .fill(Color(nsColor: .quaternarySystemFill))
+                    .overlay(
+                        Text(provider.displayName.prefix(1))
+                            .font(.system(size: size * 0.56, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    )
             }
         }
         .frame(width: size, height: size)

@@ -12,10 +12,17 @@ struct ProviderIconTests {
         // Build scripts and the bundled PNG filenames depend on these.
         #expect(ProviderIcons.resourceBaseName(for: .claude) == "provider-claude")
         #expect(ProviderIcons.resourceBaseName(for: .codex) == "provider-codex")
+        // Decision 0035: ModelDeck ships no Grok artwork (there is no
+        // installed Grok desktop app to take an .icns from). The deck's
+        // provider mark falls back to the initial. If artwork ever lands,
+        // this line and `bundledProviders` change together — and every
+        // bundle-shape tripwire below starts covering it automatically.
+        #expect(ProviderIcons.resourceBaseName(for: .grok) == nil)
+        #expect(ProviderIcons.bundledProviders == [.claude, .codex])
     }
 
     @Test func iconsLoadWithEveryDeclaredPixelSize() {
-        for provider in DeckProvider.allCases {
+        for provider in ProviderIcons.bundledProviders {
             let image = ProviderIcons.image(for: provider)
             #expect(image != nil, "\(provider) icon should load from the resource bundle")
             guard let image else { continue }
@@ -34,7 +41,7 @@ struct ProviderIconTests {
     // alpha channel; the app-icon squircle guarantees genuinely transparent
     // margin pixels (the corners), so require at least one.
     @Test func iconsContainFullyTransparentPixels() throws {
-        for provider in DeckProvider.allCases {
+        for provider in ProviderIcons.bundledProviders {
             let image = try #require(ProviderIcons.image(for: provider))
             for rep in image.representations {
                 let bitmap = try #require(rep as? NSBitmapImageRep)
@@ -75,8 +82,8 @@ struct ProviderIconTests {
     }
 
     @Test func bundledArtworkMatchesRecordedDigests() throws {
-        for provider in DeckProvider.allCases {
-            let base = ProviderIcons.resourceBaseName(for: provider)
+        for provider in ProviderIcons.bundledProviders {
+            let base = try #require(ProviderIcons.resourceBaseName(for: provider))
             for pixels in ProviderIcons.pixelSizes {
                 let name = "\(base)-\(pixels)"
                 let expected = try #require(Self.expectedDigests[name])

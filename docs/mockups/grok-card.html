@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ModelDeck — Grok column (decision 0035, stage two)</title>
+<style>
+  :root {
+    --ground: #131316;
+    --ink: #e7e7ea;
+    --muted: #8e9097;
+    --anno: #c9a96a;
+    --anno-bg: #262218;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 32px 64px;
+    background: var(--ground); color: var(--ink);
+    font: 13px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif;
+  }
+  h1 { font-size: 17px; font-weight: 650; letter-spacing: -.01em; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin: 0 0 36px; max-width: 780px; }
+  .exhibit { margin-bottom: 44px; }
+  .tag {
+    display: inline-block; margin-bottom: 12px;
+    font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--anno); background: var(--anno-bg);
+    padding: 3px 8px; border-radius: 4px;
+  }
+  .note { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 940px; }
+
+  /* ---------- popover chrome (verbatim from design/mockups/modeldeck-mac-app-mockups.html) ---------- */
+  .popover {
+    width: 344px; border-radius: 12px; overflow: hidden;
+    background: #232326;
+    border: 1px solid rgba(255,255,255,.10);
+    box-shadow: 0 18px 50px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
+    font: 13px/1.4 -apple-system, "SF Pro Text", sans-serif; color: #e7e7ea;
+    text-align: left;
+  }
+  .pop-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 12px 8px;
+  }
+  .seg { display: flex; background: rgba(255,255,255,.07); border-radius: 7px; padding: 2px; gap: 2px; }
+  .seg span { font-size: 11px; font-weight: 550; padding: 3px 9px; border-radius: 5px; color: #9a9ca4; }
+  .seg .on { background: rgba(255,255,255,.14); color: #f0f0f2; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
+  .gear { color: #8e9097; font-size: 14px; }
+
+  .acct { padding: 8px 12px 10px; border-top: 1px solid rgba(255,255,255,.06); }
+  .acct.expanded { background: rgba(255,255,255,.035); }
+  .acct-row { display: flex; align-items: center; gap: 9px; }
+  .pchip {
+    width: 24px; height: 24px; border-radius: 7px; flex: none;
+    display: flex; align-items: center; justify-content: center; font-size: 13px;
+  }
+  .pchip.claude { background: rgba(217,119,87,.16); color: #d97757; }
+  .pchip.codex  { background: rgba(255,255,255,.10); color: #e9e9ec; font-size: 11px; }
+  /* Grok ships no bundled artwork, so ProviderMarkView renders the
+     quaternary-fill slot with the provider's initial. This is that. */
+  .pchip.grok   { background: rgba(255,255,255,.10); color: #a9abb2; font-weight: 600; }
+  .acct-name { font-weight: 600; font-size: 13px; letter-spacing: -.01em; }
+  .acct-mail { font-size: 11px; color: #8e9097; margin-top: 1px; }
+  .acct-meta { margin-left: auto; text-align: right; flex: none; }
+  .worst { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .worst small { display: block; font-weight: 400; font-size: 10.5px; color: #8e9097; margin-top: 1px; }
+  .ok   { color: #e7e7ea; }
+  .warn { color: #ff9f0a; }
+  .crit { color: #ff453a; }
+
+  .windows { margin: 9px 0 0 33px; display: flex; flex-direction: column; gap: 9px; }
+  .win .wr { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
+  .win .wl { font-size: 12px; color: #cfd0d4; }
+  .win .wv { font-size: 12px; color: #8e9097; font-variant-numeric: tabular-nums; }
+  .win .wv b { color: #e7e7ea; font-weight: 600; margin-left: 7px; }
+  .win .wv b.warn { color: #ff9f0a; }
+  .win .wv b.crit { color: #ff453a; }
+  .bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.10); overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 2px; background: #6d9ef1; }
+  .bar i.warn { background: #ff9f0a; }
+  .bar i.crit { background: #ff453a; }
+  .mini-wins { margin: 8px 0 0 33px; display: flex; gap: 5px; }
+  .mini-wins .bar { flex: 1; }
+
+  .popover.wide  { width: 640px; }
+  .popover.wide3 { width: 940px; }
+  .cols { display: flex; align-items: stretch; }
+  .col { flex: 1; min-width: 0; }
+  .col + .col { border-left: 1px solid rgba(255,255,255,.06); }
+  .col-head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px 8px; border-bottom: 1px solid rgba(255,255,255,.06);
+  }
+  .col-head .pchip { width: 20px; height: 20px; border-radius: 6px; font-size: 11px; }
+  .col-head .cname { font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
+  .col-head .ccount { margin-left: auto; font-size: 11px; color: #8e9097; font-variant-numeric: tabular-nums; }
+  .col-head .ccount b { color: #cfd0d4; font-weight: 600; margin-left: 2px; }
+  .health { font-size: 10.5px; color: #8e9097; display: flex; align-items: center; gap: 4px; }
+  .health i { width: 6px; height: 6px; border-radius: 50%; background: #30d158; display: block; }
+  .col .acct { padding-left: 12px; padding-right: 12px; }
+  .col .acct:first-of-type { border-top: 0; }
+  .col .windows, .col .mini-wins { margin-left: 0; }
+
+  .pop-foot {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 12px; border-top: 1px solid rgba(255,255,255,.06);
+    font-size: 11px; color: #8e9097;
+  }
+  .pop-foot .refresh { color: #b9bac0; }
+
+  .ghost {
+    width: 300px; border: 1px dashed rgba(255,255,255,.14); border-radius: 10px;
+    display: flex; align-items: center; justify-content: center; text-align: center;
+    color: #6e7076; font-size: 11.5px; padding: 20px 16px; margin-left: 16px;
+  }
+  .side-by-side { display: flex; align-items: center; }
+</style>
+</head>
+<body>
+
+<h1>Grok gets a deck column</h1>
+<p class="sub">
+  Decision 0035, stage two. Grok sessions already feed receipts, but Grok has no deck presence —
+  you can&rsquo;t see % left or resets for the third provider. Same card anatomy, same sort, same voice.
+  Placeholder identities only.
+</p>
+
+<div class="exhibit">
+  <span class="tag">With Grok accounts · three columns</span>
+  <div class="popover wide3">
+    <div class="pop-head">
+      <div class="seg"><span class="on">Reset</span><span>Lowest</span></div>
+      <span class="gear">⚙︎</span>
+    </div>
+    <div class="cols">
+
+      <!-- Claude column (unchanged) -->
+      <div class="col">
+        <div class="col-head">
+          <span class="pchip claude">✳</span>
+          <span class="cname">Claude</span>
+          <span class="health"><i></i>Comfortable</span>
+          <span class="ccount">3 subscriptions ·<b>128% left</b></span>
+        </div>
+        <div class="acct expanded">
+          <div class="acct-row">
+            <div>
+              <div class="acct-name">Studio</div>
+              <div class="acct-mail">studio@example.com</div>
+            </div>
+          </div>
+          <div class="windows">
+            <div class="win">
+              <div class="wr"><span class="wl">5-hour limit</span><span class="wv">Resets in 57 min<b>72%</b></span></div>
+              <div class="bar"><i style="width:28%"></i></div>
+            </div>
+            <div class="win">
+              <div class="wr"><span class="wl">Weekly · all models</span><span class="wv">Resets Wed 6:00 PM<b>63%</b></span></div>
+              <div class="bar"><i style="width:37%"></i></div>
+            </div>
+            <div class="win">
+              <div class="wr"><span class="wl">Weekly · Fable</span><span class="wv">Resets Wed 6:00 PM<b class="warn">32%</b></span></div>
+              <div class="bar"><i class="warn" style="width:68%"></i></div>
+            </div>
+          </div>
+        </div>
+        <div class="acct">
+          <div class="acct-row">
+            <div>
+              <div class="acct-name">Client</div>
+              <div class="acct-mail">client@example.com</div>
+            </div>
+            <div class="acct-meta"><div class="worst crit">8% left<small>Weekly · Fable · Resets Wed 6:00 PM</small></div></div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i class="crit" style="width:92%"></i></div></div>
+        </div>
+        <div class="acct">
+          <div class="acct-row">
+            <div>
+              <div class="acct-name">Personal</div>
+              <div class="acct-mail">personal@example.com</div>
+            </div>
+            <div class="acct-meta"><div class="worst ok">88% left<small>Weekly · Resets Thu 9:00 AM</small></div></div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i style="width:12%"></i></div></div>
+        </div>
+      </div>
+
+      <!-- Codex column (unchanged) -->
+      <div class="col">
+        <div class="col-head">
+          <span class="pchip codex">◇</span>
+          <span class="cname">Codex</span>
+          <span class="health"><i></i>Comfortable</span>
+          <span class="ccount">2 subscriptions ·<b>121% left</b></span>
+        </div>
+        <div class="acct expanded">
+          <div class="acct-row">
+            <div>
+              <div class="acct-name">Studio</div>
+              <div class="acct-mail">studio@example.com</div>
+            </div>
+          </div>
+          <div class="windows">
+            <div class="win">
+              <div class="wr"><span class="wl">Weekly · all models</span><span class="wv">Resets Mon 8:00 AM<b>99%</b></span></div>
+              <div class="bar"><i style="width:1%"></i></div>
+            </div>
+          </div>
+        </div>
+        <div class="acct">
+          <div class="acct-row">
+            <div>
+              <div class="acct-name">Personal</div>
+              <div class="acct-mail">personal@example.com</div>
+            </div>
+            <div class="acct-meta"><div class="worst warn">22% left<small>Weekly · Resets Sun 8:00 AM</small></div></div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i class="warn" style="width:78%"></i></div></div>
+        </div>
+      </div>
+
+      <!-- Grok column — NEW -->
+      <div class="col">
+        <div class="col-head">
+          <span class="pchip grok">G</span>
+          <span class="cname">Grok</span>
+          <span class="ccount">2 subscriptions ·<b>118% left</b></span>
+        </div>
+        <div class="acct expanded">
+          <div class="acct-row">
+            <div>
+              <div class="acct-name">Studio</div>
+              <div class="acct-mail">studio@example.com</div>
+            </div>
+          </div>
+          <div class="windows">
+            <div class="win">
+              <div class="wr"><span class="wl">Weekly · all models</span><span class="wv">Resets Sat 5:00 PM<b>41%</b></span></div>
+              <div class="bar"><i style="width:59%"></i></div>
+            </div>
+          </div>
+        </div>
+        <div class="acct">
+          <div class="acct-row">
+            <div>
+              <div class="acct-name">Personal</div>
+              <div class="acct-mail">personal@example.com</div>
+            </div>
+            <div class="acct-meta"><div class="worst ok">77% left<small>Monthly · Resets Sep 3</small></div></div>
+          </div>
+          <div class="mini-wins"><div class="bar"><i style="width:23%"></i></div></div>
+        </div>
+      </div>
+
+    </div>
+    <div class="pop-foot">
+      <span>Updated just now</span>
+      <span class="refresh">Refresh</span>
+    </div>
+  </div>
+  <p class="note">
+    Same card anatomy as the other two: name, identity, headline &ldquo;% left&rdquo;, window label, reset text, bar.
+    Grok bills one pool per period, so a card carries one window — &ldquo;Weekly · all models&rdquo; or
+    &ldquo;Monthly · all models&rdquo;, whichever the account is billed on. No bundled Grok artwork exists,
+    so the provider mark is the initial in the same 20 pt slot. No health chip: there&rsquo;s no calibrated
+    tier ladder for Grok plans yet, and a dot that guessed would be worse than no dot.
+  </p>
+</div>
+
+<div class="exhibit">
+  <span class="tag">No Grok accounts · the column is absent, not empty</span>
+  <div class="side-by-side">
+    <div class="popover wide">
+      <div class="pop-head">
+        <div class="seg"><span class="on">Reset</span><span>Lowest</span></div>
+        <span class="gear">⚙︎</span>
+      </div>
+      <div class="cols">
+        <div class="col">
+          <div class="col-head">
+            <span class="pchip claude">✳</span>
+            <span class="cname">Claude</span>
+            <span class="health"><i></i>Comfortable</span>
+            <span class="ccount">2 subscriptions ·<b>151% left</b></span>
+          </div>
+          <div class="acct">
+            <div class="acct-row">
+              <div>
+                <div class="acct-name">Studio</div>
+                <div class="acct-mail">studio@example.com</div>
+              </div>
+              <div class="acct-meta"><div class="worst ok">63% left<small>Weekly · Resets Wed 6:00 PM</small></div></div>
+            </div>
+            <div class="mini-wins"><div class="bar"><i style="width:37%"></i></div></div>
+          </div>
+          <div class="acct">
+            <div class="acct-row">
+              <div>
+                <div class="acct-name">Personal</div>
+                <div class="acct-mail">personal@example.com</div>
+              </div>
+              <div class="acct-meta"><div class="worst ok">88% left<small>Weekly · Resets Thu 9:00 AM</small></div></div>
+            </div>
+            <div class="mini-wins"><div class="bar"><i style="width:12%"></i></div></div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="col-head">
+            <span class="pchip codex">◇</span>
+            <span class="cname">Codex</span>
+            <span class="health"><i></i>Comfortable</span>
+            <span class="ccount">1 subscription ·<b>99% left</b></span>
+          </div>
+          <div class="acct">
+            <div class="acct-row">
+              <div>
+                <div class="acct-name">Studio</div>
+                <div class="acct-mail">studio@example.com</div>
+              </div>
+              <div class="acct-meta"><div class="worst ok">99% left<small>Weekly · Resets Mon 8:00 AM</small></div></div>
+            </div>
+            <div class="mini-wins"><div class="bar"><i style="width:1%"></i></div></div>
+          </div>
+        </div>
+      </div>
+      <div class="pop-foot">
+        <span>Updated just now</span>
+        <span class="refresh">Refresh</span>
+      </div>
+    </div>
+    <div class="ghost">
+      No third column, no empty &ldquo;No subscriptions&rdquo; panel,<br>no extra width.<br>
+      Byte-for-byte the deck you have today.
+    </div>
+  </div>
+  <p class="note">
+    Claude and Codex keep an empty column when they have no accounts — that empty state is the add-account nudge.
+    Grok has no add flow yet, so an empty Grok column would be a dead end taking a third of the deck.
+  </p>
+</div>
+
+</body>
+</html>

@@ -206,6 +206,9 @@ public extension DeckState {
         switch provider {
         case .claude: entry = activation?.claude
         case .codex: entry = activation?.codex
+        // ModelDeck flips no active link for Grok — there is nothing to
+        // activate, so there is nothing to warn about either.
+        case .grok: entry = nil
         }
         guard let entry else { return .unknown }
         return ProviderActivationState.from(entry.state)

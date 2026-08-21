@@ -365,9 +365,15 @@ struct ModelDeckMacApp: App {
                     // instead) — mirror that condition so an open detail
                     // popover survives refreshes but never outlives its
                     // chip.
+                    // Decision 0035: the rendered columns ARE the list — a
+                    // hard-coded [.claude, .codex] stopped mirroring the
+                    // view the moment a third column could appear, which
+                    // would strand an open Grok health popover on a layout
+                    // switch (the #113 desync this reconcile exists to stop).
                     healthChipProviders: deckModel.layout == .twoColumn
                         && !deckModel.isDeckEmpty(state: state)
-                        ? [.claude, .codex] : [],
+                        ? deckModel.columns(for: state).map(\.provider)
+                            .filter(\.hasAvailabilityHealth) : [],
                     // Issue #241: the staged-update badge's Restart popover
                     // is released once the badge itself is gone (restart
                     // clicked, or the staged phase cleared).

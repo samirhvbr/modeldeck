@@ -102,11 +102,16 @@ public struct ToolsProbeResponse: Codable, Equatable, Sendable {
         self.checkedAt = checkedAt
     }
 
-    /// Probe for a deck provider (feeds per-account health chips).
-    public func probe(for provider: DeckProvider) -> ToolProbe {
+    /// Probe for a deck provider (feeds per-account health chips), or nil for
+    /// a provider the daemon's tool probe doesn't cover. Grok is nil: nothing
+    /// probes the grok CLI's version or auth yet (decision 0035 stages that
+    /// with the wire/pool work), and reporting `installed: false` would be a
+    /// claim we have no evidence for.
+    public func probe(for provider: DeckProvider) -> ToolProbe? {
         switch provider {
         case .claude: return tools.claude
         case .codex: return tools.codex
+        case .grok: return nil
         }
     }
 }

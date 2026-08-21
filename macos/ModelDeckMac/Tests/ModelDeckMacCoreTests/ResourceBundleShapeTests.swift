@@ -44,8 +44,8 @@ struct ResourceBundleShapeTests {
         // makes per candidate path; a bundle it rejects is the v0.3.3 trap.
         let bundle = try #require(Bundle(url: Bundle.module.bundleURL),
                                   "Bundle(url:) rejected the resource bundle directory (issue #151)")
-        for provider in DeckProvider.allCases {
-            let base = ProviderIcons.resourceBaseName(for: provider)
+        for provider in ProviderIcons.bundledProviders {
+            let base = try #require(ProviderIcons.resourceBaseName(for: provider))
             for pixels in ProviderIcons.pixelSizes {
                 #expect(bundle.url(forResource: "\(base)-\(pixels)", withExtension: "png") != nil,
                         "\(base)-\(pixels).png missing from the re-opened resource bundle")

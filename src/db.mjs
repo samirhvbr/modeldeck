@@ -33,6 +33,13 @@ export const REQUEST_USAGE_PRUNE_BATCH_SIZE = 500;
 // observations were omitted from the response.
 export const USAGE_HISTORY_RAW_LIMIT = 10_000;
 export const CORPUS_PROVIDERS = Object.freeze(['claude', 'codex', 'grok']);
+export const MAX_AUTO_REFRESH_INTERVAL_SECONDS = 3_600;
+// Default account swatch per provider (the user can override it per account).
+export const ACCOUNT_COLORS = Object.freeze({
+  claude: '#d97757',
+  codex: '#48a868',
+  grok: '#6f7ae8',
+});
 
 export const DEFAULT_SETTINGS = Object.freeze({
   autoRefreshEnabled: true,
@@ -113,7 +120,8 @@ function validateSetting(key, value) {
   if (['autoRefreshEnabled', 'autoRenewEnabled', 'otelReceiverEnabled', 'autoRefreshIntervalCustomized', 'pauseWhileActive', 'sharedUserScopeEnabled', 'usageAnalyticsEnabled', 'usageQueueConsumerEnabled'].includes(key) && typeof value !== 'boolean') {
     throw new Error(`${key} must be a boolean`);
   }
-  if (key === 'autoRefreshIntervalSeconds' && (!Number.isInteger(value) || value < 60 || value > 3600)) {
+  if (key === 'autoRefreshIntervalSeconds'
+    && (!Number.isInteger(value) || value < 60 || value > MAX_AUTO_REFRESH_INTERVAL_SECONDS)) {
     throw new Error('autoRefreshIntervalSeconds must be an integer from 60 to 3600');
   }
   if (key === 'layout' && !['two-column', 'single-column'].includes(value)) {
@@ -756,11 +764,91 @@ export class Store {
     }
   }
 
+  /// Decision 0035: the accounts table's provider CHECK predates Grok, and
+  /// SQLite cannot alter a CHECK in place — the table has to be rebuilt.
+  /// Idempotent (it reads the recorded DDL first) and a no-op on any database
+  /// created after this shipped.
+  ///
+  /// The foreign_keys pragma must be toggled OUTSIDE a transaction, so the
+  /// rebuild owns its own. Five tables carry six foreign-key clauses onto
+  /// accounts(id) — `projects` carries two (claude_account_id and
+  /// codex_account_id), alongside `request_usage`, `usage_snapshots`,
+  /// `session_model_state`, and `launch_events`. Dropping the
+  /// old table with enforcement OFF is what stops the ON DELETE CASCADE
+  /// children (usage_snapshots, session_model_state) from being wiped and
+  /// the ON DELETE SET NULL parents from being blanked; renaming the
+  /// replacement into its name then leaves all six clauses resolving to the
+  /// new table. This is SQLite's documented rebuild sequence, including the
+  /// step-10 `foreign_key_check` before COMMIT.
+  migrateAccountProviders() {
+    const recorded = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'accounts'",
+    ).get()?.sql || '';
+    if (!recorded || recorded.includes("'grok'")) return;
+    // Databases old enough to predate the identity/purpose columns are still
+    // out there, and those columns are added AFTER this runs. Copy only what
+    // the old table actually has and let the new table's defaults cover the
+    // rest, so the rebuild never depends on migration ordering.
+    const present = new Set(
+      this.db.prepare('PRAGMA table_info(accounts)').all().map((column) => column.name),
+    );
+    const columns = [
+      'id', 'provider', 'label', 'profile_ref', 'created_at', 'updated_at',
+      'identity', 'purpose', 'color', 'enabled', 'is_default', 'metadata_json',
+    ].filter((column) => present.has(column)).join(', ');
+    this.db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        this.db.exec(`
+          CREATE TABLE accounts_migrating (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL CHECK(provider IN ('claude','codex','grok')),
+            label TEXT NOT NULL,
+            identity TEXT NOT NULL DEFAULT '',
+            purpose TEXT NOT NULL DEFAULT '',
+            profile_ref TEXT NOT NULL,
+            color TEXT NOT NULL DEFAULT '#6f7bf7',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(provider, profile_ref)
+          );
+          INSERT INTO accounts_migrating(${columns}) SELECT ${columns} FROM accounts;
+          DROP TABLE accounts;
+          ALTER TABLE accounts_migrating RENAME TO accounts;
+          CREATE UNIQUE INDEX IF NOT EXISTS one_default_per_provider
+            ON accounts(provider) WHERE is_default = 1;
+        `);
+        // SQLite's documented step 10. Enforcement is off for the rebuild, so
+        // nothing else would notice a row this migration orphaned — a bad
+        // copy would land silently and only surface later as a child row
+        // pointing at an account that no longer exists. Checking here means a
+        // rebuild that broke a reference rolls back instead of committing.
+        const orphans = this.db.prepare('PRAGMA foreign_key_check').all();
+        if (orphans.length) {
+          const tables = [...new Set(orphans.map((row) => row.table))].sort().join(', ');
+          throw new Error(`accounts rebuild orphaned ${orphans.length} row(s) in: ${tables}`);
+        }
+        this.db.exec('COMMIT');
+      } catch (error) {
+        this.db.exec('ROLLBACK');
+        throw error;
+      }
+    } finally {
+      this.db.exec('PRAGMA foreign_keys = ON');
+    }
+  }
+
   migrate() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL CHECK(provider IN ('claude','codex')),
+        -- Decision 0035 widened this to three. Existing databases are
+        -- rebuilt onto the same shape by migrateAccountProviders() below.
+        provider TEXT NOT NULL CHECK(provider IN ('claude','codex','grok')),
         label TEXT NOT NULL,
         identity TEXT NOT NULL DEFAULT '',
         purpose TEXT NOT NULL DEFAULT '',
@@ -1272,6 +1360,7 @@ export class Store {
     this.db.prepare(`
       INSERT OR IGNORE INTO settings(id, value_json, updated_at) VALUES (1, '{}', ?)
     `).run(now());
+    this.migrateAccountProviders();
     // Take the write lock BEFORE probing the schema: two Stores opening
     // concurrently (daemon + CLI refit) could otherwise both see the legacy
     // table, and the second would re-migrate the already-migrated table,
@@ -1404,7 +1493,10 @@ export class Store {
   }
 
   saveAccount(input) {
-    if (!['claude', 'codex'].includes(input.provider)) throw new Error('provider must be claude or codex');
+    // Decision 0035: Grok is the third provider. The enum widens here (and
+    // only here) for the quota probe — request_usage stays claude|codex until
+    // the wire/pool stage, because nothing routes Grok through the proxy yet.
+    if (!CORPUS_PROVIDERS.includes(input.provider)) throw new Error('provider must be claude, codex, or grok');
     if (!input.label?.trim()) throw new Error('account label is required');
     if (!input.profileRef?.trim()) throw new Error('profile reference is required');
     let profileRef = input.profileRef.trim();
@@ -1436,7 +1528,7 @@ export class Store {
       input.identity == null ? existing?.identity || '' : input.identity.trim(),
       input.purpose == null ? existing?.purpose || '' : input.purpose.trim(),
       profileRef,
-      input.color || (input.provider === 'claude' ? '#d97757' : '#48a868'),
+      input.color || ACCOUNT_COLORS[input.provider],
       input.enabled === false ? 0 : 1,
       existing?.isDefault ? 1 : 0,
       JSON.stringify(input.metadata || existing?.metadata || {}),
@@ -2163,7 +2255,7 @@ export class Store {
   /// place, so stable session/turn indexes provide the same replay behavior as
   /// Codex rollouts while source JSON and a parser version preserve schema
   /// drift for later reprocessing.
-  ingestGrokSession(session, turns) {
+  ingestGrokSession(session, turns, { transaction = true } = {}) {
     turns = [...turns];
     validateGrokSessionRecord(session, turns);
     const insertSession = this.db.prepare(`
@@ -2269,7 +2361,7 @@ export class Store {
       modelUsageInserted: 0,
       modelUsageUpdated: 0,
     };
-    this.db.exec('BEGIN IMMEDIATE');
+    if (transaction) this.db.exec('BEGIN IMMEDIATE');
     try {
       const sessionExists = Boolean(existingSession.get(session.sessionId));
       const sessionResult = insertSession.run(
@@ -2331,8 +2423,115 @@ export class Store {
           else if (modelResult.changes > 0) summary.modelUsageUpdated += 1;
         }
       }
+      if (transaction) this.db.exec('COMMIT');
+      return summary;
+    } catch (error) {
+      if (transaction) this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  /// Grok shrink replay uses a temporary payload table so file parsing never
+  /// holds the Store connection's write transaction open. The final delete +
+  /// insert is one synchronous publish scoped by session id.
+  beginGrokReconcile(affectedSessions = []) {
+    this.db.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS grok_reconcile_sessions (
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        PRIMARY KEY(session_id, profile_slug)
+      ) WITHOUT ROWID;
+      CREATE TEMP TABLE IF NOT EXISTS grok_replay_payloads (
+        session_id TEXT NOT NULL,
+        profile_slug TEXT NOT NULL,
+        session_json TEXT NOT NULL,
+        turns_json TEXT NOT NULL,
+        PRIMARY KEY(session_id, profile_slug)
+      ) WITHOUT ROWID;
+    `);
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO grok_reconcile_sessions(session_id, profile_slug) VALUES (?, ?)
+    `);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.exec(`
+        DELETE FROM grok_reconcile_sessions;
+        DELETE FROM grok_replay_payloads;
+      `);
+      for (const session of affectedSessions) insert.run(session.sessionId, session.profileSlug);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  stageGrokReplay(session, turns) {
+    turns = [...turns];
+    validateGrokSessionRecord(session, turns);
+    this.db.prepare(`
+      INSERT INTO grok_replay_payloads(
+        session_id, profile_slug, session_json, turns_json
+      ) VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id, profile_slug) DO UPDATE SET
+        session_json = excluded.session_json,
+        turns_json = excluded.turns_json
+    `).run(
+      session.sessionId,
+      session.profileSlug,
+      JSON.stringify(session),
+      JSON.stringify(turns),
+    );
+  }
+
+  finishGrokReconcile() {
+    const payloads = this.db.prepare(`
+      SELECT session_json, turns_json FROM grok_replay_payloads
+      ORDER BY session_id, profile_slug
+    `).all().map((row) => ({
+      session: JSON.parse(row.session_json),
+      turns: JSON.parse(row.turns_json),
+    }));
+    const deleteAffected = this.db.prepare(`
+      DELETE FROM grok_sessions
+      WHERE EXISTS (
+        SELECT 1 FROM grok_reconcile_sessions replay
+        WHERE replay.session_id = grok_sessions.session_id
+      )
+    `);
+    const summary = {
+      sessionsInserted: 0,
+      sessionsUpdated: 0,
+      turnsInserted: 0,
+      turnsUpdated: 0,
+      modelUsageInserted: 0,
+      modelUsageUpdated: 0,
+    };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      deleteAffected.run();
+      for (const payload of payloads) {
+        const stored = this.ingestGrokSession(payload.session, payload.turns, { transaction: false });
+        for (const [key, value] of Object.entries(stored)) summary[key] += value;
+      }
       this.db.exec('COMMIT');
       return summary;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    } finally {
+      this.cancelGrokReconcile();
+    }
+  }
+
+  cancelGrokReconcile() {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.exec(`
+        DELETE FROM grok_reconcile_sessions;
+        DELETE FROM grok_replay_payloads;
+      `);
+      this.db.exec('COMMIT');
     } catch (error) {
       this.db.exec('ROLLBACK');
       throw error;

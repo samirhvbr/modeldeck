@@ -315,6 +315,13 @@ export async function readDiagnosticCorpus(store, {
     LEFT JOIN accounts a ON a.id = ru.account_id
     WHERE ru.provider = ? AND (ru.failed = 1 OR ru.status_code = 429)
   `;
+  // Decision 0035 stage two adds Grok's quota probe and deck column, and
+  // deliberately stops there: `grok` is absent from this list on purpose, not
+  // by oversight. Wire failures are read from `request_usage`, which nothing
+  // writes for Grok yet — no Grok traffic passes through CLIProxyAPI until
+  // the wire/pool stage — so including it here would scan for rows that
+  // cannot exist and imply a coverage the deck does not have. Add `grok` in
+  // the same change that starts routing Grok through the proxy.
   for (const provider of ['claude', 'codex']) {
     const totalWireRows = Number(store.db.prepare(`
       SELECT COUNT(*) AS count FROM request_usage

@@ -358,6 +358,11 @@ public enum AvailabilityHealthEngine {
             return claudeTierWeight(account.metadata?.claudePlan ?? account.metadata?.plan)
         case .codex:
             return codexTierWeight(account.metadata?.codexPlan ?? account.metadata?.plan)
+        case .grok:
+            // No calibrated tier ladder for Grok's plans yet (0035 stages the
+            // pool work after the quota probe), so every account weighs 1 and
+            // says so — the "tier unknown" path this type already has.
+            return AvailabilityTierWeight(value: 1, isKnown: false)
         }
     }
 
@@ -420,12 +425,45 @@ public enum AvailabilityHealthEngine {
         switch provider {
         case .claude: return generalWeekly ? ("weekly", nil) : ("fable weekly", "weekly")
         case .codex: return ("weekly", nil)
+        // Decision 0035 / CodeRabbit on PR #559: Grok bills one pool per
+        // period, and that period may be MONTHLY. This whole engine is a
+        // fixed 168-hour simulation (`cycleHours`), and `measuredPace` gives
+        // an account whose reset is beyond one cycle an elapsed time of zero
+        // — so a monthly window 20 days out would report no measured pace and
+        // never reset inside the sim, producing a confidently wrong verdict.
+        // Weekly-billed Grok accounts evaluate correctly and stay in; monthly
+        // ones are deliberately EXCLUDED (with an accurate reason, see
+        // `missingDriverReason`) until the simulation is period-aware. Making
+        // it period-aware is the real fix and is not attempted here.
+        case .grok: return ("weekly", nil)
         }
     }
 
     private static func normalizedScope(_ scope: String) -> String {
         let lower = scope.lowercased().trimmingCharacters(in: .whitespaces)
-        return ["week", "7d", "weekly"].contains(lower) ? "weekly" : lower
+        if ["week", "7d", "weekly"].contains(lower) { return "weekly" }
+        // Decision 0035 added a monthly window to the daemon's vocabulary.
+        // Folding its synonyms here keeps the exclusion reason accurate
+        // whichever spelling arrives.
+        if ["month", "30d", "monthly"].contains(lower) { return "monthly" }
+        return lower
+    }
+
+    /// Why an account contributed no driver-scope snapshot.
+    ///
+    /// "no weekly usage data" is the honest answer when the account really
+    /// has nothing weekly to read. It is the WRONG answer when the account
+    /// has a perfectly good window that this outlook simply cannot evaluate
+    /// — a Grok subscription billed monthly has usage data, and telling its
+    /// owner there is none sends them looking for a refresh problem that
+    /// doesn't exist. Name the window instead.
+    static func missingDriverReason(in rows: [UsageSnapshot]) -> String {
+        let scopes = Set(rows.map { normalizedScope($0.scope) })
+        if scopes.contains("monthly") { return "monthly window, not weekly" }
+        // The daemon's fallback when the provider states a percent but not
+        // which period it belongs to.
+        if scopes.contains("usage period") { return "window is not known to be weekly" }
+        return "no weekly usage data"
     }
 
     /// The driver-scope snapshot for one account's usage rows — primary
@@ -487,7 +525,7 @@ public enum AvailabilityHealthEngine {
             let snapshot = driverSnapshot(for: provider, in: rows, generalWeekly: generalWeekly)
             guard let snapshot else {
                 excluded.append(AvailabilityExclusion(
-                    label: account.label, reason: flaggedAuthReason ?? "no weekly usage data"
+                    label: account.label, reason: flaggedAuthReason ?? missingDriverReason(in: rows)
                 ))
                 continue
             }

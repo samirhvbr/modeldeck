@@ -7,16 +7,23 @@ import Observation
 // Everything here is pure derivation over `DeckState` so it is directly unit
 // testable; the SwiftUI views in the app target stay thin.
 
-/// The two providers the deck knows how to column-ize.
+/// The providers the deck knows how to column-ize.
+///
+/// Decision 0035 added Grok as the third. It differs from the other two in
+/// one way that matters here: its column is shown only when Grok accounts
+/// actually exist (see `DeckBuilder.columns`), so a deck with no Grok costs
+/// exactly the same space it always did.
 public enum DeckProvider: String, CaseIterable, Equatable, Sendable {
     case claude
     case codex
+    case grok
 
     /// Lenient mapping from the daemon's `provider` strings.
     public static func from(_ raw: String) -> DeckProvider? {
         switch raw.lowercased() {
         case "claude", "anthropic": return .claude
         case "codex", "openai": return .codex
+        case "grok", "xai": return .grok
         default: return nil
         }
     }
@@ -26,15 +33,75 @@ public enum DeckProvider: String, CaseIterable, Equatable, Sendable {
         switch self {
         case .claude: return "Claude"
         case .codex: return "Codex"
+        case .grok: return "Grok"
+        }
+    }
+
+    /// Providers the add-account flow can actually walk someone through.
+    /// That flow creates an owner-only profile home and hands off to the
+    /// provider's own sign-in; neither step exists for Grok yet, so offering
+    /// it in the picker would be a dead end.
+    public static let addableCases: [DeckProvider] = [.claude, .codex]
+
+    /// Whether this provider's column carries an Availability Health chip.
+    ///
+    /// The verdict is tier-aware and forward-simulated over a fixed 168-hour
+    /// cycle. Grok satisfies neither premise yet: there is no calibrated tier
+    /// ladder for its plans (every account weighs 1 and says "unknown"), and
+    /// monthly-billed accounts are excluded from the simulation outright
+    /// because a 7-day forecast cannot read a monthly window. A chip built on
+    /// those foundations would be a guess wearing a colored dot, so the Grok
+    /// header carries none — matching the signed-off 0035 mockup.
+    public var hasAvailabilityHealth: Bool {
+        switch self {
+        case .claude, .codex: return true
+        case .grok: return false
         }
     }
 }
 
 /// Popover layout. Two-column is the locked default; single-column is the
 /// Settings-selectable alternate driven by the same view model.
+///
+/// `twoColumn` names the MODE, not a count: how many columns the deck
+/// actually renders is data — see `DeckLayoutMetrics`.
 public enum DeckLayout: String, Equatable, Sendable {
     case twoColumn = "two-column"
     case singleColumn = "single-column"
+}
+
+/// How wide the deck has to be to hold what it is showing.
+///
+/// Issue #30 fixed the width at 640 for the two-column deck: at the standard
+/// roster (7 accounts, longest label ~"Side Project") nothing may truncate,
+/// with meter rows carrying "Weekly · all models" left and
+/// "Resets Wed 5:59 PM" right on every card. That width was a CONSTANT, so
+/// when decision 0035 made the column count variable, a third column would
+/// have squeezed all three into the two-column width and broken exactly the
+/// rule #30 established.
+///
+/// The width is therefore a function of the column count: 300 pt of card per
+/// column plus 40 pt of chrome. Two columns reproduce #30's 640 exactly, and
+/// three give the 940 of the signed-off 0035 mockup — so a fourth provider
+/// widens the deck instead of re-squeezing it.
+public enum DeckLayoutMetrics {
+    /// Card width one column is guaranteed; the #30 no-truncation budget.
+    public static let columnWidth: CGFloat = 300
+    /// Padding and inter-column spacing outside the cards themselves.
+    public static let columnChrome: CGFloat = 40
+    /// Single-column mode is one stacked list, not a column grid.
+    public static let singleColumnWidth: CGFloat = 420
+
+    /// Deck width for `count` side-by-side provider columns.
+    public static func columnLayoutWidth(columnCount count: Int) -> CGFloat {
+        CGFloat(max(1, count)) * columnWidth + columnChrome
+    }
+
+    /// The width the deck should use for a layout mode and a rendered column
+    /// count. The single-column mode ignores the count by construction.
+    public static func deckWidth(layout: DeckLayout, columnCount: Int) -> CGFloat {
+        layout == .singleColumn ? singleColumnWidth : columnLayoutWidth(columnCount: columnCount)
+    }
 }
 
 /// Issue #270 — how much desktop shows through the deck.
@@ -955,19 +1022,25 @@ public enum DeckBuilder {
         }
     }
 
-    /// Provider grouping order: Claude first, Codex second (mirroring the
-    /// two-column left→right order), unknown providers last.
+    /// Provider grouping order: Claude first, Codex second, Grok third
+    /// (mirroring the column left→right order), unknown providers last.
     static func providerRank(_ provider: DeckProvider?) -> Int {
         switch provider {
         case .claude: return 0
         case .codex: return 1
-        case nil: return 2
+        case .grok: return 2
+        case nil: return 3
         }
     }
 
-    /// Two-column mode: Claude column left, Codex right, each sorted
+    /// Column mode: Claude left, Codex next, Grok last, each sorted
     /// independently. Accounts with unknown providers are omitted from
     /// columns (they still appear in single-column mode).
+    ///
+    /// Decision 0035: Claude and Codex always get a column — an empty one
+    /// still says "No subscriptions", which is the add-account nudge. Grok's
+    /// column appears only when Grok accounts exist, so nobody who doesn't
+    /// use Grok pays a third of the deck's width for it.
     public static func columns(
         state: DeckState,
         sortOrder: DeckSortOrder,
@@ -982,10 +1055,12 @@ public enum DeckBuilder {
             preferModelWindowHeadline: preferModelWindowHeadline,
             preferGeneralWeeklyHeadline: preferGeneralWeeklyHeadline
         )
-        return [DeckProvider.claude, .codex].map { provider in
-            DeckColumn(
+        return [DeckProvider.claude, .codex, .grok].compactMap { provider in
+            let providerRows = allRows.filter { $0.provider == provider }
+            if provider == .grok, providerRows.isEmpty { return nil }
+            return DeckColumn(
                 provider: provider,
-                rows: sorted(allRows.filter { $0.provider == provider }, by: sortOrder, direction: direction)
+                rows: sorted(providerRows, by: sortOrder, direction: direction)
             )
         }
     }
@@ -1138,6 +1213,14 @@ public enum DeckBuilder {
             return "Weekly · all models"
         case "spend":
             return "Spend"
+        // Decision 0035: Grok bills against one pool on a weekly OR monthly
+        // period, so "monthly" is a real window here. "usage period" is what
+        // the daemon emits when the provider states a percent but not which
+        // period it belongs to — the number is still ground truth.
+        case "month", "monthly", "30d":
+            return "Monthly · all models"
+        case "usage period":
+            return "Usage period"
         default:
             for separator in [":", "_", "-", " "] where lower.hasPrefix("week\(separator)") {
                 let model = scope.dropFirst("week".count + separator.count)
@@ -1163,7 +1246,8 @@ public enum DeckBuilder {
         if UsageScope.isSpend(scope) { return 3 }
         switch windowTitle(for: scope) {
         case "5-hour limit": return 0
-        case "Weekly · all models": return 1
+        // The account's whole-pool window, whatever its period is called.
+        case "Weekly · all models", "Monthly · all models", "Usage period": return 1
         default: return 2
         }
     }

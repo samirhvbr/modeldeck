@@ -73,7 +73,7 @@ struct AddAccountSheet: View {
         VStack(alignment: .leading, spacing: 12) {
             Form {
                 Picker("Provider", selection: $provider) {
-                    ForEach(DeckProvider.allCases, id: \.self) { provider in
+                    ForEach(DeckProvider.addableCases, id: \.self) { provider in
                         Text(provider.displayName).tag(provider)
                     }
                 }

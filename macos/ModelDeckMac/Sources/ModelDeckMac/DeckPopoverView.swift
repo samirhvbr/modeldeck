@@ -103,7 +103,9 @@ struct DeckPopoverView: View {
         // label ~"Side Project") nothing may truncate in either layout —
         // meter rows carry "Weekly · all models" left and
         // "Resets Wed 5:59 PM" right on every card (zone-free per #137).
-        .frame(width: deckModel.layout == .twoColumn ? 640 : 420)
+        // Decision 0035 made the column count variable, so this width is
+        // derived from it rather than pinned at the two-column constant.
+        .frame(width: deckWidth)
         // Issue #270 (Tim, 2026-08-06: "a little too transparent"): the deck
         // had NO background of its own — it inherited SwiftUI's default
         // MenuBarExtra window material and nothing else. This composites a
@@ -703,6 +705,20 @@ struct DeckPopoverView: View {
         SettingsWindowFronting.activateAndFront()
     }
 
+    /// The deck's own width. In column mode it tracks how many columns are
+    /// actually rendered (decision 0035's Grok column appears only when Grok
+    /// accounts exist), so adding a provider widens the deck instead of
+    /// squeezing every card past the #30 no-truncation budget. Before the
+    /// first state arrives there is nothing but a placeholder to size, so the
+    /// historical two-column width stands.
+    private var deckWidth: CGFloat {
+        guard deckModel.layout == .twoColumn else { return DeckLayoutMetrics.singleColumnWidth }
+        guard let state = statusModel.deckState else {
+            return DeckLayoutMetrics.columnLayoutWidth(columnCount: 2)
+        }
+        return DeckLayoutMetrics.columnLayoutWidth(columnCount: deckModel.columns(for: state).count)
+    }
+
     @ViewBuilder
     private var content: some View {
         if let state = statusModel.deckState, deckModel.isDeckEmpty(state: state) {
@@ -741,7 +757,9 @@ struct DeckPopoverView: View {
                         DeckColumnView(
                             column: column,
                             deckModel: deckModel,
-                            healthPresentation: healthPresentation(for: column.provider, state: state),
+                            healthPresentation: column.provider.hasAvailabilityHealth
+                                ? healthPresentation(for: column.provider, state: state)
+                                : nil,
                             menuBarSourceAccountID: sourceID,
                             menuBarSourceTooltip: sourceTooltip,
                             staleness: { statusModel.cardStaleness(for: $0) },

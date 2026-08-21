@@ -15,6 +15,8 @@ import {
   activityBreakdownReport, attributionReport, costReport, exhaustionForecastReport,
 } from './usage-analytics.mjs';
 import { runProbeCli as runClaudeUsageProbe } from './adapters/claude-usage-probe.mjs';
+import { runProbeCli as runGrokUsageProbe } from './adapters/grok-usage-probe.mjs';
+import { GROK_SEA_PROBE_COMMAND } from './adapters/grok.mjs';
 import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from './adapters/claude-statusline.mjs';
 import { resetCalendarReport } from './capacity.mjs';
 import {
@@ -455,13 +457,17 @@ export function createApp({
       if (req.method === 'POST' && url.pathname === '/api/accounts') {
         const input = await body(req);
         const account = await ownedService.saveAccount(input);
-        return json(res, 201, { account });
+        return json(res, 201, { account: ownedService.accountForPublicResponse(account) });
       }
       const defaultMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/default$/);
       if (req.method === 'POST' && defaultMatch) {
         const account = ownedStore.getAccount(decodeURIComponent(defaultMatch[1]));
         if (!account) return json(res, 404, { error: 'account not found' });
-        return json(res, 200, { account: ownedService.setDefaultAccount(account.provider, account.id) });
+        return json(res, 200, {
+          account: ownedService.accountForPublicResponse(
+            ownedService.setDefaultAccount(account.provider, account.id),
+          ),
+        });
       }
       // Issue #8, step 2: the provider-owned login command for one account.
       // Read-only spec (same trust boundary as GET /api/launch) — the app
@@ -473,7 +479,7 @@ export function createApp({
         const spec = await ownedService.loginSpec(account.id);
         return json(res, 200, {
           provider: spec.provider,
-          account: spec.account,
+          account: ownedService.accountForPublicResponse(spec.account),
           command: spec.preview,
           // Issue #99: Claude specs carry the version-detected flow. With
           // requiresActivation the caller must activate this account BEFORE
@@ -489,7 +495,11 @@ export function createApp({
       if (req.method === 'POST' && verifyMatch) {
         const account = ownedStore.getAccount(decodeURIComponent(verifyMatch[1]));
         if (!account) return json(res, 404, { error: 'account not found' });
-        return json(res, 200, await ownedService.verifyAccount(account.id));
+        const verification = await ownedService.verifyAccount(account.id);
+        return json(res, 200, {
+          ...verification,
+          account: ownedService.accountForPublicResponse(verification.account),
+        });
       }
       // Issue #280: re-check a remembered Claude identity through the same
       // isolated, auth-status-only read used by renewal. This endpoint never
@@ -571,7 +581,11 @@ export function createApp({
       if (req.method === 'POST' && resetIdentityMatch) {
         const account = ownedStore.getAccount(decodeURIComponent(resetIdentityMatch[1]));
         if (!account) return json(res, 404, { error: 'account not found' });
-        return json(res, 200, { account: ownedService.resetClaudeIdentity(account.id) });
+        return json(res, 200, {
+          account: ownedService.accountForPublicResponse(
+            ownedService.resetClaudeIdentity(account.id),
+          ),
+        });
       }
       const renewMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/renew$/);
       if (req.method === 'POST' && renewMatch) {
@@ -588,7 +602,7 @@ export function createApp({
         const activated = await ownedService.activateAccount(id);
         const state = await ownedService.state();
         return json(res, 200, {
-          account: activated.account,
+          account: ownedService.accountForPublicResponse(activated.account),
           // Issue #66: pre-flip honesty — running Claude sessions launched
           // without the pinned env may lose session storage on this switch.
           warnings: activated.warnings,
@@ -611,7 +625,7 @@ export function createApp({
         return json(res, 200, {
           provider: spec.provider,
           project: spec.project,
-          account: spec.account,
+          account: ownedService.accountForPublicResponse(spec.account),
           command: spec.preview,
         });
       }
@@ -663,6 +677,13 @@ async function main() {
     // catch stamped it "ModelDeck failed to start:", which misread as a
     // daemon crash in every recorded per-account refresh error.
     const code = await runClaudeUsageProbe();
+    if (code !== 0) process.exitCode = code;
+    return;
+  }
+  if (isSea() && process.argv.includes(GROK_SEA_PROBE_COMMAND)) {
+    // Same contract as the Claude probe above: the probe owns its error
+    // reporting, so a probe failure never reads as a daemon start failure.
+    const code = await runGrokUsageProbe();
     if (code !== 0) process.exitCode = code;
     return;
   }

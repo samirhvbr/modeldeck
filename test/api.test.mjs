@@ -253,6 +253,101 @@ test('Claude identity reset clears provenance and can re-seed; other providers a
   assert.match(result.body.error, /only supported for claude/);
 });
 
+test('account responses never expose the internal Claude post-expiry guard', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+  const postExpiryGuardUntil = '2026-08-08T13:45:00.000Z';
+  const profileRef = path.join(fixture.service.claudeProfilesDir, 'guarded-response');
+  fs.mkdirSync(profileRef, { recursive: true, mode: 0o700 });
+
+  const storedAccount = fixture.store.saveAccount({
+    provider: 'claude',
+    label: 'Guarded response',
+    identity: 'guarded@example.invalid',
+    profileRef,
+    metadata: {
+      claudeRenewal: {
+        attempts: [],
+        postExpiryGuardUntil,
+      },
+    },
+  });
+  const responses = [];
+  let result = await request(fixture, '/api/accounts', {
+    method: 'POST',
+    body: JSON.stringify({
+      id: storedAccount.id,
+      provider: 'claude',
+      label: 'Guarded response',
+      identity: 'guarded@example.invalid',
+      profileRef,
+      metadata: {},
+    }),
+  });
+  assert.equal(result.response.status, 201);
+  responses.push(result.body.account);
+  const accountId = result.body.account.id;
+  assert.equal(
+    fixture.store.getAccount(accountId).metadata.claudeRenewal.postExpiryGuardUntil,
+    postExpiryGuardUntil,
+  );
+
+  result = await request(fixture, `/api/accounts/${accountId}/default`, { method: 'POST' });
+  assert.equal(result.response.status, 200);
+  responses.push(result.body.account);
+
+  result = await request(fixture, `/api/accounts/${accountId}/reset-identity`, { method: 'POST' });
+  assert.equal(result.response.status, 200);
+  responses.push(result.body.account);
+
+  const guardedAccount = () => fixture.store.getAccount(accountId);
+  fixture.service.loginSpec = async () => ({
+    provider: 'claude',
+    account: guardedAccount(),
+    preview: 'claude auth login',
+  });
+  result = await request(fixture, `/api/accounts/${accountId}/login`);
+  assert.equal(result.response.status, 200);
+  responses.push(result.body.account);
+
+  fixture.service.verifyAccount = async () => ({
+    account: guardedAccount(),
+    authenticated: true,
+    identity: 'guarded@example.invalid',
+  });
+  result = await request(fixture, `/api/accounts/${accountId}/verify`, { method: 'POST' });
+  assert.equal(result.response.status, 200);
+  responses.push(result.body.account);
+
+  fixture.service.activateAccount = async () => ({ account: guardedAccount(), warnings: [] });
+  fixture.service.state = async () => ({
+    activation: { claude: { state: 'identity-unverified' } },
+    claudeSecureStorage: { status: 'not-applicable' },
+  });
+  result = await request(fixture, `/api/accounts/${accountId}/activate`, { method: 'POST' });
+  assert.equal(result.response.status, 200);
+  responses.push(result.body.account);
+
+  fixture.service.launchSpec = async () => ({
+    provider: 'claude',
+    project: null,
+    account: guardedAccount(),
+    preview: 'claude',
+  });
+  result = await request(fixture, '/api/launch?provider=claude&project=%2Ffixture');
+  assert.equal(result.response.status, 200);
+  responses.push(result.body.account);
+
+  assert.equal(responses.length, 7);
+  for (const account of responses) {
+    assert.equal(Object.hasOwn(account.metadata.claudeRenewal, 'postExpiryGuardUntil'), false);
+  }
+  assert.equal(
+    fixture.store.getAccount(accountId).metadata.claudeRenewal.postExpiryGuardUntil,
+    postExpiryGuardUntil,
+  );
+});
+
 test('activates Claude and Codex accounts without changing defaults when provider switching fails', async (t) => {
   const fixture = await startFixture();
   t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
