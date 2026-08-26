@@ -1,0 +1,107 @@
+{
+  "accounts": [
+    { "id": "claude-placeholder-a", "provider": "claude", "enabled": true, "identity": "claude-a@example.invalid", "profileRef": "/fixture/claude-profiles/a" },
+    { "id": "claude-placeholder-b", "provider": "claude", "enabled": true, "identity": "claude-b@example.invalid", "profileRef": "/fixture/claude-profiles/b" },
+    { "id": "codex-placeholder-a", "provider": "codex", "enabled": true, "identity": "codex-a@example.invalid", "profileRef": "/fixture/codex-profiles/a" },
+    { "id": "codex-placeholder-b", "provider": "codex", "enabled": true, "identity": "codex-b@example.invalid", "profileRef": "/fixture/codex-profiles/b" }
+  ],
+  "installedCliVersions": {
+    "claude": { "status": "ok", "version": "2.1.223" },
+    "codex": { "status": "ok", "version": "0.87.0" }
+  },
+  "profileRoots": {
+    "claude": { "status": "ok", "path": "/fixture/claude-profiles", "isDirectory": true, "mode": 493, "ownedByCurrentUser": true },
+    "codex": { "status": "ok", "path": "/fixture/codex-profiles", "isDirectory": true, "mode": 448, "ownedByCurrentUser": true }
+  },
+  "claudeProfiles": [
+    {
+      "accountId": "claude-placeholder-a",
+      "path": "/fixture/claude-profiles/a",
+      "home": { "status": "ok", "path": "/fixture/claude-profiles/a", "isDirectory": true, "mode": 448, "ownedByCurrentUser": false },
+      "settings": {
+        "status": "ok",
+        "path": "/fixture/claude-profiles/a/settings.json",
+        "value": {
+          "apiKeyHelper": "/fixture/bin/placeholder-key-helper",
+          "env": {
+            "ANTHROPIC_API_KEY": "placeholder-api-key-not-a-secret",
+            "ANTHROPIC_BASE_URL": "https://proxy-other.example.invalid"
+          }
+        }
+      },
+      "claudeJson": { "status": "invalid", "path": "/fixture/claude-profiles/a/.claude.json", "reason": "not valid JSON" },
+      "memory": { "status": "ok", "path": "/fixture/claude-profiles/a/memory", "kind": "symlink", "target": "/fixture/wrong-shared/memory" }
+    },
+    {
+      "accountId": "claude-placeholder-b",
+      "path": "/fixture/claude-profiles/b",
+      "home": { "status": "ok", "path": "/fixture/claude-profiles/b", "isDirectory": true, "mode": 448, "ownedByCurrentUser": true },
+      "settings": { "status": "ok", "path": "/fixture/claude-profiles/b/settings.json", "value": { "env": {} } },
+      "claudeJson": { "status": "ok", "path": "/fixture/claude-profiles/b/.claude.json", "kind": "object", "regularFile": true },
+      "memory": { "status": "ok", "path": "/fixture/claude-profiles/b/memory", "kind": "symlink", "target": "/fixture/shared/memory" }
+    }
+  ],
+  "codexProfiles": [
+    {
+      "accountId": "codex-placeholder-a",
+      "path": "/fixture/codex-profiles/a",
+      "home": { "status": "ok", "path": "/fixture/codex-profiles/a", "isDirectory": true, "mode": 448, "ownedByCurrentUser": true },
+      "authAccountId": { "status": "ok", "path": "/fixture/codex-profiles/a/auth.json", "value": "acct-placeholder-shared" }
+    },
+    {
+      "accountId": "codex-placeholder-b",
+      "path": "/fixture/codex-profiles/b",
+      "home": { "status": "ok", "path": "/fixture/codex-profiles/b", "isDirectory": true, "mode": 448, "ownedByCurrentUser": true },
+      "authAccountId": { "status": "ok", "path": "/fixture/codex-profiles/b/auth.json", "value": "acct-placeholder-shared" }
+    }
+  ],
+  "activation": {
+    "claude": { "state": "ok", "path": "/fixture/active/.claude", "profilesDir": "/fixture/claude-profiles", "target": "/fixture/claude-profiles/a" },
+    "codex": { "state": "outside-managed-profiles", "path": "/fixture/active/.codex", "profilesDir": "/fixture/codex-profiles", "target": "/fixture/unmanaged/codex" }
+  },
+  "shell": {
+    "zshenv": { "status": "ok", "path": "/fixture/home/.zshenv", "hasClaudeBlock": false, "hasCodexBlock": false },
+    "claudeEnv": { "status": "ok", "path": "/fixture/data/claude-env.sh", "configDir": "/fixture/claude-profiles/b", "secureStorageConfigDir": "/fixture/claude-profiles/a" }
+  },
+  "proxy": {
+    "expectedOrigin": "http://127.0.0.1:8317",
+    "managed": true,
+    "roster": { "status": "ok", "accountIds": ["claude-placeholder-b", "codex-placeholder-a", "codex-placeholder-b"] },
+    "authFiles": {
+      "status": "ok",
+      "files": [
+        { "path": "/fixture/proxy/auth/claude-a.json", "provider": "claude", "identity": "claude-a@example.invalid", "weight": 50, "claimedAccountId": "claude-placeholder-a" },
+        { "path": "/fixture/proxy/auth/retired.json", "provider": "claude", "identity": "retired-placeholder@example.invalid", "weight": 15, "claimedAccountId": null }
+      ]
+    },
+    "managementKey": { "status": "ok", "path": "/fixture/proxy/.mgmt-key", "exists": false, "mode": null }
+  },
+  "sharedScope": {
+    "enabled": true,
+    "sharedMemoryDir": "/fixture/shared/memory",
+    "consistency": { "status": "ok", "issues": ["manifest names a profile with no backup"] }
+  },
+  "pathExecutables": {
+    "status": "ok",
+    "items": [
+      { "path": "/fixture/bin-a/claude", "realpath": "/fixture/bin-a/claude", "version": "2.1.223" },
+      { "path": "/fixture/bin-b/claude", "realpath": "/fixture/bin-b/claude", "version": "2.1.224" }
+    ]
+  },
+  "launchd": {
+    "daemon": { "status": "ok", "label": "ai.hermes.modeldeck", "state": "spawn-failed", "lastExitCode": 78, "needsLwcrUpdate": true }
+  },
+  "runtimeOverrides": {
+    "status": "ok",
+    "active": {
+      "MODELDECK_CLIPROXY_CONFIG_DIR": "/fixture/proxy-a",
+      "MODELDECK_CLIPROXY_AUTH_DIR": "/fixture/proxy-b/auth"
+    },
+    "splits": [
+      { "config": "MODELDECK_CLIPROXY_CONFIG_DIR", "auth": "MODELDECK_CLIPROXY_AUTH_DIR", "configPath": "/fixture/proxy-a", "authPath": "/fixture/proxy-b/auth" }
+    ]
+  },
+  "daemonFacts": {
+    "duplicateClaudeAccountIds": { "status": "ok", "value": ["claude-placeholder-a", "claude-placeholder-b"] }
+  }
+}

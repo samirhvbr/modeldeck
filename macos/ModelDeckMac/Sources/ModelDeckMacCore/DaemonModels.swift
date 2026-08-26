@@ -1095,12 +1095,24 @@ public struct AccountCreate: Codable, Equatable, Sendable {
     public var label: String
     public var purpose: String
     public var color: String?
+    /// Issue #560: the existing grok CLI home this subscription watches.
+    /// Set ONLY for Grok, where the folder already exists and ModelDeck
+    /// creates nothing (decision 0035). Nil is omitted from the payload, so
+    /// the Claude/Codex create is byte-identical to before.
+    public var profileRef: String?
 
-    public init(provider: String, label: String, purpose: String, color: String? = nil) {
+    public init(
+        provider: String,
+        label: String,
+        purpose: String,
+        color: String? = nil,
+        profileRef: String? = nil
+    ) {
         self.provider = provider
         self.label = label
         self.purpose = purpose
         self.color = color
+        self.profileRef = profileRef
     }
 }
 

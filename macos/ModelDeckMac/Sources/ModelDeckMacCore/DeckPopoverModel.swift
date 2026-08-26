@@ -38,10 +38,12 @@ public enum DeckProvider: String, CaseIterable, Equatable, Sendable {
     }
 
     /// Providers the add-account flow can actually walk someone through.
-    /// That flow creates an owner-only profile home and hands off to the
-    /// provider's own sign-in; neither step exists for Grok yet, so offering
-    /// it in the picker would be a dead end.
-    public static let addableCases: [DeckProvider] = [.claude, .codex]
+    /// Claude and Codex get an owner-only profile home plus a hand-off to the
+    /// provider's sign-in. Grok has neither (the grok CLI owns `~/.grok` and
+    /// its own auth, decision 0035), so issue #560 gave it the honest
+    /// alternative: point ModelDeck at the grok home that already exists,
+    /// read-only. Same picker, different second half.
+    public static let addableCases: [DeckProvider] = [.claude, .codex, .grok]
 
     /// Whether this provider's column carries an Availability Health chip.
     ///

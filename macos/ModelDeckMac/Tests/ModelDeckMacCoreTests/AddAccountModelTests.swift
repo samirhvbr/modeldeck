@@ -19,6 +19,9 @@ final class StubOnboardingBackend: AccountOnboarding, LoginLaunching, DeckStateP
     /// failure path (issue #99, CodeRabbit PR #106).
     var stateError: Error?
     var verification: AccountVerification?
+    /// Issue #560: what discovery reports for the Grok flow.
+    var grokCandidate: GrokHomeCandidate?
+    var grokCandidateError: Error?
     /// Issue #99: nil keeps the legacy env-scoped spec; set to exercise the
     /// activation-driven flow.
     var loginResult: LoginCommand?
@@ -31,9 +34,18 @@ final class StubOnboardingBackend: AccountOnboarding, LoginLaunching, DeckStateP
     private(set) var deletedIDs: [String] = []
     private(set) var stateReads = 0
     private(set) var activatedIDs: [String] = []
+    private(set) var grokCandidateRequests: [String?] = []
+    /// Issue #560 fix round 1: lets a test hold a connect open at its first
+    /// daemon call so cancel/reset can happen mid-flight.
+    var beforeCreate: (@Sendable () async -> Void)?
+    private(set) var createStarted = false
 
     func createAccount(_ create: AccountCreate) async throws -> DeckAccount {
-        try locked {
+        if let beforeCreate {
+            locked { createStarted = true }
+            await beforeCreate()
+        }
+        return try locked {
             created.append(create)
             if let createError { throw createError }
             return DeckAccount(
@@ -42,8 +54,17 @@ final class StubOnboardingBackend: AccountOnboarding, LoginLaunching, DeckStateP
                 label: create.label,
                 purpose: create.purpose,
                 color: create.color,
-                profileRef: "/profiles/\(create.label.lowercased())"
+                profileRef: create.profileRef ?? "/profiles/\(create.label.lowercased())"
             )
+        }
+    }
+
+    func grokHomeCandidate(path: String?) async throws -> GrokHomeCandidate {
+        try locked {
+            grokCandidateRequests.append(path)
+            if let grokCandidateError { throw grokCandidateError }
+            guard let grokCandidate else { throw DaemonClientError.invalidResponse }
+            return grokCandidate
         }
     }
 

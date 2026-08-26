@@ -26,6 +26,9 @@ import {
 import { RETRY_STORM, retryStormDetector } from '../src/rate-pathologies.mjs';
 
 const DETECTED_AT = '2026-08-17T23:00:00.000Z';
+// The page's pinned clock (bootPage `now`): the fixtures above are fixed
+// dates, so the page must not query a wall-clock window they age out of.
+const PAGE_NOW = '2026-08-18T12:00:00.000Z';
 
 function receiptFinding(sessions) {
   return {
@@ -63,7 +66,7 @@ async function openReceipt(t, store, port) {
     port,
     mutationToken: 'attribution-dashboard-token-placeholder',
   });
-  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: `127.0.0.1:${port}` });
+  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: `127.0.0.1:${port}`, now: PAGE_NOW });
   t.after(() => dom.window.close());
   const page = dom.window.document;
   await waitFor(() => page.querySelector('.finding-row'), 'the finding row to render', { timeoutMs: 1_500 });

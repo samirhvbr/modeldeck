@@ -13,18 +13,28 @@ function jsonObject(value) {
 
 function skipWhitespace(source, offset) {
   let cursor = offset;
-  while (/\s/.test(source[cursor] || '')) cursor += 1;
+  while (/[ \t\r\n]/.test(source[cursor] || '')) cursor += 1;
   return cursor;
 }
 
 function stringEnd(source, offset) {
   if (source[offset] !== '"') throw new Error('expected a JSON string');
-  let escaped = false;
   for (let cursor = offset + 1; cursor < source.length; cursor += 1) {
     const character = source[cursor];
-    if (escaped) escaped = false;
-    else if (character === '\\') escaped = true;
-    else if (character === '"') return cursor + 1;
+    if (character === '"') return cursor + 1;
+    if (character === '\\') {
+      const escape = source[cursor + 1];
+      if ('"\\/bfnrt'.includes(escape)) {
+        cursor += 1;
+        continue;
+      }
+      if (escape === 'u' && /^[0-9a-fA-F]{4}$/.test(source.slice(cursor + 2, cursor + 6))) {
+        cursor += 5;
+        continue;
+      }
+      throw new Error('invalid JSON string escape');
+    }
+    if (character.charCodeAt(0) < 0x20) throw new Error('invalid control character in JSON string');
   }
   throw new Error('unterminated JSON string');
 }
@@ -32,32 +42,50 @@ function stringEnd(source, offset) {
 function valueEnd(source, offset) {
   const first = source[offset];
   if (first === '"') return stringEnd(source, offset);
-  if (first === '{' || first === '[') {
-    const open = first;
-    const close = open === '{' ? '}' : ']';
-    let depth = 0;
-    for (let cursor = offset; cursor < source.length; cursor += 1) {
-      const character = source[cursor];
-      if (character === '"') {
-        cursor = stringEnd(source, cursor) - 1;
-        continue;
-      }
-      if (character === open) depth += 1;
-      else if (character === close && --depth === 0) return cursor + 1;
+  if (first === '{') {
+    let cursor = skipWhitespace(source, offset + 1);
+    if (source[cursor] === '}') return cursor + 1;
+    while (cursor < source.length) {
+      cursor = stringEnd(source, cursor);
+      cursor = skipWhitespace(source, cursor);
+      if (source[cursor] !== ':') throw new Error('invalid JSON object property');
+      cursor = skipWhitespace(source, cursor + 1);
+      cursor = valueEnd(source, cursor);
+      cursor = skipWhitespace(source, cursor);
+      if (source[cursor] === '}') return cursor + 1;
+      if (source[cursor] !== ',') throw new Error('invalid JSON object');
+      cursor = skipWhitespace(source, cursor + 1);
+      if (source[cursor] === '}') throw new Error('trailing comma in JSON object');
     }
-    throw new Error('unterminated JSON value');
+    throw new Error('unterminated JSON object');
   }
-  let cursor = offset;
-  while (cursor < source.length && !/[\s,}]/.test(source[cursor])) cursor += 1;
-  return cursor;
+  if (first === '[') {
+    let cursor = skipWhitespace(source, offset + 1);
+    if (source[cursor] === ']') return cursor + 1;
+    while (cursor < source.length) {
+      cursor = valueEnd(source, cursor);
+      cursor = skipWhitespace(source, cursor);
+      if (source[cursor] === ']') return cursor + 1;
+      if (source[cursor] !== ',') throw new Error('invalid JSON array');
+      cursor = skipWhitespace(source, cursor + 1);
+      if (source[cursor] === ']') throw new Error('trailing comma in JSON array');
+    }
+    throw new Error('unterminated JSON array');
+  }
+  for (const literal of ['true', 'false', 'null']) {
+    if (source.startsWith(literal, offset)) return offset + literal.length;
+  }
+  const number = source.slice(offset).match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/);
+  if (number) return offset + number[0].length;
+  throw new Error('invalid JSON value');
 }
 
 // Return byte offsets for top-level JSON object properties. This deliberately
 // does not stringify the whole document: .claude.json owns OAuth/account
 // state whose bytes are outside ModelDeck's sharing boundary.
-function topLevelObject(source) {
-  let cursor = skipWhitespace(source, 0);
-  if (source[cursor] !== '{') throw new Error('.claude.json must contain a JSON object');
+function topLevelObject(source, offset = 0) {
+  let cursor = skipWhitespace(source, offset);
+  if (source[cursor] !== '{') throw new Error('expected a JSON object');
   const open = cursor;
   cursor += 1;
   const properties = [];
@@ -75,12 +103,36 @@ function topLevelObject(source) {
     properties.push({ key, start, end });
     cursor = skipWhitespace(source, end);
     if (source[cursor] === ',') {
-      cursor += 1;
+      cursor = skipWhitespace(source, cursor + 1);
+      if (source[cursor] === '}') throw new Error('trailing comma in top-level JSON object');
       continue;
     }
     if (source[cursor] === '}') return { open, close: cursor, properties };
     throw new Error('invalid top-level JSON object');
   }
+}
+
+// Return keys and byte offsets for one JSON object without materializing any
+// property values. The caller decides which approved value slices, if any, it
+// is allowed to decode.
+export function inspectJsonObjectAt(source, offset = 0) {
+  return topLevelObject(source, offset);
+}
+
+export function inspectJsonObjectDocument(source) {
+  const object = inspectJsonObjectAt(source);
+  if (skipWhitespace(source, object.close + 1) !== source.length) {
+    throw new Error('invalid content after JSON object');
+  }
+  return object;
+}
+
+// Read only the top-level JSON structure. Callers that do not own Claude's
+// OAuth/account fields can validate the document without parsing those
+// property values into an object or copying them into their output.
+export function inspectTopLevelJsonObject(source) {
+  inspectJsonObjectDocument(source);
+  return { kind: 'object' };
 }
 
 export function replaceTopLevelJsonProperty(source, key, value) {

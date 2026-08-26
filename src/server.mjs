@@ -20,11 +20,11 @@ import { GROK_SEA_PROBE_COMMAND } from './adapters/grok.mjs';
 import { runStatuslineCli as runClaudeStatusline, STATUSLINE_SEA_COMMAND } from './adapters/claude-statusline.mjs';
 import { resetCalendarReport } from './capacity.mjs';
 import {
-  HOST, PORT, DB_PATH, DAEMON_ERROR_LOG_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
+  HOST, PORT, DB_PATH, DATA_DIR, DAEMON_ERROR_LOG_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
   CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
   GROK_SESSIONS_DIR,
   CLIPROXY_AUTH_DIR, CLIPROXY_BIN, CLIPROXY_BASE_URL, CLIPROXY_CONFIG_DIR,
-  CLIPROXY_MANAGEMENT_KEY_PATH, LANE_MANIFEST_PATH,
+  CLIPROXY_MANAGEMENT_KEY_PATH, LANE_MANIFEST_PATH, LAUNCHCTL_PATH, ZSHENV_PATH,
 } from './paths.mjs';
 
 // esbuild replaces the build-only identifier with a string literal for SEA;
@@ -148,6 +148,11 @@ export function createApp({
     cliproxyBaseUrl: CLIPROXY_BASE_URL,
     cliproxyManagementKeyPath: CLIPROXY_MANAGEMENT_KEY_PATH,
     daemonGitCommit: GIT_COMMIT,
+    dataDir: DATA_DIR,
+    dbPath: DB_PATH,
+    zshenvPath: ZSHENV_PATH,
+    launchctlPath: LAUNCHCTL_PATH,
+    configLintEnabled: true,
     // DEMO/DEV ONLY (issue #129): seeded fixture snapshots are authoritative —
     // provider refresh becomes a no-op and its scheduler never arms. Local
     // database maintenance remains independent. Set only by demo-daemon.sh.
@@ -202,6 +207,12 @@ export function createApp({
         return json(res, 200, { ok: true, name: 'ModelDeck', version: VERSION, MDGitCommit: GIT_COMMIT, tokenSource, projectsRoot: ownedService.projectsRoot });
       }
       if (req.method === 'GET' && url.pathname === '/api/state') return json(res, 200, await ownedService.state());
+      if (req.method === 'GET' && url.pathname === '/api/config-lint') {
+        return json(res, 200, ownedService.configLintStatus());
+      }
+      if (req.method === 'POST' && url.pathname === '/api/config-lint/run') {
+        return json(res, 200, await ownedService.runConfigLint());
+      }
       // Issue #432: the app owns the proxy process, so it reports lifecycle
       // facts through the same token-gated mutation boundary as every other
       // app write. The service keeps only the last report in memory.
@@ -454,6 +465,12 @@ export function createApp({
         const input = await body(req);
         return json(res, 200, { projects: ownedService.scanProjects(input.root || ownedService.projectsRoot) });
       }
+      if (req.method === 'GET' && url.pathname === '/api/grok/home-candidate') {
+        if (!mutationAllowed(req, host, actualPort, sessionToken)) {
+          return json(res, 403, { error: 'mutation token or origin rejected' });
+        }
+        return json(res, 200, await ownedService.grokHomeCandidate(url.searchParams.get('path')));
+      }
       if (req.method === 'POST' && url.pathname === '/api/accounts') {
         const input = await body(req);
         const account = await ownedService.saveAccount(input);
@@ -651,6 +668,9 @@ export function createApp({
         // when auto-refresh is disabled or the daemon serves demo fixtures.
         ownedService.startUsageSnapshotRetention?.();
         ownedService.startUsageQueueConsumer?.();
+        void ownedService.startConfigLint?.()?.catch((error) => {
+          console.error(`[modeldeck] config lint startup failed: ${error?.message || error}`);
+        });
         void ownedService.startWarehouseIngest?.()?.catch((error) => {
           console.error(`[modeldeck] warehouse ingest startup failed: ${error?.message || error}`);
         });
@@ -664,6 +684,7 @@ export function createApp({
         ownedService.stopUsageSnapshotRetention?.() || Promise.resolve(),
         ownedService.stopUsageQueueConsumer?.() || Promise.resolve(),
         ownedService.stopWarehouseIngest?.() || Promise.resolve(),
+        ownedService.stopConfigLint?.() || Promise.resolve(),
         new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
       ]);
     },

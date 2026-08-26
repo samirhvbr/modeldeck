@@ -23,6 +23,11 @@ const fixture = JSON.parse(fs.readFileSync(
   'utf8',
 ));
 
+// The page's pinned clock (bootPage `now`): every render test here seeds
+// fixed 2026-08-17 fixtures, so the page must not query a wall-clock window
+// they age out of.
+const PAGE_NOW = '2026-08-18T12:00:00.000Z';
+
 function seedSession(store, session) {
   if (session.provider === 'claude') {
     store.ingestTranscriptBatch({
@@ -593,7 +598,7 @@ test('dashboard renders one minimal finding row and clicks through to its receip
     port,
     mutationToken: 'diagnostician-dashboard-token-placeholder',
   });
-  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: `127.0.0.1:${port}` });
+  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: `127.0.0.1:${port}`, now: PAGE_NOW });
   t.after(() => dom.window.close());
   const page = dom.window.document;
 
@@ -658,7 +663,7 @@ test('TRIPWIRE: dashboard rate receipt names the measured window and tokens burn
     port,
     mutationToken: 'rate-dashboard-token-placeholder',
   });
-  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: `127.0.0.1:${port}` });
+  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: `127.0.0.1:${port}`, now: PAGE_NOW });
   t.after(() => dom.window.close());
   const page = dom.window.document;
 
@@ -726,7 +731,7 @@ test('dashboard receipt ignores malformed sessions and distinguishes profile ide
     port: 43500,
     mutationToken: 'diagnostician-malformed-token-placeholder',
   });
-  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: '127.0.0.1:43500' });
+  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: '127.0.0.1:43500', now: PAGE_NOW });
   t.after(() => dom.window.close());
   const page = dom.window.document;
 
@@ -752,7 +757,7 @@ test('dashboard receipt progressively reveals large affected-session lists', asy
     port: 43501,
     mutationToken: 'diagnostician-progressive-token-placeholder',
   });
-  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: '127.0.0.1:43501' });
+  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: '127.0.0.1:43501', now: PAGE_NOW });
   t.after(() => dom.window.close());
   const page = dom.window.document;
 
@@ -779,7 +784,7 @@ test('dashboard finding disclosure keeps a valid control relationship and readab
     port: 43502,
     mutationToken: 'diagnostician-accessibility-token-placeholder',
   });
-  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: '127.0.0.1:43502' });
+  const dom = bootPage(DASHBOARD_APP_HTML, app, { host: '127.0.0.1:43502', now: PAGE_NOW });
   t.after(() => dom.window.close());
   const page = dom.window.document;
 

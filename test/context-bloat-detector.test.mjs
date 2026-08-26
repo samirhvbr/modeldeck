@@ -295,6 +295,9 @@ test('dashboard names measured context bloat, shows week share, and drills into 
   const dom = bootPage(DASHBOARD_APP_HTML, app, {
     host: '127.0.0.1:43503',
     hash: `#route=${route}`,
+    // Pin the page clock beside the fixture's fixed dates, or the 7-day
+    // window walks past them and the row stops rendering.
+    now: '2026-08-18T12:00:00.000Z',
   });
   t.after(() => dom.window.close());
   const page = dom.window.document;

@@ -90,7 +90,7 @@ export function installDom({ width = 1040, height = 340, hash = '' } = {}) {
  * an empty page in a browser and passes every source-level test.
  */
 export function bootPage(
-  html, app, { width = 1040, height = 340, host = '127.0.0.1:3867', hash = '' } = {},
+  html, app, { width = 1040, height = 340, host = '127.0.0.1:3867', hash = '', now = null } = {},
 ) {
   const dom = new JSDOM(html, {
     // jsdom does not execute <script type="module">, so the page's own script is
@@ -116,6 +116,25 @@ export function bootPage(
         disconnect() {}
       };
       window.fetch = requestThrough(app, host);
+      // `now` pins the page's clock. The page derives its query window from
+      // `new Date()` (boundsFor), so a test seeding fixed-date fixtures MUST
+      // pin the clock beside them — seeded against the wall clock instead,
+      // the fixtures age out of the window and the test starts failing the
+      // day they do (the 2026-08-24 breakage). Pinning also makes the revert
+      // loud: an unpinned page filters those same stale fixtures out
+      // immediately, not next week.
+      if (now != null) {
+        const fixedNow = new Date(now).getTime();
+        const PageDate = window.Date;
+        window.Date = class extends PageDate {
+          constructor(...args) {
+            if (args.length === 0) super(fixedNow);
+            else super(...args);
+          }
+
+          static now() { return fixedNow; }
+        };
+      }
     },
   });
   const scripts = [...dom.window.document.querySelectorAll('script')];

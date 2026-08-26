@@ -127,22 +127,53 @@ export function grokProfileEnv(grokHome, sourceEnv = process.env) {
 /// on the maintainer's machine). World-READABLE is the grok CLI's own choice
 /// and discloses nothing — the secret is already owner-only — so demanding
 /// 0700 would refuse every stock install and buy nothing against planting.
-export async function assertGrokHomeDirectory(grokHome, { lstat = fs.promises.lstat } = {}) {
-  const homeStat = await lstat(grokHome).catch((error) => {
-    if (error.code === 'ENOENT') throw new Error(`Grok profile home does not exist: ${grokHome}`);
-    throw error;
-  });
-  if (!homeStat.isDirectory() || homeStat.isSymbolicLink()) {
+export async function inspectGrokHomeDirectory(grokHome, {
+  lstat = fs.promises.lstat,
+  uid = process.getuid?.(),
+} = {}) {
+  let homeStat;
+  try {
+    homeStat = await lstat(grokHome);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    return {
+      exists: false,
+      isDirectory: false,
+      ownedByCurrentUser: false,
+      writableByOthers: false,
+      permissionsOk: false,
+    };
+  }
+  const isDirectory = homeStat.isDirectory() && !homeStat.isSymbolicLink();
+  const ownedByCurrentUser = uid == null || homeStat.uid === uid;
+  const writableByOthers = (homeStat.mode & 0o022) !== 0;
+  return {
+    exists: true,
+    isDirectory,
+    ownedByCurrentUser,
+    writableByOthers,
+    permissionsOk: isDirectory && ownedByCurrentUser && !writableByOthers,
+  };
+}
+
+export async function assertGrokHomeDirectory(grokHome, {
+  lstat = fs.promises.lstat,
+  inspection = null,
+} = {}) {
+  const inspected = inspection || await inspectGrokHomeDirectory(grokHome, { lstat });
+  if (!inspected.exists) throw new Error(`Grok profile home does not exist: ${grokHome}`);
+  if (!inspected.isDirectory) {
     throw new Error(`Grok profile home must be a directory: ${grokHome}`);
   }
-  if (process.getuid && homeStat.uid !== process.getuid()) {
+  if (!inspected.ownedByCurrentUser) {
     throw new Error('Grok profile home must be owned by the current user');
   }
-  if ((homeStat.mode & 0o022) !== 0) {
+  if (inspected.writableByOthers) {
     throw new Error(
       `Grok profile home must not be writable by anyone else (chmod g-w,o-w ${grokHome})`,
     );
   }
+  return inspected;
 }
 
 /// The full gate: a home nobody else can write, holding a credential that is

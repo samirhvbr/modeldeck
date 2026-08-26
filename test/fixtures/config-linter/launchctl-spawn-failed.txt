@@ -1,0 +1,39 @@
+gui/501/ai.hermes.modeldeck = {
+	active count = 0
+	path = /Users/placeholder/Library/LaunchAgents/ai.hermes.modeldeck.plist
+	type = LaunchAgent
+	state = spawn failed
+
+	program = /Applications/ModelDeck.app/Contents/MacOS/modeldeck-daemon
+	arguments = {
+		/Applications/ModelDeck.app/Contents/MacOS/modeldeck-daemon
+	}
+
+	domain = gui/501 [100004]
+	asid = 100004
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 12
+	last exit code = 78
+
+	event triggers = {
+		com.apple.launchd.placeholder = {
+			stream = com.apple.launchd.placeholder
+			monitor = com.apple.UserEventAgent-Aqua
+			descriptor = {
+				"State" => "Foreground"
+			}
+			state = active
+		}
+	}
+
+	endpoints = {
+		"com.apple.placeholder" = {
+			port = 0x0
+			active = 0
+			state = active
+		}
+	}
+
+	properties = inferred program | needs LWCR update
+}

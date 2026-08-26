@@ -1,0 +1,7 @@
+{
+  "oauthAccount": {
+    "emailAddress": "claude-a@example.invalid",
+    "placeholderToken": "placeholder-secret-bytes-must-not-surface"
+  },
+  "mcpServers": {}
+}

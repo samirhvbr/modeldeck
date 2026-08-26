@@ -95,6 +95,22 @@ test('a recognized identity makes pool state knowable even without a valid weigh
   assert.ok(!('proxyWeight' in absent));
 });
 
+test('whitespace-only credential strings do not establish proxy membership', async (t) => {
+  const fixture = makeFixture({
+    authFiles: {
+      'claude-whitespace.json': JSON.stringify({
+        type: 'claude', email: 'tim@example.com', weight: 4, access_token: ' \n\t',
+      }),
+    },
+  });
+  t.after(() => cleanup(fixture));
+
+  const accounts = await fixture.service.accountsWithAuthState();
+  const claude = accounts.find((account) => account.provider === 'claude');
+  assert.equal(claude.proxyPool, 'absent');
+  assert.equal(claude.proxyWeight, undefined);
+});
+
 test('codex accounts join by the remembered tokens.account_id identifier', async (t) => {
   const fixture = makeFixture({
     authFiles: {

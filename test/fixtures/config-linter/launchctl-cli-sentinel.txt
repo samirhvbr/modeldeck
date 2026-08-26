@@ -1,0 +1,6 @@
+gui/501/ai.hermes.modeldeck = {
+	type = LaunchAgent
+	state = spawn failed
+	last exit code = 77
+	properties = needs LWCR update
+}

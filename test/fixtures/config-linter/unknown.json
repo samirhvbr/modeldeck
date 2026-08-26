@@ -1,0 +1,67 @@
+{
+  "accounts": [
+    { "id": "claude-placeholder-a", "provider": "claude", "enabled": true, "identity": "claude-a@example.invalid", "profileRef": "/fixture/claude-profiles/a" },
+    { "id": "codex-placeholder-a", "provider": "codex", "enabled": true, "identity": "codex-a@example.invalid", "profileRef": "/fixture/codex-profiles/a" },
+    { "id": "codex-placeholder-b", "provider": "codex", "enabled": true, "identity": "codex-b@example.invalid", "profileRef": "/fixture/codex-profiles/b" }
+  ],
+  "installedCliVersions": {
+    "claude": { "status": "unknown", "reason": "daemon has not detected a Claude version" },
+    "codex": { "status": "unknown", "reason": "daemon has not detected a Codex version" }
+  },
+  "profileRoots": {
+    "claude": { "status": "unknown", "path": "/fixture/claude-profiles", "reason": "permission denied" },
+    "codex": { "status": "unknown", "path": "/fixture/codex-profiles", "reason": "permission denied" }
+  },
+  "claudeProfiles": [
+    {
+      "accountId": "claude-placeholder-a",
+      "path": "/fixture/claude-profiles/a",
+      "home": { "status": "unknown", "path": "/fixture/claude-profiles/a", "reason": "permission denied" },
+      "settings": { "status": "unknown", "path": "/fixture/claude-profiles/a/settings.json", "reason": "permission denied" },
+      "claudeJson": { "status": "unknown", "path": "/fixture/claude-profiles/a/.claude.json", "reason": "permission denied" },
+      "memory": { "status": "unknown", "path": "/fixture/claude-profiles/a/memory", "reason": "permission denied" }
+    }
+  ],
+  "codexProfiles": [
+    {
+      "accountId": "codex-placeholder-a",
+      "path": "/fixture/codex-profiles/a",
+      "home": { "status": "unknown", "path": "/fixture/codex-profiles/a", "reason": "permission denied" },
+      "authAccountId": { "status": "unknown", "path": "/fixture/codex-profiles/a/auth.json", "reason": "permission denied" }
+    },
+    {
+      "accountId": "codex-placeholder-b",
+      "path": "/fixture/codex-profiles/b",
+      "home": { "status": "unknown", "path": "/fixture/codex-profiles/b", "reason": "permission denied" },
+      "authAccountId": { "status": "unknown", "path": "/fixture/codex-profiles/b/auth.json", "reason": "permission denied" }
+    }
+  ],
+  "activation": {
+    "claude": { "state": "unknown", "path": "/fixture/active/.claude", "profilesDir": "/fixture/claude-profiles", "reason": "permission denied" },
+    "codex": { "state": "unknown", "path": "/fixture/active/.codex", "profilesDir": "/fixture/codex-profiles", "reason": "permission denied" }
+  },
+  "shell": {
+    "zshenv": { "status": "unknown", "path": "/fixture/home/.zshenv", "reason": "permission denied" },
+    "claudeEnv": { "status": "unknown", "path": "/fixture/data/claude-env.sh", "reason": "permission denied" }
+  },
+  "proxy": {
+    "expectedOrigin": "http://127.0.0.1:8317",
+    "managed": true,
+    "roster": { "status": "unknown", "reason": "daemon roster unavailable" },
+    "authFiles": { "status": "unknown", "path": "/fixture/proxy/auth", "reason": "permission denied" },
+    "managementKey": { "status": "unknown", "path": "/fixture/proxy/.mgmt-key", "reason": "permission denied" }
+  },
+  "sharedScope": {
+    "enabled": true,
+    "sharedMemoryDir": "/fixture/shared/memory",
+    "consistency": { "status": "unknown", "reason": "manifest unreadable" }
+  },
+  "pathExecutables": { "status": "unknown", "reason": "PATH unavailable" },
+  "launchd": {
+    "daemon": { "status": "unknown", "label": "ai.hermes.modeldeck", "reason": "launchctl unavailable" }
+  },
+  "runtimeOverrides": { "status": "unknown", "reason": "daemon environment unavailable" },
+  "daemonFacts": {
+    "duplicateClaudeAccountIds": { "status": "unknown", "reason": "no completed Claude refresh" }
+  }
+}

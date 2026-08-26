@@ -30,6 +30,10 @@ export const CLAUDE_PROFILES_DIR = path.resolve(
 export const CLAUDE_ACTIVE_LINK = path.resolve(
   process.env.MODELDECK_CLAUDE_ACTIVE_LINK || path.join(os.homedir(), '.claude'),
 );
+export const ZSHENV_PATH = path.resolve(
+  process.env.MODELDECK_ZSHENV_PATH || path.join(os.homedir(), '.zshenv'),
+);
+export const LAUNCHCTL_PATH = process.env.MODELDECK_LAUNCHCTL_PATH || '/bin/launchctl';
 // Issue #66: shell snippet the install-shell-env.sh block sources so new
 // terminal sessions launch pinned to the active profile real path. The
 // generated ~/.zshenv block honors the same MODELDECK_CLAUDE_SHELL_ENV_FILE

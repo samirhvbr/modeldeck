@@ -208,12 +208,14 @@ struct Decision0035GrokColumnTests {
         #expect(DeckBuilder.providerRank(.grok) < DeckBuilder.providerRank(nil))
     }
 
-    /// The add-account flow builds an owner-only profile home and hands off to
-    /// the provider's sign-in; neither exists for Grok, so the picker must not
-    /// offer it.
-    @Test func addAccountPickerDoesNotOfferGrok() {
-        #expect(!DeckProvider.addableCases.contains(.grok))
-        #expect(DeckProvider.addableCases == [.claude, .codex])
+    /// Issue #560 gave Grok its own add flow (connect an existing grok CLI
+    /// home, read-only), so the picker offers it. Tim's ruling kept the deck
+    /// itself unchanged: being addable must NOT earn Grok the empty
+    /// add-account column Claude and Codex get.
+    @Test func addAccountPickerOffersGrokWithoutGivingItAnEmptyColumn() {
+        #expect(DeckProvider.addableCases == [.claude, .codex, .grok])
+        let columns = DeckBuilder.columns(state: DeckState(), sortOrder: .nextReset, now: now)
+        #expect(!columns.contains { $0.provider == .grok })
     }
 
     // MARK: Window copy

@@ -45,7 +45,13 @@ scripts/release-dmg.sh --check-only # repository guard + release checks; no cred
 ```
 
 Output: `dist/ModelDeck-<version>.dmg` (gitignored). The version comes
-from the `VERSION` file at the repo root (bump `package.json` version in the same commit — the daemon inlines ITS version from package.json, and release-checks fails if the two disagree) — the release-tag authority
+from the `VERSION` file at the repo root (bump `package.json` **and
+`package-lock.json`** versions in the same commit — the daemon inlines ITS
+version from package.json, release-checks fails if VERSION and package.json
+disagree, and a stale lock gets rewritten by `npm install` in the pristine
+worktree, which the repository guard then rejects as a dirty tree; the 1.1.5
+release hit exactly that. `npm install --package-lock-only` after editing
+package.json updates the lock's two version fields) — the release-tag authority
 documented in `macos/ModelDeckMac/Sources/ModelDeckMacCore/AppVersion.swift`.
 Bump `VERSION` first; the script stamps it into the app bundle's
 `CFBundleShortVersionString` at build time (`CFBundleVersion` is the repo
@@ -272,6 +278,31 @@ Sparkle `SUFeedURL` both point. All three assets are required:
   `releases/latest/download/ModelDeck.dmg`, which resolves only while
   **every** release ships an asset with that exact name. Omitting it
   silently breaks the website's fallback download for the release.
+
+## Homebrew tap bump
+
+After publishing, update the cask in the tap repo
+(`timharris707/homebrew-modeldeck`) so `brew install --cask
+timharris707/modeldeck/modeldeck` serves the new version. The cask needs
+two edits: the `version` line and the `sha256` of the **versioned** DMG.
+
+```sh
+VERSION="$(cat VERSION)"
+SHA256="$(shasum -a 256 "dist/ModelDeck-$VERSION.dmg" | cut -d' ' -f1)"
+TAP_DIR="$(mktemp -d)/homebrew-modeldeck"
+git clone https://github.com/timharris707/homebrew-modeldeck "$TAP_DIR"
+cd "$TAP_DIR"
+sed -i '' -e "s/^  version .*/  version \"$VERSION\"/" \
+  -e "s/^  sha256 .*/  sha256 \"$SHA256\"/" Casks/modeldeck.rb
+brew style . && brew audit --cask --online Casks/modeldeck.rb
+git commit -am "modeldeck $VERSION" && git push
+cd - && rm -rf "$(dirname "$TAP_DIR")"
+```
+
+The audit step downloads the published DMG and verifies the checksum, so
+run it only after the release assets are live. The cask is marked
+`auto_updates` (Sparkle owns upgrades), so a missed bump doesn't strand
+brew users on an old build — but the bump is still part of every release.
 
 ## Syncing the public mirror
 

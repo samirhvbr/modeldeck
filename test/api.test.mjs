@@ -12,11 +12,14 @@ import {
 } from '../src/service.mjs';
 import { createApp } from '../src/server.mjs';
 
-async function startFixture(serviceOptions = {}) {
+const API_MUTATION_TOKEN = 'api-mutation-token-placeholder';
+
+async function startFixture(serviceOptions = {}, { listen = true } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-api-'));
   const projectsRoot = path.join(root, 'projects');
   const codexHome = path.join(root, 'profiles', 'work');
   const claudeHome = path.join(root, 'claude-profiles', 'work');
+  const grokHome = path.join(root, '.grok');
   const codexActiveLink = path.join(root, 'active', '.codex');
   const claudeActiveLink = path.join(root, 'active', '.claude');
   fs.mkdirSync(path.join(projectsRoot, 'loanmeld'), { recursive: true });
@@ -33,6 +36,7 @@ async function startFixture(serviceOptions = {}) {
     claudeActiveLink,
     claudeProfilesDir: path.join(root, 'claude-profiles'),
     codexProfilesDir: path.join(root, 'profiles'),
+    grokSessionsDir: path.join(grokHome, 'sessions'),
     fetchClaude: async () => [{ scope: 'Fable weekly', usedPercent: 20, source: 'fixture' }],
     fetchCodex: async () => [],
     // Inert timer: listen() must never arm a real auto-refresh in the API
@@ -49,14 +53,36 @@ async function startFixture(serviceOptions = {}) {
     detectForeignUsageConsumers: async () => ({ checked: true, consumers: [], probe: 'ok' }),
     ...serviceOptions,
   });
-  const app = createApp({ store, service, host: '127.0.0.1', port: 0 });
+  const app = createApp({
+    store,
+    service,
+    host: '127.0.0.1',
+    port: 0,
+    mutationToken: API_MUTATION_TOKEN,
+  });
+  if (!listen) {
+    return {
+      root,
+      claudeHome,
+      claudeActiveLink,
+      codexHome,
+      codexActiveLink,
+      grokHome,
+      store,
+      service,
+      app,
+      base: null,
+      token: API_MUTATION_TOKEN,
+      cookie: `modeldeck_session=${API_MUTATION_TOKEN}`,
+    };
+  }
   await new Promise((resolve) => app.listen(resolve));
   const address = app.server.address();
   const base = `http://127.0.0.1:${address.port}`;
   const sessionResponse = await fetch(`${base}/api/session`);
   const session = await sessionResponse.json();
   const cookie = sessionResponse.headers.get('set-cookie').split(';')[0];
-  return { root, claudeHome, claudeActiveLink, codexHome, codexActiveLink, store, service, app, base, token: session.token, cookie };
+  return { root, claudeHome, claudeActiveLink, codexHome, codexActiveLink, grokHome, store, service, app, base, token: session.token, cookie };
 }
 
 async function request(fixture, route, options = {}) {
@@ -70,6 +96,45 @@ async function request(fixture, route, options = {}) {
     },
   });
   return { response, body: await response.json() };
+}
+
+async function directRequest(fixture, route, {
+  method = 'GET',
+  body: input,
+  authenticated = true,
+} = {}) {
+  const requestPayload = input === undefined ? '' : JSON.stringify(input);
+  const req = Object.assign(Readable.from(requestPayload ? [Buffer.from(requestPayload)] : []), {
+    method,
+    url: route,
+    headers: {
+      host: 'localhost:0',
+      ...(requestPayload ? { 'content-type': 'application/json' } : {}),
+      ...(authenticated ? {
+        'x-modeldeck-token': fixture.token,
+        cookie: fixture.cookie,
+      } : {}),
+    },
+    socket: { remoteAddress: '127.0.0.1' },
+  });
+  let status;
+  let headers;
+  let responsePayload = '';
+  const finished = new Promise((resolve) => {
+    req.res = {
+      writeHead(nextStatus, nextHeaders) { status = nextStatus; headers = nextHeaders; },
+      end(chunk = '') { responsePayload += chunk; resolve(); },
+    };
+  });
+  await Promise.all([fixture.app.server.listeners('request')[0](req, req.res), finished]);
+  return {
+    response: { status, headers },
+    body: JSON.parse(responsePayload),
+  };
+}
+
+async function directGet(fixture, route, options) {
+  return directRequest(fixture, route, options);
 }
 
 function claudeSnapshotsExpiringAt(expiresAt) {
@@ -88,6 +153,42 @@ function requestWithHost(fixture, host) {
     req.on('error', reject);
     req.end();
   });
+}
+
+function createGrokHome(home, { lastSessionAt = null, mode = 0o700 } = {}) {
+  fs.mkdirSync(home, { recursive: true, mode });
+  fs.chmodSync(home, mode);
+  fs.writeFileSync(path.join(home, 'auth.json'), '{}', { mode: 0o600 });
+  if (lastSessionAt) createGrokSession(path.join(home, 'sessions'), lastSessionAt);
+}
+
+function createGrokSession(sessionsRoot, lastSessionAt) {
+  const updates = path.join(sessionsRoot, 'fixture-cwd', 'fixture-session', 'updates.jsonl');
+  fs.mkdirSync(path.dirname(updates), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(updates, '{"type":"fixture"}\n', { mode: 0o600 });
+  const at = new Date(lastSessionAt);
+  fs.utimesSync(updates, at, at);
+}
+
+function treeMetadata(root) {
+  const result = {};
+  const visit = (target, relative) => {
+    const stat = fs.lstatSync(target);
+    result[relative || '.'] = {
+      type: stat.isDirectory() ? 'directory' : stat.isSymbolicLink() ? 'symlink' : 'file',
+      mode: stat.mode & 0o777,
+      size: stat.size,
+      mtimeMs: stat.mtimeMs,
+      ctimeMs: stat.ctimeMs,
+      link: stat.isSymbolicLink() ? fs.readlinkSync(target) : null,
+    };
+    if (!stat.isDirectory()) return;
+    for (const name of fs.readdirSync(target).sort()) {
+      visit(path.join(target, name), relative ? path.join(relative, name) : name);
+    }
+  };
+  visit(root, '');
+  return result;
 }
 
 test('retired dashboard paths return JSON 404 responses', async (t) => {
@@ -138,6 +239,226 @@ test('health, scan, account, mapping, launch, and refresh APIs work together', a
   result = await request(fixture, `/api/launch?provider=codex&project=${encodeURIComponent(path.join(project.path, 'apps', 'web'))}`);
   assert.equal(result.body.account.profileRef, fs.realpathSync(fixture.codexHome));
   assert.ok(result.body.command.includes(`CODEX_HOME='${fs.realpathSync(fixture.codexHome)}'`));
+});
+
+test('Grok home discovery reports readiness and refusals without changing the candidate', async (t) => {
+  const fixture = await startFixture({}, { listen: false });
+  t.after(() => { fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  await t.test('happy path uses the configured default and derives the last session time', async () => {
+    const lastSessionAt = '2026-08-23T19:20:21.000Z';
+    createGrokHome(fixture.grokHome, { lastSessionAt });
+    const canonical = fs.realpathSync(fixture.grokHome);
+    const untokened = await directGet(fixture, '/api/grok/home-candidate', { authenticated: false });
+    assert.equal(untokened.response.status, 403);
+    assert.deepEqual(untokened.body, { error: 'mutation token or origin rejected' });
+
+    const result = await directGet(fixture, '/api/grok/home-candidate');
+
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, {
+      path: canonical,
+      exists: true,
+      isDirectory: true,
+      ownedByCurrentUser: true,
+      writableByOthers: false,
+      permissionsOk: true,
+      hasCredentials: true,
+      alreadyRegisteredAs: null,
+      lastSessionAt,
+      hint: null,
+      readFiles: [
+        path.join(canonical, 'auth.json'),
+        path.join(canonical, 'sessions', '*', '*', 'updates.jsonl'),
+      ],
+    });
+  });
+
+  await t.test('missing home is reported instead of raised as an endpoint error', async () => {
+    const missing = path.join(fixture.root, 'missing-grok-home');
+    const result = await directGet(fixture, `/api/grok/home-candidate?path=${encodeURIComponent(missing)}`);
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.path, missing);
+    assert.equal(result.body.exists, false);
+    assert.equal(result.body.isDirectory, false);
+    assert.equal(result.body.permissionsOk, false);
+    assert.equal(result.body.hasCredentials, false);
+    assert.equal(result.body.lastSessionAt, null);
+    assert.match(result.body.hint, /Run grok/);
+  });
+
+  await t.test('a permission error during canonicalization uses the ordinary unavailable shape', async (subtest) => {
+    const isolated = await startFixture({
+      realpath: async (target) => {
+        if (target.endsWith(`${path.sep}unreadable-grok-home`)) {
+          const error = new Error('fixture permission denied');
+          error.code = 'EACCES';
+          throw error;
+        }
+        return fs.promises.realpath(target);
+      },
+    }, { listen: false });
+    subtest.after(() => { isolated.store.close(); fs.rmSync(isolated.root, { recursive: true, force: true }); });
+    const unreadable = path.join(isolated.root, 'unreadable-grok-home');
+    createGrokHome(unreadable);
+
+    const result = await directGet(isolated, `/api/grok/home-candidate?path=${encodeURIComponent(unreadable)}`);
+
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, {
+      path: unreadable,
+      exists: false,
+      isDirectory: false,
+      ownedByCurrentUser: false,
+      writableByOthers: false,
+      permissionsOk: false,
+      hasCredentials: false,
+      alreadyRegisteredAs: null,
+      lastSessionAt: null,
+      hint: `No Grok home found at ${unreadable}. Run grok to create it and sign in.`,
+      readFiles: [
+        path.join(unreadable, 'auth.json'),
+        path.join(unreadable, 'sessions', '*', '*', 'updates.jsonl'),
+      ],
+    });
+  });
+
+  await t.test('home writable by other users carries the exact chmod refusal', async () => {
+    const writable = path.join(fixture.root, 'shared-grok-home');
+    createGrokHome(writable, { mode: 0o722 });
+    const result = await directGet(fixture, `/api/grok/home-candidate?path=${encodeURIComponent(writable)}`);
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.writableByOthers, true);
+    assert.equal(result.body.permissionsOk, false);
+    assert.equal(result.body.hint, `Grok profile home must not be writable by anyone else (chmod g-w,o-w ${fs.realpathSync(writable)})`);
+  });
+
+  await t.test('a home registered to another provider is named by the shared guard', async () => {
+    const result = await directGet(fixture, `/api/grok/home-candidate?path=${encodeURIComponent(fixture.claudeHome)}`);
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.alreadyRegisteredAs, 'claude');
+    assert.match(result.body.hint, /already registered as a claude subscription's home/);
+  });
+
+  await t.test('a home registered to Grok is reported and refused for a second Grok account', async () => {
+    const sharedHome = path.join(fixture.root, 'registered-grok-home');
+    createGrokHome(sharedHome);
+    fixture.store.saveAccount({
+      provider: 'grok',
+      label: 'Existing Grok placeholder',
+      profileRef: fs.realpathSync(sharedHome),
+    });
+    const hint = "this directory is already registered as a grok subscription's home; a Grok subscription needs its own";
+
+    const discovery = await directGet(fixture, `/api/grok/home-candidate?path=${encodeURIComponent(sharedHome)}`);
+
+    assert.equal(discovery.response.status, 200);
+    assert.equal(discovery.body.alreadyRegisteredAs, 'grok');
+    assert.equal(discovery.body.hint, hint);
+
+    const registration = await directRequest(fixture, '/api/accounts', {
+      method: 'POST',
+      body: {
+        provider: 'grok',
+        label: 'Second Grok placeholder',
+        profileRef: sharedHome,
+      },
+    });
+
+    assert.equal(registration.response.status, 400);
+    assert.deepEqual(registration.body, { error: hint });
+    assert.equal(fixture.store.listAccounts().filter((account) => account.provider === 'grok').length, 1);
+  });
+
+  await t.test('a home owned by another uid has a stable refusal shape', async (subtest) => {
+    const isolated = await startFixture({ uid: (process.getuid?.() ?? 0) + 1 }, { listen: false });
+    subtest.after(() => { isolated.store.close(); fs.rmSync(isolated.root, { recursive: true, force: true }); });
+    createGrokHome(isolated.grokHome);
+    const canonical = fs.realpathSync(isolated.grokHome);
+
+    const result = await directGet(isolated, '/api/grok/home-candidate');
+
+    assert.equal(result.response.status, 200);
+    assert.deepEqual(result.body, {
+      path: canonical,
+      exists: true,
+      isDirectory: true,
+      ownedByCurrentUser: false,
+      writableByOthers: false,
+      permissionsOk: false,
+      hasCredentials: true,
+      alreadyRegisteredAs: null,
+      lastSessionAt: null,
+      hint: 'Grok profile home must be owned by the current user',
+      readFiles: [
+        path.join(canonical, 'auth.json'),
+        path.join(canonical, 'sessions', '*', '*', 'updates.jsonl'),
+      ],
+    });
+  });
+
+  await t.test('an explicit path override is resolved through realpath', async () => {
+    const alternate = path.join(fixture.root, 'alternate-grok-home');
+    const selected = path.join(fixture.root, 'selected-grok-home');
+    createGrokHome(alternate);
+    fs.symlinkSync(alternate, selected, 'dir');
+    const result = await directGet(fixture, `/api/grok/home-candidate?path=${encodeURIComponent(selected)}`);
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.path, fs.realpathSync(alternate));
+    assert.equal(result.body.permissionsOk, true);
+    assert.equal(result.body.hasCredentials, true);
+  });
+
+  await t.test('a symlink to the default home still uses the configured sessions root', async (subtest) => {
+    const isolated = await startFixture({}, { listen: false });
+    subtest.after(() => { isolated.store.close(); fs.rmSync(isolated.root, { recursive: true, force: true }); });
+    createGrokHome(isolated.grokHome);
+    const configuredSessions = path.join(isolated.root, 'configured-grok-sessions');
+    const lastSessionAt = '2026-08-24T08:09:10.000Z';
+    createGrokSession(configuredSessions, lastSessionAt);
+    isolated.service.grokSessionsDir = configuredSessions;
+    const selected = path.join(isolated.root, 'selected-default-grok-home');
+    fs.symlinkSync(isolated.grokHome, selected, 'dir');
+
+    const result = await directGet(isolated, `/api/grok/home-candidate?path=${encodeURIComponent(selected)}`);
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.lastSessionAt, lastSessionAt);
+    assert.equal(
+      result.body.readFiles[1],
+      path.join(fs.realpathSync(configuredSessions), '*', '*', 'updates.jsonl'),
+    );
+  });
+
+  await t.test('timestamp discovery returns unknown when its metadata-entry cap is reached', async (subtest) => {
+    const isolated = await startFixture({ grokHomeDiscoveryEntryLimit: 1 }, { listen: false });
+    subtest.after(() => { isolated.store.close(); fs.rmSync(isolated.root, { recursive: true, force: true }); });
+    createGrokHome(isolated.grokHome, { lastSessionAt: '2026-08-24T09:10:11.000Z' });
+
+    const result = await directGet(isolated, '/api/grok/home-candidate');
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.lastSessionAt, null);
+  });
+
+  await t.test('the endpoint performs zero writes and never needs to open auth.json', async () => {
+    const readOnly = path.join(fixture.root, 'read-only-grok-home');
+    createGrokHome(readOnly, { lastSessionAt: '2026-08-22T10:00:00.000Z' });
+    const credential = path.join(readOnly, 'auth.json');
+    fs.chmodSync(credential, 0o000);
+    const before = treeMetadata(readOnly);
+
+    const result = await directGet(fixture, `/api/grok/home-candidate?path=${encodeURIComponent(readOnly)}`);
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.hasCredentials, true);
+    assert.deepEqual(treeMetadata(readOnly), before);
+    fs.chmodSync(credential, 0o600);
+  });
 });
 
 test('rejects missing mutation token, cross-origin mutations, and hostile Host headers', async (t) => {

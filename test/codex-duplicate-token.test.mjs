@@ -41,6 +41,7 @@ test('readCodexAccountId treats every malformed or missing input as absent evide
     ['missing file', { codexHome: fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-codex-empty-')) }],
     ['unreadable file', { codexHome: '/nonexistent-path/modeldeck', readFile: async () => { throw new Error('EACCES'); } }],
     ['invalid json', { codexHome: '/x', readFile: async () => 'not-json{' }],
+    ['valid object plus non-JSON whitespace', { codexHome: '/x', readFile: async () => '{"tokens":{"account_id":"acct-placeholder"}}\u00a0' }],
     ['no tokens object', { codexHome: '/x', readFile: async () => JSON.stringify({ OPENAI_API_KEY: 'k' }) }],
     ['missing account_id', { codexHome: '/x', readFile: async () => JSON.stringify({ tokens: { id_token: 't' } }) }],
     ['blank account_id', { codexHome: '/x', readFile: async () => JSON.stringify({ tokens: { account_id: '   ' } }) }],

@@ -4,10 +4,14 @@ import path from 'node:path';
 import { Store } from '../src/db.mjs';
 import { ModelDeckService } from '../src/service.mjs';
 import { evaluateCapacity } from '../src/capacity.mjs';
+import { configLintFailureFindings, evaluateConfigLint, renderConfigLintTable } from '../src/config-linter.mjs';
+import { collectConfigLintSnapshot, configLintSnapshotOptions } from '../src/config-linter-snapshot.mjs';
 import { LEGACY_CLIENT_KEY_SERVICE, assertClientKeyService } from '../src/client-key-helper.mjs';
 import {
   DB_PATH, PROJECTS_ROOT, CLAUDE_PATH, CLAUDE_PROFILES_DIR, CLAUDE_ACTIVE_LINK,
-  CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, HOST, PORT,
+  CLAUDE_SHELL_ENV_FILE, CLAUDE_STATUSLINE_DIR, CODEX_PATH, CODEX_ACTIVE_LINK, CODEX_PROFILES_DIR,
+  CLIPROXY_AUTH_DIR, CLIPROXY_BASE_URL, CLIPROXY_CONFIG_DIR, CLIPROXY_MANAGEMENT_KEY_PATH,
+  DATA_DIR, HOST, LAUNCHCTL_PATH, PORT, ZSHENV_PATH,
 } from '../src/paths.mjs';
 
 function usage() {
@@ -18,6 +22,7 @@ Usage:
   modeldeck scan [projects-root]
   modeldeck status
   modeldeck check [--threshold 25] [--max-age-min 15] [--json]
+  modeldeck lint [--json]
   modeldeck account add claude <label> [--identity email] [--purpose text] [--default]
   modeldeck account add codex <label> <profile-ref> [--identity email] [--purpose text] [--default]
   modeldeck claude migrate <label> <approved-cswap-profile-home>
@@ -43,6 +48,46 @@ if (command === 'serve') {
   const { createApp } = await import('../src/server.mjs');
   const app = createApp();
   app.listen(() => console.log(`ModelDeck running at http://${HOST}:${PORT}`));
+} else if (command === 'lint') {
+  const unknownOption = args.find((arg) => arg !== '--json');
+  if (unknownOption) {
+    console.error(`ModelDeck: unknown lint option ${unknownOption}`);
+    process.exitCode = 2;
+  } else {
+    let store;
+    let findings;
+    try {
+      store = new Store(DB_PATH, { readOnly: true });
+      const service = new ModelDeckService(store, {
+        projectsRoot: PROJECTS_ROOT,
+        claudePath: CLAUDE_PATH,
+        claudeProfilesDir: CLAUDE_PROFILES_DIR,
+        claudeActiveLink: CLAUDE_ACTIVE_LINK,
+        claudeShellEnvFile: CLAUDE_SHELL_ENV_FILE,
+        claudeStatuslineDir: CLAUDE_STATUSLINE_DIR,
+        codexPath: CODEX_PATH,
+        codexActiveLink: CODEX_ACTIVE_LINK,
+        codexProfilesDir: CODEX_PROFILES_DIR,
+        cliproxyAuthDir: CLIPROXY_AUTH_DIR,
+        cliproxyConfigDir: CLIPROXY_CONFIG_DIR,
+        cliproxyBaseUrl: CLIPROXY_BASE_URL,
+        cliproxyManagementKeyPath: CLIPROXY_MANAGEMENT_KEY_PATH,
+        dataDir: DATA_DIR,
+        dbPath: DB_PATH,
+        zshenvPath: ZSHENV_PATH,
+        launchctlPath: LAUNCHCTL_PATH,
+      });
+      const snapshot = await collectConfigLintSnapshot(configLintSnapshotOptions(service));
+      findings = evaluateConfigLint(snapshot);
+    } catch (error) {
+      findings = configLintFailureFindings(error?.code || error?.message || 'configuration lint failed');
+    } finally {
+      store?.close();
+    }
+    if (args.includes('--json')) console.log(JSON.stringify({ findings }, null, 2));
+    else process.stdout.write(renderConfigLintTable(findings));
+    if (findings.some((finding) => finding.severity === 'error')) process.exitCode = 1;
+  }
 } else {
   const store = new Store(DB_PATH);
   const service = new ModelDeckService(store, {

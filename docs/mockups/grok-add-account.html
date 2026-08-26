@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ModelDeck — adding a Grok subscription (issue #560)</title>
+<style>
+  :root {
+    --ground: #131316;
+    --ink: #e7e7ea;
+    --muted: #8e9097;
+    --anno: #c9a96a;
+    --anno-bg: #262218;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 40px 32px 64px;
+    background: var(--ground); color: var(--ink);
+    font: 13px/1.5 -apple-system, "SF Pro Text", system-ui, sans-serif;
+  }
+  h1 { font-size: 17px; font-weight: 650; letter-spacing: -.01em; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 12.5px; margin: 0 0 36px; max-width: 820px; }
+  .exhibit { margin-bottom: 44px; }
+  .tag {
+    display: inline-block; margin-bottom: 12px;
+    font-size: 10px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+    color: var(--anno); background: var(--anno-bg);
+    padding: 3px 8px; border-radius: 4px;
+  }
+  .note { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 940px; }
+  .row { display: flex; align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+
+  /* ---------- sheet chrome (the add-account sheet is 420 pt wide in AddAccountSheet.swift) ---------- */
+  .sheet {
+    width: 420px; border-radius: 12px; padding: 18px;
+    background: #232326;
+    border: 1px solid rgba(255,255,255,.10);
+    box-shadow: 0 18px 50px rgba(0,0,0,.55), 0 2px 8px rgba(0,0,0,.4);
+    font: 13px/1.4 -apple-system, "SF Pro Text", sans-serif; color: #e7e7ea;
+    text-align: left;
+  }
+  .sheet h2 { font-size: 13.5px; font-weight: 650; margin: 0 0 3px; letter-spacing: -.01em; }
+  .step { font-size: 11px; color: var(--muted); margin: 0 0 14px; }
+
+  .field { display: flex; align-items: center; gap: 10px; margin-bottom: 9px; }
+  .field > label { width: 74px; text-align: right; color: #cfd0d4; font-size: 12px; flex: none; }
+  .control {
+    flex: 1; min-width: 0; background: rgba(255,255,255,.07);
+    border: 1px solid rgba(255,255,255,.10); border-radius: 6px;
+    padding: 5px 8px; font-size: 12px; color: #e7e7ea;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  }
+  .control.placeholder { color: #6e7076; }
+  .chev { color: #8e9097; font-size: 10px; }
+  .swatch { width: 34px; height: 20px; border-radius: 5px; border: 1px solid rgba(255,255,255,.16); flex: none; }
+
+  /* provider popup menu, opened */
+  .menu {
+    width: 210px; background: #2c2c30; border: 1px solid rgba(255,255,255,.12);
+    border-radius: 8px; padding: 4px; box-shadow: 0 14px 34px rgba(0,0,0,.5);
+  }
+  .menu div { padding: 5px 9px; border-radius: 5px; font-size: 12.5px; display: flex; align-items: center; gap: 8px; }
+  .menu div.on { background: rgba(110,158,241,.30); }
+  .menu .mark {
+    width: 18px; height: 18px; border-radius: 5px; flex: none;
+    display: flex; align-items: center; justify-content: center; font-size: 10.5px; font-weight: 600;
+  }
+  .mark.claude { background: rgba(217,119,87,.16); color: #d97757; }
+  .mark.codex  { background: rgba(255,255,255,.10); color: #e9e9ec; }
+  .mark.grok   { background: rgba(255,255,255,.10); color: #a9abb2; }
+
+  /* the discovery / consent block — inline in step 1, not a new screen */
+  .found {
+    margin: 12px 0 0; padding: 9px 10px; border-radius: 8px;
+    background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09);
+  }
+  .found .hd { display: flex; align-items: center; gap: 8px; }
+  .found .path { font: 11.5px/1.35 ui-monospace, "SF Mono", Menlo, monospace; color: #e7e7ea; }
+  .found .sig { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .found .alt { margin-left: auto; font-size: 11.5px; color: #6d9ef1; flex: none; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: #30d158; }
+  .dot.warn { background: #ff9f0a; }
+  .dot.crit { background: #ff453a; }
+
+  .disclose { margin: 10px 0 0; font-size: 11.5px; color: #6d9ef1; }
+  .reads { margin: 6px 0 0 14px; font-size: 11px; color: var(--muted); }
+  .reads li { margin-bottom: 2px; }
+  .reads code { font: 11px ui-monospace, "SF Mono", Menlo, monospace; color: #cfd0d4; }
+
+  .caption { font-size: 11px; color: var(--muted); margin: 12px 0 0; }
+  .err { font-size: 11.5px; color: #ff9f0a; margin: 10px 0 0; }
+  .err.crit { color: #ff453a; }
+  .cmd {
+    margin: 8px 0 0; padding: 7px 9px; border-radius: 7px;
+    background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09);
+    font: 11.5px ui-monospace, "SF Mono", Menlo, monospace; color: #e7e7ea;
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  }
+  .cmd span.copy { font: 11px -apple-system, sans-serif; color: #6d9ef1; }
+
+  .foot { display: flex; align-items: center; gap: 8px; margin-top: 16px; }
+  .btn {
+    font-size: 12px; padding: 4px 12px; border-radius: 6px;
+    background: rgba(255,255,255,.09); border: 1px solid rgba(255,255,255,.10); color: #e7e7ea;
+  }
+  .btn.primary { background: #3f6fd0; border-color: #3f6fd0; color: #fff; font-weight: 550; }
+  .btn.dim { color: #6e7076; background: rgba(255,255,255,.05); }
+  .foot .spacer { margin-left: auto; }
+
+  /* landed card preview inside the confirm step */
+  .cardlet { margin: 12px 0 0; padding: 10px; border-radius: 8px; background: rgba(255,255,255,.05); border: 1px solid rgba(255,255,255,.09); }
+  .cardlet .top { display: flex; align-items: center; gap: 9px; }
+  .cardlet .nm { font-weight: 600; font-size: 12.5px; }
+  .cardlet .worst { margin-left: auto; font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .cardlet .wl { font-size: 11px; color: var(--muted); margin: 7px 0 4px; }
+  .bar { height: 4px; border-radius: 2px; background: rgba(255,255,255,.10); overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 2px; background: #6d9ef1; }
+
+  .ghost {
+    width: 300px; border: 1px dashed rgba(255,255,255,.14); border-radius: 10px;
+    color: #6e7076; font-size: 11.5px; padding: 18px 16px; align-self: center;
+  }
+</style>
+</head>
+<body>
+
+<h1>Adding a Grok subscription</h1>
+<p class="sub">
+  Issue #560. Claude and Codex are added by creating a fresh, ModelDeck-owned profile folder and handing off to
+  the provider&rsquo;s sign-in. Grok has neither: the grok CLI owns <code>~/.grok</code> and does its own auth. So the Grok
+  entry does the honest thing instead &mdash; it points ModelDeck at the grok home that already exists, read-only, and skips
+  the sign-in step entirely. Two steps instead of three, in the same 420 pt sheet, with no new window.
+  Placeholder identities only.
+</p>
+
+<div class="exhibit">
+  <span class="tag">Step 1 &middot; the picker gains a third entry</span>
+  <div class="row">
+    <div class="sheet">
+      <h2>Add a subscription</h2>
+      <p class="step">Step 1 of 2</p>
+
+      <div class="field">
+        <label>Provider</label>
+        <div class="control"><span><span class="mark grok" style="display:inline-flex;width:16px;height:16px;vertical-align:-3px;margin-right:6px;">G</span>Grok</span><span class="chev">&#9662;</span></div>
+      </div>
+      <div class="field">
+        <label>Label</label>
+        <div class="control placeholder">e.g. Side Project</div>
+      </div>
+      <div class="field">
+        <label>Purpose</label>
+        <div class="control placeholder">e.g. client work</div>
+      </div>
+      <div class="field">
+        <label>Color</label>
+        <div class="control" style="justify-content:flex-start;"><span class="swatch" style="background:#48a868"></span></div>
+      </div>
+
+      <div class="found">
+        <div class="hd">
+          <span class="dot"></span>
+          <div>
+            <div class="path">~/.grok</div>
+            <div class="sig">Credentials found &middot; last session 2 days ago</div>
+          </div>
+          <span class="alt">Choose Another Folder&hellip;</span>
+        </div>
+      </div>
+
+      <p class="caption">
+        ModelDeck reads this folder. It never writes to it, never signs you in or out, and never copies your credentials.
+      </p>
+      <p class="disclose">&#9662; What ModelDeck reads</p>
+      <ul class="reads">
+        <li><code>~/.grok/auth.json</code> &mdash; handed to an isolated child process that asks xAI for your billing percentage. Never stored, never logged.</li>
+        <li><code>~/.grok/sessions/*/*/updates.jsonl</code> &mdash; per-turn token counts for receipts. Already read today.</li>
+      </ul>
+
+      <div class="foot">
+        <span class="btn dim">Cancel</span>
+        <span class="spacer"></span>
+        <span class="btn primary">Connect</span>
+      </div>
+    </div>
+
+    <div style="padding-top:34px">
+      <div class="menu">
+        <div><span class="mark claude">&#10035;</span>Claude</div>
+        <div><span class="mark codex">&#9671;</span>Codex</div>
+        <div class="on"><span class="mark grok">G</span>Grok</div>
+      </div>
+      <p class="note" style="max-width:260px">
+        One added row. Picking Grok swaps the body of the same sheet &mdash;
+        no second window, no separate &ldquo;import&rdquo; menu item.
+      </p>
+    </div>
+  </div>
+  <p class="note">
+    Same four fields as Claude and Codex, so the card that lands looks like every other card. What changes is the
+    sentence under them: Claude and Codex say &ldquo;ModelDeck creates an isolated, owner-only profile home&rdquo;;
+    Grok says what it actually does, which is read one folder it did not create. The green dot means the daemon already
+    checked the folder before the button was live: it exists, you own it, nobody else can write to it, and
+    <code>auth.json</code> is there. It says &ldquo;credentials found&rdquo; and not &ldquo;signed in&rdquo; on purpose &mdash;
+    all this proves is that the file exists. Whether it works is what step 2 finds out.
+  </p>
+</div>
+
+<div class="exhibit">
+  <span class="tag">Step 1 &middot; the four honest refusals, inline</span>
+  <div class="row">
+
+    <div class="sheet">
+      <h2>Add a subscription</h2>
+      <p class="step">Step 1 of 2</p>
+      <div class="field">
+        <label>Provider</label>
+        <div class="control"><span><span class="mark grok" style="display:inline-flex;width:16px;height:16px;vertical-align:-3px;margin-right:6px;">G</span>Grok</span><span class="chev">&#9662;</span></div>
+      </div>
+      <div class="found">
+        <div class="hd">
+          <span class="dot crit"></span>
+          <div>
+            <div class="path">~/.grok</div>
+            <div class="sig">No grok CLI home found</div>
+          </div>
+          <span class="alt">Choose Another Folder&hellip;</span>
+        </div>
+      </div>
+      <p class="err">
+        ModelDeck can only watch a Grok subscription the grok CLI has already signed in.
+        Run this once in Terminal, sign in as normal, then come back.
+      </p>
+      <div class="cmd"><span>grok</span><span class="copy">Copy</span></div>
+      <div class="foot">
+        <span class="btn dim">Cancel</span>
+        <span class="spacer"></span>
+        <span class="btn">Check Again</span>
+        <span class="btn primary" style="opacity:.4">Connect</span>
+      </div>
+    </div>
+
+    <div class="sheet">
+      <h2>Add a subscription</h2>
+      <p class="step">Step 1 of 2</p>
+      <div class="field">
+        <label>Provider</label>
+        <div class="control"><span><span class="mark grok" style="display:inline-flex;width:16px;height:16px;vertical-align:-3px;margin-right:6px;">G</span>Grok</span><span class="chev">&#9662;</span></div>
+      </div>
+      <div class="found">
+        <div class="hd">
+          <span class="dot warn"></span>
+          <div>
+            <div class="path">~/.grok</div>
+            <div class="sig">Found, but other users on this Mac can write to it</div>
+          </div>
+          <span class="alt">Choose Another Folder&hellip;</span>
+        </div>
+      </div>
+      <p class="err">
+        Anyone who can write to that folder could swap in their own credentials, and ModelDeck would send theirs
+        instead of yours. Tighten the permissions, then check again.
+      </p>
+      <div class="cmd"><span>chmod g-w,o-w ~/.grok</span><span class="copy">Copy</span></div>
+      <div class="foot">
+        <span class="btn dim">Cancel</span>
+        <span class="spacer"></span>
+        <span class="btn">Check Again</span>
+        <span class="btn primary" style="opacity:.4">Connect</span>
+      </div>
+    </div>
+
+    <div class="sheet">
+      <h2>Add a subscription</h2>
+      <p class="step">Step 1 of 2</p>
+      <div class="field">
+        <label>Provider</label>
+        <div class="control"><span><span class="mark grok" style="display:inline-flex;width:16px;height:16px;vertical-align:-3px;margin-right:6px;">G</span>Grok</span><span class="chev">&#9662;</span></div>
+      </div>
+      <div class="found">
+        <div class="hd">
+          <span class="dot crit"></span>
+          <div>
+            <div class="path">~/.codex-profiles/studio</div>
+            <div class="sig">Already registered as a Codex subscription&rsquo;s home</div>
+          </div>
+          <span class="alt">Choose Another Folder&hellip;</span>
+        </div>
+      </div>
+      <p class="err crit">
+        That folder belongs to a Codex subscription. Connecting it as Grok would send an OpenAI credential to xAI.
+        Pick the folder the grok CLI actually uses.
+      </p>
+      <div class="foot">
+        <span class="btn dim">Cancel</span>
+        <span class="spacer"></span>
+        <span class="btn">Check Again</span>
+        <span class="btn primary" style="opacity:.4">Connect</span>
+      </div>
+    </div>
+
+    <div class="sheet">
+      <h2>Add a subscription</h2>
+      <p class="step">Step 1 of 2</p>
+      <div class="field">
+        <label>Provider</label>
+        <div class="control"><span><span class="mark grok" style="display:inline-flex;width:16px;height:16px;vertical-align:-3px;margin-right:6px;">G</span>Grok</span><span class="chev">&#9662;</span></div>
+      </div>
+      <div class="found">
+        <div class="hd">
+          <span class="dot crit"></span>
+          <div>
+            <div class="path">~/.grok</div>
+            <div class="sig">Already connected as another Grok subscription</div>
+          </div>
+          <span class="alt">Choose Another Folder&hellip;</span>
+        </div>
+      </div>
+      <p class="err crit">
+        That folder is already connected as another Grok subscription. Each one needs its own grok home,
+        so pick a different folder.
+      </p>
+      <div class="foot">
+        <span class="btn dim">Cancel</span>
+        <span class="spacer"></span>
+        <span class="btn">Check Again</span>
+        <span class="btn primary" style="opacity:.4">Connect</span>
+      </div>
+    </div>
+
+  </div>
+  <p class="note">
+    All four are checks the daemon performs when something posts a Grok subscription to its API &mdash; this
+    just shows them before the button is pressed instead of after. The third is not hypothetical: a Codex profile
+    folder and a grok home are indistinguishable at refresh time, so registration is the only place it can be caught.
+    The fourth arrived during the build &mdash; two subscriptions on one folder would poll xAI for a single pool and
+    read as two independent subscriptions in the deck.
+  </p>
+</div>
+
+<div class="exhibit">
+  <span class="tag">Step 2 &middot; connected, with the first real reading</span>
+  <div class="row">
+    <div class="sheet">
+      <h2>Grok is connected</h2>
+      <p class="step">Step 2 of 2</p>
+      <p style="margin:0 0 2px">
+        ModelDeck asked xAI for this subscription&rsquo;s billing percentage and got an answer, so the card is real,
+        not a placeholder waiting to fill in.
+      </p>
+      <div class="cardlet">
+        <div class="top">
+          <span class="mark grok">G</span>
+          <span class="nm">Side Project</span>
+          <span class="worst">59% left</span>
+        </div>
+        <div class="wl">Weekly &middot; all models &middot; Resets Sat 5:00 PM</div>
+        <div class="bar"><i style="width:41%"></i></div>
+      </div>
+      <p class="caption">
+        The grok CLI still owns sign-in, renewal and everything in <code>~/.grok</code>. Removing this subscription later
+        removes only ModelDeck&rsquo;s reference to the folder &mdash; nothing inside it is touched.
+      </p>
+      <div class="foot">
+        <span class="spacer"></span>
+        <span class="btn primary">Done</span>
+      </div>
+    </div>
+    <div class="ghost">
+      No sign-in step, no Terminal handoff, no &ldquo;Signed in as&hellip;&rdquo;.<br><br>
+      Grok has no per-account profile home for ModelDeck to create and no login for it to launch, so the
+      middle step of the Claude/Codex flow simply is not there. Claude and Codex keep all three steps, unchanged.
+    </div>
+  </div>
+  <p class="note">
+    The confirm step earns its place by proving the connection works. Claude and Codex confirm with an identity
+    read-back (&ldquo;Signed in as &hellip;&rdquo;); ModelDeck never opens Grok&rsquo;s credential, so it has no identity to show.
+    The billing reading is the honest equivalent &mdash; and it is the same reading the deck card uses, so a card that
+    can never fill in fails here, at connect time, rather than silently.
+  </p>
+</div>
+
+</body>
+</html>

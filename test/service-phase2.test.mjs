@@ -1092,10 +1092,8 @@ test('Claude refresh keeps credential expiry private while threading it to the s
       assert.doesNotMatch(serialized, new RegExp(String(expiresAt)));
       assert.doesNotMatch(serialized, /"expiresAt"/);
     }
-    data.service.claudePreExpiryAttemptedExpiries.set(account.id, expiresAt);
     assert.equal(await data.service.deleteAccount(account.id), true);
     assert.equal(data.service.claudeCredentialExpiries.has(account.id), false);
-    assert.equal(data.service.claudePreExpiryAttemptedExpiries.has(account.id), false);
   } finally { data.close(); }
 });
 

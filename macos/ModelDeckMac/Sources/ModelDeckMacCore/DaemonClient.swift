@@ -555,6 +555,46 @@ public struct DaemonClient: Sendable {
         return envelope.account
     }
 
+    /// `GET /api/grok/home-candidate` — issue #560's read-only discovery of
+    /// an existing grok CLI home (`~/.grok` when `path` is nil). Metadata
+    /// only: the daemon never opens the credential and writes nothing under
+    /// the candidate. It still walks a caller-supplied path, so the daemon
+    /// gates it behind the mutation token (fix round 1) and this runs through
+    /// the same token+cookie flow as a mutation.
+    public func grokHomeCandidate(path: String? = nil) async throws -> GrokHomeCandidate {
+        let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var request = try await authorizedRequest(
+            method: "GET",
+            pathComponents: ["api", "grok", "home-candidate"]
+        )
+        if let trimmed, !trimmed.isEmpty {
+            request.url = try Self.grokCandidateURL(request.url, path: trimmed)
+        }
+        // A directory walk bounded daemon-side, but slower than the instant
+        // in-memory reads.
+        request.timeoutInterval = 15
+        return try await send(request)
+    }
+
+    /// The folder query, percent-encoded by hand.
+    ///
+    /// CodeRabbit round: `URLComponents.queryItems` leaves a literal `+` in a
+    /// value, and the daemon parses with `URLSearchParams`, where `+` means a
+    /// space — so a folder called `my+grok` would be inspected as `my grok`.
+    /// Encoding `+` (and the other separators) removes the ambiguity.
+    private static func grokCandidateURL(_ base: URL?, path: String) throws -> URL {
+        var allowed = CharacterSet.urlQueryAllowed
+        allowed.remove(charactersIn: "+&=?#")
+        guard let base,
+              var components = URLComponents(url: base, resolvingAgainstBaseURL: false),
+              let encoded = path.addingPercentEncoding(withAllowedCharacters: allowed) else {
+            throw DaemonClientError.invalidResponse
+        }
+        components.percentEncodedQuery = "path=\(encoded)"
+        guard let url = components.url else { throw DaemonClientError.invalidResponse }
+        return url
+    }
+
     /// `GET /api/accounts/:id/login` — the provider's own login command for
     /// step 2. Read-only; running it is the app layer's job (in the user's
     /// terminal, never inside the daemon).

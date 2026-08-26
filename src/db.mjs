@@ -22,6 +22,126 @@ function now() {
   return new Date().toISOString();
 }
 
+function fileStamp(file) {
+  try {
+    const stat = fs.statSync(file, { bigint: true });
+    return { ino: stat.ino, size: stat.size, mtimeNs: stat.mtimeNs };
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function sameFileStamp(left, right) {
+  return left == null
+    ? right == null
+    : right != null && left.ino === right.ino && left.size === right.size && left.mtimeNs === right.mtimeNs;
+}
+
+function walChecksum(bytes, byteOrder, seed = [0, 0]) {
+  if (bytes.length % 8 !== 0) throw new Error('ModelDeck database WAL checksum input is invalid');
+  const readWord = byteOrder === 'little'
+    ? (offset) => bytes.readUInt32LE(offset)
+    : (offset) => bytes.readUInt32BE(offset);
+  let [first, second] = seed;
+  for (let offset = 0; offset < bytes.length; offset += 8) {
+    first = (first + readWord(offset) + second) >>> 0;
+    second = (second + readWord(offset + 4) + first) >>> 0;
+  }
+  return [first, second];
+}
+
+// Build a committed SQLite image without opening the on-disk database. A
+// filesystem-backed read-only SQLite connection still creates sidecars for a
+// closed WAL database and writes reader marks into a live -shm file. The
+// linter is report-only, so it reads main/WAL bytes and applies committed WAL
+// frames to an in-memory image instead.
+function applyCommittedWal(database, wal) {
+  if (!wal || wal.length < 32) return database;
+  const magic = wal.readUInt32BE(0);
+  if (magic !== 0x377f0682 && magic !== 0x377f0683) throw new Error('ModelDeck database WAL header is invalid');
+  const byteOrder = magic === 0x377f0682 ? 'little' : 'big';
+  let checksum = walChecksum(wal.subarray(0, 24), byteOrder);
+  if (wal.readUInt32BE(24) !== checksum[0] || wal.readUInt32BE(28) !== checksum[1]) {
+    throw new Error('ModelDeck database WAL header checksum is invalid');
+  }
+  const encodedPageSize = wal.readUInt32BE(8);
+  const pageSize = encodedPageSize === 1 ? 65_536 : encodedPageSize;
+  if (pageSize < 512 || pageSize > 65_536 || (pageSize & (pageSize - 1)) !== 0) {
+    throw new Error('ModelDeck database WAL page size is invalid');
+  }
+  if (database.length < 100 || database.length % pageSize !== 0) {
+    throw new Error('ModelDeck database size does not match its WAL page size');
+  }
+  const encodedDatabasePageSize = database.readUInt16BE(16);
+  const databasePageSize = encodedDatabasePageSize === 1 ? 65_536 : encodedDatabasePageSize;
+  if (databasePageSize !== pageSize) throw new Error('ModelDeck database and WAL page sizes disagree');
+  const frameSize = pageSize + 24;
+  const frameCount = Math.floor((wal.length - 32) / frameSize);
+  const maximumDatabasePages = (database.length / pageSize) + frameCount;
+  const salt1 = wal.readUInt32BE(16);
+  const salt2 = wal.readUInt32BE(20);
+  let lastCommit = -1;
+  let committedPages = 0;
+  for (let index = 0; index < frameCount; index += 1) {
+    const offset = 32 + index * frameSize;
+    const pageNumber = wal.readUInt32BE(offset);
+    if (!pageNumber || wal.readUInt32BE(offset + 8) !== salt1 || wal.readUInt32BE(offset + 12) !== salt2) break;
+    const databaseSize = wal.readUInt32BE(offset + 4);
+    if (pageNumber > maximumDatabasePages || databaseSize > maximumDatabasePages) {
+      throw new Error('ModelDeck database WAL commit database size is invalid');
+    }
+    checksum = walChecksum(wal.subarray(offset, offset + 8), byteOrder, checksum);
+    checksum = walChecksum(wal.subarray(offset + 24, offset + 24 + pageSize), byteOrder, checksum);
+    if (wal.readUInt32BE(offset + 16) !== checksum[0] || wal.readUInt32BE(offset + 20) !== checksum[1]) {
+      throw new Error('ModelDeck database WAL frame checksum is invalid');
+    }
+    if (databaseSize > 0) {
+      lastCommit = index;
+      committedPages = databaseSize;
+    }
+  }
+  if (lastCommit < 0) return database;
+  const image = Buffer.alloc(committedPages * pageSize);
+  database.copy(image, 0, 0, Math.min(database.length, image.length));
+  for (let index = 0; index <= lastCommit; index += 1) {
+    const offset = 32 + index * frameSize;
+    const pageNumber = wal.readUInt32BE(offset);
+    if (pageNumber > committedPages) continue;
+    wal.copy(image, (pageNumber - 1) * pageSize, offset + 24, offset + 24 + pageSize);
+  }
+  return image;
+}
+
+function readOnlyDatabaseImage(dbPath) {
+  const walPath = `${dbPath}-wal`;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const databaseBefore = fileStamp(dbPath);
+    const walBefore = fileStamp(walPath);
+    if (!databaseBefore) throw new Error(`ModelDeck database does not exist: ${dbPath}`);
+    try {
+      const database = fs.readFileSync(dbPath);
+      const wal = walBefore ? fs.readFileSync(walPath) : null;
+      const databaseAfter = fileStamp(dbPath);
+      const walAfter = fileStamp(walPath);
+      if (sameFileStamp(databaseBefore, databaseAfter) && sameFileStamp(walBefore, walAfter)) {
+        const image = Buffer.from(applyCommittedWal(database, wal));
+        // Bytes 18/19 select WAL (2) versus rollback (1) read/write format.
+        // The deserialized image has no filesystem WAL, so mark this private
+        // in-memory copy as rollback format before SQLite opens it.
+        if (image.length >= 20) {
+          image[18] = 1;
+          image[19] = 1;
+        }
+        return image;
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT' || attempt === 2) throw error;
+    }
+  }
+  throw new Error('ModelDeck database changed repeatedly while the read-only snapshot was collected');
+}
+
 // Issue #181: feature consumers need only the newest row per (account, scope),
 // but keep a wide history window as a conservative operational/debugging
 // margin. The newest row is protected independently of age for idle accounts.
@@ -753,7 +873,13 @@ function later(left, right) {
 }
 
 export class Store {
-  constructor(dbPath) {
+  constructor(dbPath, { readOnly = false } = {}) {
+    if (readOnly) {
+      this.db = new DatabaseSync(':memory:');
+      this.db.deserialize(readOnlyDatabaseImage(dbPath));
+      this.db.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 5000;');
+      return;
+    }
     if (dbPath !== ':memory:') fs.mkdirSync(path.dirname(dbPath), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
@@ -1329,6 +1455,12 @@ export class Store {
       );
 
       CREATE TABLE IF NOT EXISTS settings (
+        id INTEGER PRIMARY KEY CHECK(id = 1),
+        value_json TEXT NOT NULL DEFAULT '{}',
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS config_lint_facts (
         id INTEGER PRIMARY KEY CHECK(id = 1),
         value_json TEXT NOT NULL DEFAULT '{}',
         updated_at TEXT NOT NULL
@@ -4643,6 +4775,61 @@ export class Store {
     this.db.prepare('UPDATE settings SET value_json = ?, updated_at = ? WHERE id = 1')
       .run(JSON.stringify(settings), now());
     return settings;
+  }
+
+  getConfigLintFacts() {
+    let row;
+    try { row = this.db.prepare('SELECT value_json, updated_at FROM config_lint_facts WHERE id = 1').get(); }
+    catch (error) {
+      if (/no such table: config_lint_facts/i.test(error?.message || '')) {
+        return { installedCliVersions: {}, claudeWeeklyFingerprints: {}, updatedAt: null };
+      }
+      throw error;
+    }
+    let stored = {};
+    try { stored = JSON.parse(row?.value_json || '{}'); }
+    catch { /* A malformed fact row is unavailable, never guessed. */ }
+    const installed = stored?.installedCliVersions;
+    const fingerprints = stored?.claudeWeeklyFingerprints;
+    return {
+      installedCliVersions: Object.fromEntries(
+        Object.entries(installed && typeof installed === 'object' && !Array.isArray(installed) ? installed : {})
+          .filter(([provider, version]) => ['claude', 'codex'].includes(provider)
+            && typeof version === 'string' && version.trim()),
+      ),
+      claudeWeeklyFingerprints: Object.fromEntries(
+        Object.entries(fingerprints && typeof fingerprints === 'object' && !Array.isArray(fingerprints) ? fingerprints : {})
+          .filter(([accountId, value]) => accountId && Number.isSafeInteger(value)),
+      ),
+      updatedAt: row?.updated_at || null,
+    };
+  }
+
+  saveConfigLintFacts(input) {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('config lint facts must be an object');
+    const current = this.getConfigLintFacts();
+    const next = {
+      installedCliVersions: input.installedCliVersions ?? current.installedCliVersions,
+      claudeWeeklyFingerprints: input.claudeWeeklyFingerprints ?? current.claudeWeeklyFingerprints,
+    };
+    const validated = {
+      installedCliVersions: Object.fromEntries(
+        Object.entries(next.installedCliVersions || {}).filter(([provider, version]) => (
+          ['claude', 'codex'].includes(provider) && typeof version === 'string' && version.trim()
+        )),
+      ),
+      claudeWeeklyFingerprints: Object.fromEntries(
+        Object.entries(next.claudeWeeklyFingerprints || {}).filter(([accountId, value]) => (
+          accountId && Number.isSafeInteger(value)
+        )),
+      ),
+    };
+    const updatedAt = now();
+    this.db.prepare(`
+      INSERT INTO config_lint_facts(id, value_json, updated_at) VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+    `).run(JSON.stringify(validated), updatedAt);
+    return { ...validated, updatedAt };
   }
 
   // --- Client key map (issue #520, design §2.1/§2.2, decision 0036 D1) ---

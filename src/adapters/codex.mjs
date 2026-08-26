@@ -4,6 +4,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { extractIdentity } from './identity.mjs';
 import { createProviderProfileHelpers } from './provider-profile.mjs';
+import { inspectJsonObjectAt, inspectJsonObjectDocument } from '../shared-scope.mjs';
 
 const execFileAsync = promisify(execFile);
 const codexProfile = createProviderProfileHelpers({
@@ -237,15 +238,23 @@ export async function readCodexPlan({ codexHome, readFile = fs.promises.readFile
 /// Issue #108: reads ONLY the `tokens.account_id` IDENTIFIER from
 /// CODEX_HOME/auth.json so the service can detect two profiles holding the
 /// same account (duplicate-credential detection). Token values are never
-/// read into the result, logged, stored, or transmitted — the parsed object
-/// is discarded after the identifier is extracted. Every malformed/missing
-/// input (no home, unreadable file, invalid JSON, absent or blank
-/// account_id) is `{ accountId: null }`: absence of evidence, never a crash.
+/// decoded into an object, returned, logged, stored, or transmitted. The
+/// offset inspector decodes only the approved identifier slice. Every
+/// malformed/missing input (no home, unreadable file, invalid JSON, absent
+/// or blank account_id) is `{ accountId: null }`: absence of evidence, never
+/// a crash.
 export async function readCodexAccountId({ codexHome, readFile = fs.promises.readFile } = {}) {
   if (!codexHome) return { accountId: null };
   try {
-    const auth = JSON.parse(await readFile(path.join(codexHome, 'auth.json'), 'utf8'));
-    const accountId = auth?.tokens?.account_id;
+    const source = await readFile(path.join(codexHome, 'auth.json'), 'utf8');
+    const auth = inspectJsonObjectDocument(source);
+    const tokensProperty = auth.properties.findLast((property) => property.key === 'tokens');
+    if (!tokensProperty) return { accountId: null };
+    const tokens = inspectJsonObjectAt(source, tokensProperty.start);
+    if (tokens.close + 1 !== tokensProperty.end) return { accountId: null };
+    const accountProperty = tokens.properties.findLast((property) => property.key === 'account_id');
+    if (!accountProperty || source[accountProperty.start] !== '"') return { accountId: null };
+    const accountId = JSON.parse(source.slice(accountProperty.start, accountProperty.end));
     return { accountId: typeof accountId === 'string' && accountId.trim() ? accountId.trim() : null };
   } catch {
     return { accountId: null };

@@ -1,0 +1,7 @@
+{
+  "type": "claude",
+  "email": "claude-a@example.invalid",
+  "weight": 50,
+  "excluded-models": [],
+  "access_token": "placeholder-proxy-token-must-not-surface"
+}
