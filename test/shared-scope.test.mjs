@@ -1056,3 +1056,27 @@ test('a settings PUT conflict restores the prior shared-scope opt-in value', asy
   assert.equal(queueReschedules.length, 1);
   assert.equal(queueReschedules[0].usageQueueConsumerEnabled, false);
 });
+
+// TRIPWIRE #590 round 4 (CodeRabbit minor): the adoption reset clears a
+// stale memory BACKUP too, not only the absent marker — backupMemory skips
+// when either backup entry exists, so a stale copy from a failed prior
+// attempt would make the next reconcile skip backing up the adopted memory
+// and a later disable would restore the stale copy over it.
+test('resetProfileMemoryMerge clears a stale memory backup alongside the absent marker', async (t) => {
+  const data = fixture();
+  t.after(() => data.close());
+
+  const scope = data.service.sharedScope;
+  const profile = scope.managedProfiles().find((item) => item.account.id === data.first.id);
+  const backupDir = scope.backupDirectory(profile);
+  fs.mkdirSync(path.join(backupDir, 'memory'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(backupDir, 'memory', 'stale.md'), 'stale copy');
+  fs.writeFileSync(path.join(backupDir, 'memory.absent'), '');
+  fs.mkdirSync(path.dirname(scope.manifestFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(scope.manifestFile, JSON.stringify({ memoryEnabled: true, mergedProfiles: [data.first.id] }));
+
+  await scope.resetProfileMemoryMerge(data.first);
+  assert.equal(fs.existsSync(path.join(backupDir, 'memory')), false);
+  assert.equal(fs.existsSync(path.join(backupDir, 'memory.absent')), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(scope.manifestFile, 'utf8')).mergedProfiles, []);
+});

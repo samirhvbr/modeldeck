@@ -627,6 +627,21 @@ export function createApp({
           claudeSecureStorage: state.claudeSecureStorage,
         });
       }
+      // Issue #586: in-app resolution of the first-run `active-link-blocked`
+      // dead end — adopt (or move aside, mode "fresh") the legacy real
+      // ~/.claude so the add-subscription flow can proceed.
+      const adoptMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/adopt-legacy-home$/);
+      if (req.method === 'POST' && adoptMatch) {
+        const id = decodeURIComponent(adoptMatch[1]);
+        if (!ownedStore.getAccount(id)) return json(res, 404, { error: 'account not found' });
+        const input = await body(req);
+        const adopted = await ownedService.adoptClaudeLegacyHome(id, { mode: input.mode ?? 'adopt' });
+        return json(res, 200, {
+          account: ownedService.accountForPublicResponse(adopted.account),
+          warnings: adopted.warnings,
+          backupPath: adopted.backupPath,
+        });
+      }
       const accountMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)$/);
       if (req.method === 'DELETE' && accountMatch) {
         const deleted = await ownedService.deleteAccount(decodeURIComponent(accountMatch[1]));

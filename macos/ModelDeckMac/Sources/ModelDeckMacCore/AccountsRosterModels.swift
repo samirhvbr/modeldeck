@@ -247,14 +247,28 @@ public enum AccountsRoster {
         //    view can offer Reveal in Finder.
         if let (accountID, guidance) = firstValue(guidanceForAccount, in: accounts) {
             let label = accounts.first { $0.id == accountID }?.label
+            let path = blockedPath(inGuidance: guidance)
+            // Issue #586 (Tim's recorded scope comment: "the raw daemon
+            // error line … should stop rendering raw"): the clobber-guard's
+            // verbatim text mislabels the user's live setup and instructs
+            // manual folder surgery the add flow now performs for them.
+            // For Claude it is rewritten to the same honest copy as the
+            // state-derived banner (the parsed path keeps Reveal working);
+            // other guidance, and Codex, stay verbatim.
+            let message: String
+            if provider == .claude, let path, guidance.contains("one-time migration") {
+                message = claudeBlockedMessage(path: path)
+            } else {
+                message = guidance + " "
+                    + blockedResolutionSentence(accountLabel: label, afterDaemonGuidance: true)
+            }
             return ProviderActivationBanner(
                 provider: provider,
-                message: guidance + " "
-                    + blockedResolutionSentence(accountLabel: label, afterDaemonGuidance: true),
+                message: message,
                 detail: detail,
                 retryRunsActivation: true,
                 affectedAccountID: accountID,
-                blockedPath: blockedPath(inGuidance: guidance)
+                blockedPath: path
             )
         }
         // 2. A generic activation failure surfaced by the deck model.
@@ -274,17 +288,29 @@ public enum AccountsRoster {
         //    for an account that no longer exists — it re-reads state.
         if let trouble = troubleForProvider(provider),
            !accounts.contains(where: { $0.id == trouble.accountID }) {
+            // Issue #227: an orphaned clobber-guard record still names a
+            // real on-disk blocker — keep the reveal affordance.
+            let orphanBlockedPath = trouble.kind == .guidance
+                ? blockedPath(inGuidance: trouble.message) : nil
+            // Review #590 round 2: the same clobber-guard rewrite as the
+            // per-account path above — this orphan path was the one
+            // remaining route for the raw migration text to reach a
+            // Claude user.
+            let headline: String
+            if provider == .claude, let orphanBlockedPath,
+               trouble.message.contains("one-time migration") {
+                headline = claudeBlockedMessage(path: orphanBlockedPath)
+            } else {
+                headline = trouble.message
+            }
             return ProviderActivationBanner(
                 provider: provider,
-                message: trouble.message
+                message: headline
                     + " (The subscription this concerns is no longer in the roster.)",
                 detail: detail,
                 retryRunsActivation: false,
                 affectedAccountID: nil,
-                // Issue #227: an orphaned clobber-guard record still names a
-                // real on-disk blocker — keep the reveal affordance.
-                blockedPath: trouble.kind == .guidance
-                    ? blockedPath(inGuidance: trouble.message) : nil
+                blockedPath: orphanBlockedPath
             )
         }
         // 3. The verified activation state. Only providers with an enabled
@@ -400,6 +426,17 @@ public enum AccountsRoster {
         return candidate
     }
 
+    /// Issue #586: the honest Claude blocked copy, shared by the
+    /// guidance-rewrite and state-derived banner paths so the two can never
+    /// drift back apart. `path` is either the daemon-named blocking path or
+    /// the "usually ~/.claude" convention.
+    static func claudeBlockedMessage(path: String) -> String {
+        "Activation blocked — this Mac's existing Claude setup (\(path)) is "
+            + "still in place, and ModelDeck never overwrites it. "
+            + "Add Subscription… can bring it in as a subscription or set it "
+            + "aside as a backup — no manual folder work needed."
+    }
+
     /// The provider's conventional active-link location (`~/.claude` /
     /// `~/.codex` — the daemon's defaults). Display copy for the
     /// state-derived blocked banner, which knows no exact path.
@@ -454,15 +491,23 @@ public enum AccountsRoster {
         case .blocked:
             // Issue #227 (Tim's fresh-install field data): "a one-time
             // migration must run" named neither the blocker nor an action,
-            // so repeated Retry read as a bug. Name the KIND of thing and
-            // WHERE (the daemon's blocked verdict comes from lstat'ing the
-            // active link — conventionally ~/.claude / ~/.codex — but the
-            // state payload carries no path, so "usually" stays honest),
-            // then give the click-level resolution.
-            return "Activation blocked — an existing \(provider.displayName) "
-                + "directory from a previous install is in the way (usually "
-                + "\(conventionalActiveLinkPath(for: provider))). "
-                + blockedResolutionSentence(accountLabel: selectedLabel)
+            // so repeated Retry read as a bug. Issue #586 (Rick's fresh
+            // install): "from a previous install" was factually wrong — the
+            // directory is the Mac's live, current setup — and telling a new
+            // user to hand-move their real Claude home reads as dangerous.
+            // Name what it IS ("usually" stays honest: the state payload
+            // carries no path), then point Claude at the in-app adoption;
+            // Codex has no adoption flow yet, so it keeps the manual path.
+            guard provider == .claude else {
+                return "Activation blocked — this Mac's existing "
+                    + "\(provider.displayName) setup (usually "
+                    + "\(conventionalActiveLinkPath(for: provider))) is still in "
+                    + "place, and ModelDeck never overwrites it. "
+                    + blockedResolutionSentence(accountLabel: selectedLabel)
+            }
+            return claudeBlockedMessage(
+                path: "usually \(conventionalActiveLinkPath(for: provider))"
+            )
         case .mismatched:
             return "Activation pending — the active link on disk points at a "
                 + "different profile than \(selected)."

@@ -105,6 +105,21 @@ public struct AccountActivation: Equatable, Sendable {
     }
 }
 
+/// The daemon's adopt-legacy-home response (issue #586): the post-adoption
+/// account, informational warnings, and where the original `~/.claude` was
+/// preserved. `backupPath` decodes tolerantly for older daemons.
+public struct LegacyHomeAdoption: Equatable, Sendable {
+    public var account: DeckAccount
+    public var warnings: [String]
+    public var backupPath: String?
+
+    public init(account: DeckAccount, warnings: [String] = [], backupPath: String? = nil) {
+        self.account = account
+        self.warnings = warnings
+        self.backupPath = backupPath
+    }
+}
+
 /// Seam for the popover's Activate action; `DaemonClient` conforms and
 /// tests stub it.
 public protocol AccountActivating: Sendable {
@@ -276,6 +291,39 @@ public struct DaemonClient: Sendable {
         )
         let envelope: Envelope = try await send(request)
         return AccountActivation(account: envelope.account, warnings: envelope.warnings ?? [])
+    }
+
+    /// `POST /api/accounts/:id/adopt-legacy-home` — issue #586: resolve the
+    /// first-run `active-link-blocked` dead end. Mode "adopt" copies the
+    /// legacy real `~/.claude` into this account's profile home so the
+    /// existing sign-in and settings carry over; mode "fresh" only moves it
+    /// aside. Both preserve the original as a timestamped backup (never
+    /// deleted) and finish with the activation flip.
+    public func adoptLegacyHome(accountID: String, startFresh: Bool) async throws -> LegacyHomeAdoption {
+        struct Envelope: Decodable {
+            var account: DeckAccount
+            var warnings: [String]?
+            var backupPath: String?
+        }
+        struct Body: Encodable { var mode: String }
+        var request = try await authorizedRequest(
+            method: "POST",
+            pathComponents: ["api", "accounts", accountID, "adopt-legacy-home"]
+        )
+        // Copying a large legacy home can run long. Repo convention (proxy
+        // join at 330s, updateTool at 620s): the transport outlives the
+        // daemon's own operation budget (6 min for Claude account work) so
+        // the honest daemon answer arrives instead of a client-side timeout
+        // on a mutation that then completed anyway (review #590).
+        request.timeoutInterval = 390
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(mode: startFresh ? "fresh" : "adopt"))
+        let envelope: Envelope = try await send(request)
+        return LegacyHomeAdoption(
+            account: envelope.account,
+            warnings: envelope.warnings ?? [],
+            backupPath: envelope.backupPath
+        )
     }
 
     // MARK: - Settings (issue #7)

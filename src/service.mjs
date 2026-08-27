@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import {
   activateClaudeProfile,
+  adoptLegacyClaudeHome,
   claudePinnedEnvFileContent,
   claudeProxyPointerShellSnippet,
   createClaudeProfileHome,
@@ -877,6 +878,7 @@ export class ModelDeckService {
     this.claudeCredentialKeychainSlotState = options.claudeCredentialKeychainSlotState
       || claudeCredentialKeychainSlotState;
     this.migrateClaude = options.migrateClaude || migrateClaudeSwapProfiles;
+    this.adoptClaudeLegacy = options.adoptClaudeLegacy || adoptLegacyClaudeHome;
     this.exec = options.exec || options.execFile || options.run || execFileAsync;
     // Issue #2 (public tracker): the bundled daemon's launchd plist carries a
     // static PATH, and launchd never expands $HOME — so PATH alone cannot see
@@ -1054,6 +1056,7 @@ export class ModelDeckService {
       debounceMs: options.sharedScopeDebounceMs,
       beforeAtomicRename: options.sharedScopeBeforeAtomicRename,
       afterMcpRead: options.sharedScopeAfterMcpRead,
+      afterUndoQuarantine: options.sharedScopeAfterUndoQuarantine,
     });
     this.configLintSnapshotCollector = options.configLintSnapshotCollector || collectConfigLintSnapshot;
     this.configLintEvaluate = options.configLintEvaluate || evaluateConfigLint;
@@ -2591,6 +2594,274 @@ export class ModelDeckService {
     }
   }
 
+  // Issue #586 — the other first-run trap seen in the field: a real legacy
+  // `~/.claude` blocks activation (the clobber guard, correctly), which used
+  // to dead-end the add flow's step 1 with a raw error and no path forward.
+  // This is the in-app resolution the sheet offers instead. Two modes:
+  //   adopt — copy the legacy home into the account's (empty) profile home so
+  //           the existing sign-in and settings carry over, then proceed;
+  //   fresh — keep the profile home empty; the normal login follows.
+  // Both then move the legacy directory aside to a timestamped backup (never
+  // deleted) and flip the activation symlink. Ordering is non-destructive
+  // first: copy, then backup rename, then symlink — with a rename rollback if
+  // the flip fails, so no failure strands the machine without a `~/.claude`.
+  // Round 2 (N1): shared scope writes into a brand-new profile home before
+  // the adoption offer ever runs, which the emptiness guard must not read as
+  // "populated". Replaceability is proven from the on-disk record, never the
+  // file name alone (defect-class rule): `.claude.json` only while it is
+  // exactly the shared-scope-generated mcp document (an object holding
+  // nothing but an mcpServers object), `memory` only while it is ModelDeck's
+  // own shared-memory symlink. Both are regenerated post-swap by the
+  // profile-set-changed reconcile.
+  async claudeAdoptionReplaceableEntries(profileRef) {
+    const entries = [];
+    try {
+      const parsed = JSON.parse(await fs.promises.readFile(path.join(profileRef, '.claude.json'), 'utf8'));
+      // Review #590 (CodeRabbit, thread on the round-1 diff): the absence of
+      // a signed-in identity proves nothing about AUTHORSHIP — a user's own
+      // .claude.json (theme, customApiKeyResponses, hand-written servers)
+      // has no oauthAccount either, and the swap would destroy it. The only
+      // .claude.json ModelDeck itself writes into a fresh profile home is
+      // the shared-scope mcp document: a JSON object with exactly one
+      // top-level property, mcpServers, holding an object — writeMcpDocument
+      // always emits that key, so a bare {} is not provably ModelDeck's
+      // (CodeRabbit follow-up) and counts as user content like any other
+      // unrecognized shape. No ModelDeck path writes {} into a profile home:
+      // creation makes a bare directory, and the reconcile either skips the
+      // write or emits the mcpServers key.
+      const isPlainObject = (value) => value != null && typeof value === 'object' && !Array.isArray(value);
+      const keys = isPlainObject(parsed) ? Object.keys(parsed) : null;
+      if (keys && keys.length === 1 && keys[0] === 'mcpServers' && isPlainObject(parsed.mcpServers)) {
+        entries.push('.claude.json');
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') return entries;
+    }
+    try {
+      const memoryPath = path.join(profileRef, 'memory');
+      const stat = await fs.promises.lstat(memoryPath);
+      if (stat.isSymbolicLink()) {
+        const [target, shared] = await Promise.all([
+          fs.promises.realpath(memoryPath).catch(() => null),
+          fs.promises.realpath(this.sharedScope.sharedMemoryDir).catch(() => null),
+        ]);
+        if (target && shared && target === shared) entries.push('memory');
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') return entries;
+    }
+    return entries;
+  }
+
+  async adoptClaudeLegacyHome(accountId, { mode = 'adopt' } = {}) {
+    if (mode !== 'adopt' && mode !== 'fresh') {
+      const error = new Error(`unknown legacy adoption mode: ${mode}`);
+      error.statusCode = 400;
+      throw error;
+    }
+    const account = this.store.getAccount(accountId);
+    if (!account) throw new Error('account not found');
+    if (account.provider !== 'claude') {
+      const error = new Error('legacy home adoption is only supported for claude accounts');
+      error.statusCode = 400;
+      throw error;
+    }
+    this.beginClaudeActivation(accountId);
+    try {
+      return await this.withClaudeActivationLock(async () => {
+        const latest = this.store.getAccount(accountId);
+        if (!latest) throw new Error('account not found');
+        if (!latest.enabled) throw new Error('account is disabled');
+        let legacyStat;
+        try {
+          legacyStat = await fs.promises.lstat(this.claudeActiveLink);
+        } catch (error) {
+          if (error.code !== 'ENOENT') throw error;
+          legacyStat = null;
+        }
+        if (legacyStat?.isSymbolicLink()) {
+          const error = new Error(`there is no legacy Claude directory to adopt — ${this.claudeActiveLink} is already managed`);
+          error.statusCode = 409;
+          throw error;
+        }
+        const warnings = await this.claudeRunningSessionWarnings();
+        // Review #590 (delete race): the copy below can run for minutes, and
+        // deleteAccount is deliberately lock-free — so the account is
+        // re-read after every long await. A vanished account aborts before
+        // the store write (saveAccount would otherwise INSERT a zombie under
+        // a fresh id) and before the point of no return (the backup rename).
+        // In adopt mode the abort also removes the freshly copied contents,
+        // so no credential copy outlives its deleted account.
+        const requireAliveAccount = async ({ cleanupCopy = false, outcome = '; your existing Claude setup was not touched' } = {}) => {
+          const current = this.store.getAccount(accountId);
+          const refuse = async (why) => {
+            if (cleanupCopy) {
+              await fs.promises.rm(latest.profileRef, { recursive: true, force: true }).catch(() => {});
+            }
+            const error = new Error(`${why} while the adoption was running${outcome}`);
+            error.statusCode = 409;
+            throw error;
+          };
+          if (!current || !current.enabled) await refuse('account was removed or disabled');
+          // Review #590 round 2 (CodeRabbit stale-account finding): an
+          // update repointing the account's profile home mid-adoption would
+          // otherwise let this flow activate a profile the record no
+          // longer names.
+          if (current.profileRef !== latest.profileRef) await refuse("the account's profile home was repointed");
+          return current;
+        };
+        // Review #590 round 2 (N3): a MISSING active link is not "already
+        // managed" — nothing pins new sessions yet, and calling it managed
+        // would let the sheet skip activation and recreate the original
+        // trap on the next plain login. Degenerate to a plain activation.
+        if (!legacyStat) {
+          await this.activateClaude({ profileRef: latest.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
+          const previousPins = await this.captureClaudeScopePins();
+          await this.scopeClaudeSecureStorage(latest.profileRef);
+          try {
+            await requireAliveAccount();
+          } catch (error) {
+            // Round 3 (R3-A): pre-call state was "no active link", so
+            // restoring it means unlinking the symlink this call just
+            // created — never leave ~/.claude pointing at a dead account.
+            // Round 7 (pin rollback): the scope call above re-aimed the
+            // shell pin and launchd values at the dead account's home; put
+            // the pre-call pin state back too, and say so when that fails.
+            await fs.promises.unlink(this.claudeActiveLink).catch(() => {});
+            try {
+              await this.restoreClaudeScopePins(previousPins);
+            } catch (pinError) {
+              error.message += `; ModelDeck could not restore the previous terminal environment pins (${errorMessage(pinError)})`;
+            }
+            throw error;
+          }
+          return { account: this.setDefaultAccount('claude', accountId), warnings, backupPath: null };
+        }
+        if (mode === 'adopt') {
+          await this.adoptClaudeLegacy({
+            sourceDir: this.claudeActiveLink,
+            profileRef: latest.profileRef,
+            profilesDir: this.claudeProfilesDir,
+            replaceableEntries: await this.claudeAdoptionReplaceableEntries(latest.profileRef),
+          });
+          try {
+            await this.ensureClaudeProfileExplainer({ profileRef: latest.profileRef });
+          } catch (error) {
+            console.error(`[modeldeck] profile explainer install failed during legacy home adoption: ${error?.message || error}`);
+          }
+          await requireAliveAccount({ cleanupCopy: true });
+          // Round 2 (N1): shared scope's artifacts were verified-replaceable
+          // and discarded by the swap — re-reconcile so the memory link and
+          // the mcpServers merge land on the ADOPTED home (mirrors the
+          // cswap import path). Round 3 (R3-B): the merge record from the
+          // pre-adoption empty home is forgotten first, so the adopted
+          // memory is backed up and merged like a newly arriving profile's.
+          // Round 3 (R3-C): a reconcile failure restores an empty home so
+          // the retry is never bricked by the emptiness guard — and the
+          // adoption stamp lands only after this block, so metadata never
+          // claims an adoption that didn't finish.
+          try {
+            await this.sharedScope.resetProfileMemoryMerge(this.store.getAccount(accountId));
+            await this.accountProfileSetChanged();
+          } catch (error) {
+            // Round 4 (CodeRabbit): items the failed reconcile already
+            // copied into shared memory are removed too — left behind, the
+            // retry would re-copy them under collision-renamed duplicates.
+            await this.sharedScope.undoProfileMemoryMerge(this.store.getAccount(accountId)).catch(() => {});
+            await fs.promises.rm(latest.profileRef, { recursive: true, force: true }).catch(() => {});
+            await fs.promises.mkdir(latest.profileRef, { recursive: true, mode: 0o700 }).catch(() => {});
+            throw new Error(
+              'adoption could not finish while shared settings were being reapplied — '
+              + 'nothing was activated, and your existing Claude setup was not touched. '
+              + `Start Fresh is still available. (${errorMessage(error)})`,
+            );
+          }
+          const alive = await requireAliveAccount({ cleanupCopy: true });
+          // Daemon-authored metadata rides the repo's rebase discipline
+          // (mirrors refreshClaudeProfileMetadata) so a concurrent writer's
+          // keys are never clobbered by this save.
+          this.store.saveAccount({
+            id: alive.id, provider: alive.provider, label: alive.label,
+            profileRef: alive.profileRef, identity: alive.identity,
+            purpose: alive.purpose, color: alive.color, enabled: alive.enabled,
+            metadata: this.mergeDaemonMetadataAtPersist(
+              alive.id,
+              { ...alive.metadata, adoptedLegacyHome: true },
+              ['adoptedLegacyHome'],
+            ),
+          });
+        }
+        await requireAliveAccount({ cleanupCopy: mode === 'adopt' });
+        const backupPath = `${this.claudeActiveLink}.pre-modeldeck-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+        if (await fs.promises.lstat(backupPath).then(() => true, () => false)) {
+          throw new Error(`legacy Claude backup destination already exists: ${backupPath}`);
+        }
+        await fs.promises.rename(this.claudeActiveLink, backupPath);
+        try {
+          await this.activateClaude({ profileRef: latest.profileRef, activeLink: this.claudeActiveLink, profilesDir: this.claudeProfilesDir });
+        } catch (error) {
+          // Review #590 (live-session race): a rollback that fails (e.g. a
+          // running session recreated a non-empty ~/.claude in the window,
+          // making the rename ENOTEMPTY) must never be swallowed — the
+          // user's real home is sitting at the backup path and the error is
+          // the only place that can say so.
+          try {
+            await fs.promises.rename(backupPath, this.claudeActiveLink);
+          } catch {
+            throw new Error(
+              `${errorMessage(error)} — your previous Claude setup is preserved at ${backupPath}; `
+              + 'ModelDeck could not move it back automatically.',
+            );
+          }
+          throw error;
+        }
+        const previousPins = await this.captureClaudeScopePins();
+        await this.scopeClaudeSecureStorage(latest.profileRef);
+        if (mode === 'adopt') {
+          const refreshed = this.store.getAccount(accountId);
+          if (refreshed) await this.refreshClaudeProfileMetadata(refreshed).catch(() => {});
+        }
+        // Deleted after the flip landed: undo the flip so ~/.claude never
+        // points at a dead account's home, then report honestly. Round 2
+        // (N2): renaming a DIRECTORY over a symlink is ENOTDIR, so the
+        // symlink is unlinked first; only then can the backup move home —
+        // and either undo step failing must name where the data sits
+        // instead of being swallowed. Round 7 (pin rollback): the scope call
+        // above re-aimed the shell pin and launchd values at a profile home
+        // this branch may just have deleted — the pin restore runs after the
+        // filesystem rollback on BOTH of its outcomes, and a pin failure is
+        // surfaced on the same error instead of masking it.
+        try {
+          await requireAliveAccount({ cleanupCopy: mode === 'adopt', outcome: '' });
+        } catch (raceError) {
+          let filesystemRestored = true;
+          try {
+            await fs.promises.unlink(this.claudeActiveLink);
+            await fs.promises.rename(backupPath, this.claudeActiveLink);
+          } catch {
+            filesystemRestored = false;
+          }
+          let pinFailure = null;
+          try {
+            await this.restoreClaudeScopePins(previousPins);
+          } catch (error) {
+            pinFailure = errorMessage(error);
+          }
+          raceError.message += filesystemRestored
+            ? '; your previous Claude setup was restored'
+            : `; your previous Claude setup is preserved at ${backupPath} — ModelDeck could not move it back automatically`;
+          if (pinFailure) {
+            raceError.message += `; ModelDeck could not restore the previous terminal environment pins (${pinFailure})`;
+          }
+          throw raceError;
+        }
+        return { account: this.setDefaultAccount('claude', accountId), warnings, backupPath };
+      }, { queueTimeoutMs: this.claudeActivationQueueTimeoutMs });
+    } finally {
+      this.endClaudeActivation(accountId);
+    }
+  }
+
   // First-run trap seen in the field: with no provider CLI installed, step 1
   // used to succeed (profile home + account created), then step 2 exploded in
   // Terminal with "command not found" — leaving partial state and a user with
@@ -3987,6 +4258,72 @@ export class ModelDeckService {
       this.claudeSecureStorageSupported = false;
     }
     return this.claudeSecureStorageSupported;
+  }
+
+  // Review #590 (CodeRabbit pin-rollback finding): activation pins are
+  // global mutable state — the shell pin file plus, on macOS, the two
+  // launchd variables — and the adoption flow's rollback branches used to
+  // restore only ~/.claude, leaving every pin aimed at a profile home the
+  // rollback may have just deleted. Capture reads the pre-operation state;
+  // restore puts it back exactly (absent stays absent, a value stays that
+  // value). A piece captured as undefined was unreadable and is left alone
+  // rather than guessed at. Capture itself never throws: pin handling is
+  // best-effort everywhere in this file and must not block the operation.
+  async captureClaudeScopePins() {
+    const captured = { secureStorage: this.claudeSecureStorage ?? null };
+    try {
+      captured.shellPin = await fs.promises.readFile(this.claudeShellEnvFile, 'utf8');
+    } catch (error) {
+      captured.shellPin = error?.code === 'ENOENT' ? null : undefined;
+    }
+    // Mirrors the guards under which scopeClaudeSecureStorage mutates
+    // launchd: never on other platforms, never from a demo instance.
+    if (this.platform === 'darwin' && !this.demoFixtures) {
+      captured.launchd = {};
+      for (const name of ['CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR']) {
+        try {
+          const { stdout } = await this.exec('/bin/launchctl', ['getenv', name], { timeout: 5_000, maxBuffer: 65_536 });
+          const value = String(stdout ?? '').replace(/\n+$/, '');
+          captured.launchd[name] = value === '' ? null : value;
+        } catch {
+          captured.launchd[name] = undefined;
+        }
+      }
+    }
+    return captured;
+  }
+
+  async restoreClaudeScopePins(captured) {
+    if (!captured) return;
+    const failures = [];
+    if (captured.shellPin === null) {
+      try { await fs.promises.rm(this.claudeShellEnvFile, { force: true }); }
+      catch (error) { failures.push(`shell pin: ${errorMessage(error)}`); }
+    } else if (typeof captured.shellPin === 'string') {
+      // temp + rename, mirroring writeClaudeShellEnvFile's atomicity.
+      const temporary = `${this.claudeShellEnvFile}.modeldeck-${process.pid}-${crypto.randomUUID()}`;
+      try {
+        await fs.promises.mkdir(path.dirname(this.claudeShellEnvFile), { recursive: true });
+        await fs.promises.writeFile(temporary, captured.shellPin, { mode: 0o600 });
+        await fs.promises.rename(temporary, this.claudeShellEnvFile);
+      } catch (error) {
+        await fs.promises.unlink(temporary).catch(() => {});
+        failures.push(`shell pin: ${errorMessage(error)}`);
+      }
+    }
+    if (captured.launchd && this.platform === 'darwin' && !this.demoFixtures) {
+      for (const [name, value] of Object.entries(captured.launchd)) {
+        if (value === undefined) continue;
+        try {
+          if (value === null) await this.exec('/bin/launchctl', ['unsetenv', name], { timeout: 5_000, maxBuffer: 65_536 });
+          else await this.exec('/bin/launchctl', ['setenv', name, value], { timeout: 5_000, maxBuffer: 65_536 });
+        } catch (error) {
+          failures.push(`${name}: ${errorMessage(error)}`);
+        }
+      }
+    }
+    this.claudeSecureStorage = captured.secureStorage;
+    if (failures.length) throw new Error(failures.join('; '));
   }
 
   async scopeClaudeSecureStorage(profileRef) {

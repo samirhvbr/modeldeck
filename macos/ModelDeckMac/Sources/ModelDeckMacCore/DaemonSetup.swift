@@ -385,11 +385,30 @@ public enum SystemPromptCoaching {
     /// not redesigned): frames the Login Items approval before macOS asks.
     public static let loginItemsConsentNote = "macOS will confirm this with its own system prompt, and may ask for your password. That request comes from macOS, not ModelDeck."
 
-    /// Headline + body for the Keychain heads-up shown while the service is
+    /// Headline + bodies for the Keychain heads-up shown while the service is
     /// installing/starting — BEFORE its first refresh triggers the per-
     /// account Keychain prompts.
     public static let keychainHeadline = "Next: Keychain permission prompts"
-    public static let keychainBody = "Once the service starts, macOS will ask permission for it to read each Claude subscription's sign-in from your Keychain — one prompt per subscription, from macOS itself. Choose Always Allow (it may ask for your password once per subscription); plain Allow asks again on every refresh. Properly signed app updates won't re-prompt."
+
+    /// Issue #588: the FIRST Keychain prompt a fresh install fires — before
+    /// any subscription exists — is the service reading back ModelDeck's own
+    /// token (service "modeldeck", account "mutation-token", created by
+    /// `install()` moments earlier; read by src/token.mjs at daemon startup
+    /// through /usr/bin/security, which isn't on the item's ACL). macOS words
+    /// it as "security wants to use your confidential information stored in
+    /// 'modeldeck'" — on Rick's fresh install that read as a credential grab.
+    /// Tim's ruling (issue #588, 2026-08-26): the prompt may fire, but the
+    /// app explains it FIRST — what macOS will say, why, and that Always
+    /// Allow is safe. This body quotes the prompt so users can match it.
+    public static let serviceTokenBody = "First, right as the service starts, macOS will say “security” wants to use confidential information stored in “modeldeck” — that item is ModelDeck's own service key, a random token this app just created so only ModelDeck can change its local service. It is not your Claude or Codex sign-in, and it never leaves this Mac. Click Always Allow (macOS may ask for your Mac login password once)."
+
+    public static let keychainBody = "Then, as each Claude subscription first refreshes, macOS will ask permission for the service to read that subscription's sign-in from your Keychain — one prompt per subscription, from macOS itself. Choose Always Allow (it may ask for your password once per subscription); plain Allow asks again on every refresh. Properly signed app updates won't re-prompt."
+
+    /// The coaching paragraphs in the order the prompts actually fire: the
+    /// service-token prompt comes first (daemon startup), the per-
+    /// subscription prompts only after an account exists. The card renders
+    /// this array verbatim, so tests pinning its order pin the UI's order.
+    public static let keychainBodiesInPromptOrder = [serviceTokenBody, keychainBody]
 }
 
 // MARK: - Model

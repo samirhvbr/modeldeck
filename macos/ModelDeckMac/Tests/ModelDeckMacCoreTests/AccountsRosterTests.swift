@@ -222,11 +222,13 @@ struct AccountsRosterSectionTests {
 
     // MARK: - Blocked banner names the path + click-level action (issue #227)
 
-    @Test func guidanceBannerAppendsRadioStepAndCarriesParsedPath() {
-        // The daemon's real guidance format ends with the blocking path;
-        // the banner parses it for Reveal in Finder and names the working
-        // retry path (the account's radio, post-#234) after the daemon's
-        // own move instruction. Placeholder path only — safety contract.
+    @Test func guidanceBannerRewritesClobberGuardForClaudeAndKeepsReveal() {
+        // TRIPWIRE #586 (supersedes the #227 verbatim rule for this one
+        // message): the daemon's clobber-guard text must never reach a
+        // Claude user raw — it mislabels their live setup and instructs
+        // manual folder surgery the add flow now performs. The banner
+        // renders the honest copy, names the daemon's exact path, and keeps
+        // Reveal in Finder working. Placeholder path only — safety contract.
         let guidance = "claude activation requires a one-time migration: "
             + "move the existing directory aside at a quiet moment before "
             + "activating: /placeholder/home/.claude"
@@ -238,9 +240,13 @@ struct AccountsRosterSectionTests {
             guidanceForAccount: { $0 == "a1" ? guidance : nil }
         )
         let banner = sections[0].banner
-        #expect(banner?.message.hasPrefix(guidance) == true)
-        #expect(banner?.message.contains("click Work's radio to activate") == true)
+        #expect(banner?.message.contains("one-time migration") == false)
+        #expect(banner?.message.contains("move the existing directory") == false)
+        #expect(banner?.message.contains("existing Claude setup") == true)
+        #expect(banner?.message.contains("/placeholder/home/.claude") == true)
+        #expect(banner?.message.contains("Add Subscription") == true)
         #expect(banner?.blockedPath == "/placeholder/home/.claude")
+        #expect(banner?.retryRunsActivation == true)
     }
 
     @Test func blockedPathParsingOnlyAcceptsTrailingPaths() {
@@ -258,33 +264,48 @@ struct AccountsRosterSectionTests {
     }
 
     @Test func stateDerivedBlockedNamesConventionalPathAndRadioStep() {
-        // Tim's fresh-install field data (#227): the old copy ("a one-time
-        // migration must run") named neither the blocker nor an action, so
-        // repeated Retry read as a bug. The state payload carries no path,
-        // so the copy names the conventional active-link location and the
-        // radio as the retry path once the directory is moved.
+        // TRIPWIRE #586 (was #227): the blocked banner must (a) never call
+        // the user's live setup a leftover "from a previous install", (b)
+        // never tell a Claude user to hand-move their real Claude home —
+        // it points at the add flow's in-app adoption instead.
         let s = state(claudeState: "blocked", accounts: [
             account(id: "a1", label: "Work", isDefault: true),
         ])
         let banner = AccountsRoster.sections(state: s)[0].banner
-        #expect(banner?.message.contains("existing Claude directory") == true)
+        #expect(banner?.message.contains("existing Claude setup") == true)
         #expect(banner?.message.contains("~/.claude") == true)
-        #expect(banner?.message.contains("Move or rename") == true)
-        #expect(banner?.message.contains("click Work's radio to activate") == true)
+        #expect(banner?.message.contains("never overwrites") == true)
+        #expect(banner?.message.contains("Add Subscription") == true)
+        #expect(banner?.message.contains("previous install") == false)
+        #expect(banner?.message.contains("Move or rename") == false)
         #expect(banner?.blockedPath == "~/.claude")
     }
 
     @Test func stateDerivedBlockedWithNoDefaultPointsAtPickingAnAccount() {
-        // Post-#234 fresh-install pattern: no selected row, no dead Retry —
-        // the message carries the whole path out (move the directory, then
-        // pick an account; its radio runs activation).
+        // Post-#234 fresh-install pattern, updated for #586: with or without
+        // a selected row, the Claude banner's whole path out is the add
+        // flow's adoption — no manual folder step, no dead Retry.
         let s = state(claudeState: "blocked", accounts: [
             account(id: "a1", label: "Work"),
         ])
         let banner = AccountsRoster.sections(state: s)[0].banner
-        #expect(banner?.message.contains("pick a subscription below") == true)
+        #expect(banner?.message.contains("Add Subscription") == true)
         #expect(banner?.offersRetry == false)
         #expect(banner?.blockedPath == "~/.claude")
+    }
+
+    @Test func stateDerivedBlockedForCodexKeepsTheManualPath() {
+        // Codex has no in-app adoption (#586 is Claude-only): its banner
+        // keeps the manual move/rename guidance, minus the "previous
+        // install" fiction.
+        let s = DeckState(
+            accounts: [account(id: "c1", provider: "codex", label: "Work Codex", isDefault: true)],
+            activation: DeckActivation(codex: ProviderActivation(state: "blocked"))
+        )
+        let banner = AccountsRoster.sections(state: s)[0].banner
+        #expect(banner?.message.contains("existing Codex setup") == true)
+        #expect(banner?.message.contains("Move or rename") == true)
+        #expect(banner?.message.contains("previous install") == false)
     }
 
     @Test func onlyBlockedStateCarriesABlockedPath() {
@@ -371,6 +392,34 @@ struct AccountsRosterSectionTests {
         #expect(banner?.message.contains("no longer in the roster") == true)
         #expect(banner?.retryRunsActivation == false, "cannot re-activate a vanished account")
         #expect(banner?.affectedAccountID == nil)
+    }
+
+    /// TRIPWIRE #590 round 2: the orphaned-trouble path (2.5) was the last
+    /// route for the raw clobber-guard migration text to reach a Claude
+    /// user — it must go through the same rewrite as the per-account path.
+    @Test func orphanedClaudeClobberGuardIsRewritten() {
+        let s = state(claudeState: "effective", accounts: [
+            account(id: "a1", label: "Work", isDefault: true),
+        ])
+        let sections = AccountsRoster.sections(
+            state: s,
+            troubleForProvider: { provider in
+                provider == .claude
+                    ? ActivationTrouble(
+                        accountID: "ghost",
+                        kind: .guidance,
+                        message: "Claude activation requires a one-time migration: "
+                            + "move the existing directory aside at a quiet moment "
+                            + "before activating: /Users/fixture/.claude"
+                    )
+                    : nil
+            }
+        )
+        let banner = sections[0].banner
+        #expect(banner?.message.contains("one-time migration") == false)
+        #expect(banner?.message.contains("existing Claude setup (/Users/fixture/.claude)") == true)
+        #expect(banner?.message.contains("no longer in the roster") == true)
+        #expect(banner?.blockedPath == "/Users/fixture/.claude")
     }
 
     @Test func emptyProviderYieldsNoSectionEvenWithOrphanedTrouble() {

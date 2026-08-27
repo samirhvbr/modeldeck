@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Issue #586 — Add Subscription: legacy ~/.claude adoption step (mockup)</title>
+<style>
+  body { margin: 0; padding: 40px; background: #6b6b6b; font-family: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif; display: flex; flex-direction: column; align-items: center; gap: 36px; }
+  .caption { color: #ddd; font-size: 13px; max-width: 480px; text-align: center; }
+  .sheet { width: 456px; background: #ececec; border-radius: 12px; padding: 18px; box-shadow: 0 18px 50px rgba(0,0,0,.45); box-sizing: border-box; }
+  .sheet h1 { font-size: 13px; font-weight: 700; margin: 0 0 2px; color: #1d1d1f; }
+  .step { font-size: 11px; color: #6e6e73; margin: 0 0 14px; }
+  .body-text { font-size: 13px; color: #1d1d1f; line-height: 1.45; margin: 0 0 12px; }
+  .fine { font-size: 11px; color: #6e6e73; line-height: 1.5; margin: 0 0 18px; }
+  .footer { display: flex; justify-content: flex-end; gap: 8px; }
+  .btn { font-size: 13px; padding: 4px 14px; border-radius: 6px; border: 1px solid rgba(0,0,0,.12); background: linear-gradient(#fff,#f3f3f3); color: #1d1d1f; }
+  .btn.primary { background: linear-gradient(#4d9dfa,#2f7cf6); color: #fff; border-color: #2f6fe0; font-weight: 600; }
+  .banner { width: 640px; background: #faf6e8; border: 1px solid #e8dfb8; border-radius: 10px; padding: 14px 16px; display: flex; gap: 10px; align-items: flex-start; box-sizing: border-box; }
+  .banner .icon { color: #c9a227; font-size: 15px; line-height: 1.4; }
+  .banner p { font-size: 13px; color: #4a4a3a; line-height: 1.5; margin: 0; }
+  .banner .reveal { margin-left: auto; flex-shrink: 0; }
+</style>
+</head>
+<body>
+  <div class="caption">Mockup 1 — the Add Subscription sheet when a real ~/.claude exists.<br>Replaces the red dead-end error. Reached automatically after “Create &amp; Sign In”.</div>
+  <div class="sheet">
+    <h1>Use your existing Claude setup?</h1>
+    <p class="step">Step 1 of 3</p>
+    <p class="body-text">This Mac already has a Claude setup — the ~/.claude folder. ModelDeck can use it as this subscription, so your existing sign-in and settings carry over. Usually no login is needed at all.</p>
+    <p class="fine">Either way, the current folder is kept as a backup next to ~/.claude — nothing is deleted. Quit any running Claude Code sessions before continuing.</p>
+    <div class="footer">
+      <button class="btn">Cancel</button>
+      <button class="btn">Start Fresh</button>
+      <button class="btn primary">Use Existing Setup</button>
+    </div>
+  </div>
+
+  <div class="caption">Mockup 2 — the Settings → Subscriptions blocked banner, rewritten.<br>(Old copy claimed the folder was “from a previous install” and told users to move it by hand.)</div>
+  <div class="banner">
+    <span class="icon">&#9888;</span>
+    <p>Activation blocked — this Mac's existing Claude setup (usually ~/.claude) is still in place, and ModelDeck never overwrites it. Add Subscription… can bring it in as a subscription or set it aside as a backup — no manual folder work needed.</p>
+    <button class="btn reveal">Reveal in Finder</button>
+  </div>
+</body>
+</html>

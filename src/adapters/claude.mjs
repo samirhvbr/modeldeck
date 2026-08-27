@@ -566,6 +566,76 @@ export async function importClaudeSwapProfiles({ selections, profilesDir } = {})
   }
 }
 
+// Issue #586 — first-run adoption: copy the user's legacy real `~/.claude`
+// into an already-created (empty) profile home. Same safety envelope as the
+// cswap import: symlink-free source, owner-only result, copy-then-swap so the
+// profile home is never half-written. The legacy source is never mutated here
+// — moving it aside is the service's separate step, ordered after this copy.
+export async function adoptLegacyClaudeHome({
+  sourceDir, profileRef, profilesDir,
+  // Entries the CALLER proved ModelDeck authored (shared-scope artifacts in
+  // a just-created home); the explainer is always ModelDeck's. Everything
+  // else counts as populated.
+  replaceableEntries = [],
+} = {}) {
+  if (!sourceDir) throw new Error('legacy Claude home path is required');
+  const canonical = await validateClaudeProfileHome({ profileRef, profilesDir });
+  // Review #590 blocker: the swap below discards the displaced profile home,
+  // so adoption is only ever legal into an effectively-empty one. A populated
+  // home (an established account passed by id) is refused — its credentials
+  // and history are not this function's to destroy.
+  const replaceable = new Set(['CLAUDE.md', ...replaceableEntries]);
+  const populated = (await fs.promises.readdir(canonical))
+    .filter((entry) => !replaceable.has(entry));
+  if (populated.length) {
+    throw new Error(`Claude profile home is not empty — adoption would destroy its contents: ${canonical}`);
+  }
+  const source = path.resolve(sourceDir);
+  const sourceStat = await fs.promises.lstat(source);
+  if (!sourceStat.isDirectory() || sourceStat.isSymbolicLink()) {
+    throw new Error(`legacy Claude home must be a real directory: ${source}`);
+  }
+  const root = path.dirname(canonical);
+  const name = path.basename(canonical);
+  const staged = path.join(root, `.${name}.modeldeck-adopt-${crypto.randomUUID()}`);
+  const discarded = path.join(root, `.${name}.modeldeck-adopt-discard-${crypto.randomUUID()}`);
+  try {
+    await copyApprovedHome(source, staged);
+    await fs.promises.rename(canonical, discarded);
+    // Review #590 round 2: the emptiness check above ran BEFORE a copy that
+    // can take minutes. Anything non-replaceable that landed in the profile
+    // home during the copy is not this function's to destroy — put the
+    // displaced home back and refuse instead of deleting it below.
+    const appearedDuringCopy = (await fs.promises.readdir(discarded))
+      .filter((entry) => !replaceable.has(entry));
+    if (appearedDuringCopy.length) {
+      await fs.promises.rename(discarded, canonical);
+      throw new Error(`Claude profile home is not empty — adoption would destroy its contents: ${canonical}`);
+    }
+    try {
+      await fs.promises.rename(staged, canonical);
+    } catch (error) {
+      await fs.promises.rename(discarded, canonical).catch(() => {});
+      throw error;
+    }
+  } catch (error) {
+    await fs.promises.rm(staged, { recursive: true, force: true }).catch(() => {});
+    // The safety envelope's messages talk about "approved cswap profile
+    // homes" — wrong words for this call path, where the directory is the
+    // user's own ~/.claude and the reader is a first-run user (review #590).
+    if (/symbolic link/.test(errorMessage(error))) {
+      throw new Error(
+        'Your existing Claude folder contains a symbolic link, which adoption '
+        + "can't safely copy. Choose Start Fresh instead, or remove the link "
+        + `and try again. (${errorMessage(error)})`,
+      );
+    }
+    throw new Error(`Claude legacy home adoption failed: ${errorMessage(error)}`);
+  }
+  await fs.promises.rm(discarded, { recursive: true, force: true }).catch(() => {});
+  return canonical;
+}
+
 // ---------------------------------------------------------------------------
 // Issue #8 — add-account flow, step 3: read back the authenticated identity
 // from the provider's own status command. This extends the #17 adapter seam

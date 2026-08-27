@@ -18,11 +18,16 @@ private final class FakeRegistrar: DaemonServiceRegistrar, @unchecked Sendable {
     var errorLeavesStatus: ServiceRegistrationStatus?
     var registerCalls = 0
     var unregisterCalls = 0
+    /// Issue #588 tripwire hook: observes the moment registration happens
+    /// (the step that starts the daemon, whose startup Keychain read fires
+    /// the "stored in 'modeldeck'" prompt).
+    var onRegister: (() -> Void)?
 
     var status: ServiceRegistrationStatus { statusValue }
 
     func register() throws {
         registerCalls += 1
+        onRegister?()
         if let registerError {
             if let errorLeavesStatus { statusValue = errorLeavesStatus }
             throw registerError
@@ -41,6 +46,9 @@ private final class FakeTokenStore: MutationTokenStore, @unchecked Sendable {
     var existsError: Error?
     var createError: Error?
     var createCalls = 0
+    /// Issue #588 tripwire hook: observes the moment the token item is
+    /// created — the first Keychain-touching step of the install flow.
+    var onCreate: (() -> Void)?
 
     func tokenExists() throws -> Bool {
         if let existsError { throw existsError }
@@ -49,6 +57,7 @@ private final class FakeTokenStore: MutationTokenStore, @unchecked Sendable {
 
     func createToken() throws {
         createCalls += 1
+        onCreate?()
         if let createError { throw createError }
         exists = true
     }
@@ -1031,5 +1040,58 @@ final class KeychainPromptCoachingTests: XCTestCase {
         XCTAssertTrue(SystemPromptCoaching.keychainBody.contains("from macOS itself"))
         XCTAssertTrue(SystemPromptCoaching.keychainBody.contains("won't re-prompt"))
         XCTAssertTrue(SystemPromptCoaching.loginItemsConsentNote.contains("macOS, not ModelDeck"))
+    }
+
+    // MARK: Issue #588 — the "stored in 'modeldeck'" prompt is explained first
+
+    /// Tripwire for the load-bearing pieces of the service-token explainer:
+    /// it must quote the item name macOS shows ("modeldeck") so users can
+    /// match the prompt on screen, say what the item is and is NOT (a
+    /// provider sign-in — the scare Rick reported), and carry the safe
+    /// action ("Always Allow").
+    func testServiceTokenCopyCarriesTheLoadBearingGuidance() {
+        let body = SystemPromptCoaching.serviceTokenBody
+        XCTAssertTrue(body.contains("“modeldeck”"),
+                      "must quote the item name the macOS prompt shows")
+        XCTAssertTrue(body.contains("confidential information"),
+                      "must echo the prompt's own scary wording so users can match it")
+        XCTAssertTrue(body.contains("not your Claude or Codex sign-in"))
+        XCTAssertTrue(body.contains("Always Allow"))
+        XCTAssertTrue(body.contains("login password"),
+                      "the prompt asks for the login keychain password — say so ahead of time")
+    }
+
+    /// The prompts fire in a fixed order — service token at daemon startup,
+    /// per-subscription only after an account exists — and the card renders
+    /// `keychainBodiesInPromptOrder` verbatim, so this pins the UI order.
+    func testServiceTokenExplanationRendersBeforeThePerSubscriptionOne() {
+        XCTAssertEqual(SystemPromptCoaching.keychainBodiesInPromptOrder,
+                       [SystemPromptCoaching.serviceTokenBody,
+                        SystemPromptCoaching.keychainBody])
+    }
+
+    /// Issue #588's mandate, pinned structurally: by the time the install
+    /// flow touches the Keychain (token creation) or starts the daemon
+    /// (registration — whose startup token read fires the macOS prompt),
+    /// the coaching that explains those prompts is already showing.
+    func testCoachingIsActiveBeforeAnyKeychainTouchingStep() async {
+        probe = FakeProbe([false, true])
+        let model = makeModel()
+        var activeAtTokenCreation: Bool?
+        var activeAtRegistration: Bool?
+        // The model calls these seams synchronously from its MainActor
+        // context; assumeIsolated makes that visible to the compiler.
+        tokenStore.onCreate = {
+            activeAtTokenCreation = MainActor.assumeIsolated { model.keychainPromptCoachingActive }
+        }
+        registrar.onRegister = {
+            activeAtRegistration = MainActor.assumeIsolated { model.keychainPromptCoachingActive }
+        }
+        await model.evaluateOnLaunch()
+        await model.consentToInstall()
+        XCTAssertEqual(activeAtTokenCreation, true,
+                       "the explanation must be on screen before the first Keychain write")
+        XCTAssertEqual(activeAtRegistration, true,
+                       "the explanation must be on screen before the daemon can start and read the token back")
     }
 }

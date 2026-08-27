@@ -113,6 +113,23 @@ final class StubOnboardingBackend: AccountOnboarding, LoginLaunching, DeckStateP
         }
     }
 
+    // Issue #586: legacy ~/.claude adoption.
+    var adoptError: Error?
+    var adoptionResult: LegacyHomeAdoption?
+    private(set) var adoptions: [(accountID: String, startFresh: Bool)] = []
+
+    func adoptLegacyHome(accountID: String, startFresh: Bool) async throws -> LegacyHomeAdoption {
+        try locked {
+            adoptions.append((accountID: accountID, startFresh: startFresh))
+            if let adoptError { throw adoptError }
+            return adoptionResult ?? LegacyHomeAdoption(
+                account: DeckAccount(id: accountID, provider: "claude", label: "Adopted", isDefault: true),
+                warnings: [],
+                backupPath: "/Users/fixture/.claude.pre-modeldeck-2026"
+            )
+        }
+    }
+
     func launchLogin(command: String) throws {
         try locked {
             launchedCommands.append(command)
@@ -389,6 +406,194 @@ struct AddAccountModelTests {
         #expect(model.lastError == "account is disabled")
         #expect(backend.launchedCommands.isEmpty)
         #expect(model.didActivateForLogin == false)
+    }
+
+    // MARK: - Issue #586: legacy ~/.claude adoption
+
+    /// TRIPWIRE #586: a real legacy ~/.claude at add time must yield the
+    /// adoption offer, never the raw dead-end error the field hit.
+    @Test("A blocked first activation offers adoption instead of a dead end")
+    func blockedActivationOffersAdoption() async {
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonCodedError(
+            message: "Claude activation requires a one-time migration…",
+            code: DaemonClientError.activeLinkBlockedCode,
+            status: 400
+        )
+        let model = makeModel(backend)
+
+        let began = await model.begin(provider: .claude, label: "Insight", purpose: "work", colorHex: nil)
+        #expect(began)
+        #expect(model.step == .adoptLegacy)
+        // No raw daemon error, no Terminal, and the account is KEPT for the
+        // adoption call (cancel offers the explicit keep/remove choice).
+        #expect(model.lastError == nil)
+        #expect(backend.launchedCommands.isEmpty)
+        #expect(model.account?.id == "acct-1")
+        #expect(model.didActivateForLogin == false)
+        // Review #590 round 2: the command fetched before the blocked
+        // activation is kept as the sign-in fallback.
+        #expect(model.loginCommand == "'claude' /login")
+    }
+
+    @Test("Adopting a signed-in legacy home lands on confirm with no login")
+    func adoptSignedInLegacyHome() async {
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonCodedError(
+            message: "blocked", code: DaemonClientError.activeLinkBlockedCode, status: 400
+        )
+        let model = makeModel(backend)
+        _ = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
+
+        let resolved = await model.resolveLegacyHome(startFresh: false)
+        #expect(resolved)
+        #expect(model.step == .confirm)
+        #expect(backend.adoptions.count == 1)
+        #expect(backend.adoptions.first?.startFresh == false)
+        #expect(model.identity == "user@example.invalid")
+        // The whole flow never opened Terminal — the carried-over sign-in
+        // made the login step unnecessary.
+        #expect(backend.launchedCommands.isEmpty)
+    }
+
+    @Test("Adopting a signed-out legacy home falls into the normal sign-in step")
+    func adoptSignedOutLegacyHome() async {
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonCodedError(
+            message: "blocked", code: DaemonClientError.activeLinkBlockedCode, status: 400
+        )
+        backend.verification = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Insight"),
+            authenticated: false
+        )
+        let model = makeModel(backend)
+        _ = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
+
+        let resolved = await model.resolveLegacyHome(startFresh: false)
+        #expect(resolved)
+        #expect(model.step == .signIn)
+        // Adoption already flipped activation; the login command is on hand
+        // and Terminal opened for the plain login.
+        #expect(backend.launchedCommands == ["'claude' /login"])
+    }
+
+    @Test("Start fresh moves the legacy home aside and proceeds to sign-in")
+    func startFreshSkipsVerification() async {
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonCodedError(
+            message: "blocked", code: DaemonClientError.activeLinkBlockedCode, status: 400
+        )
+        let model = makeModel(backend)
+        _ = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
+
+        let resolved = await model.resolveLegacyHome(startFresh: true)
+        #expect(resolved)
+        #expect(model.step == .signIn)
+        #expect(backend.adoptions.first?.startFresh == true)
+        // Fresh mode never wastes a verify on a home known to be empty.
+        #expect(backend.verifiedIDs.isEmpty)
+        #expect(backend.launchedCommands == ["'claude' /login"])
+    }
+
+    @Test("A failed adoption stays on the offer with an honest error")
+    func adoptionFailureStaysOnOffer() async {
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonCodedError(
+            message: "blocked", code: DaemonClientError.activeLinkBlockedCode, status: 400
+        )
+        backend.adoptError = DaemonClientError.daemonError(
+            message: "legacy Claude backup destination already exists", status: 400
+        )
+        let model = makeModel(backend)
+        _ = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
+
+        let resolved = await model.resolveLegacyHome(startFresh: false)
+        #expect(!resolved)
+        #expect(model.step == .adoptLegacy)
+        #expect(model.lastError == "legacy Claude backup destination already exists")
+        #expect(backend.launchedCommands.isEmpty)
+    }
+
+    @Test("A 409 already-managed refusal on retry proceeds as the success it proves")
+    func alreadyManagedRetryProceeds() async {
+        // Review #590: a big-copy adoption can complete daemon-side after the
+        // client timed out; the retry's 409 is proof it landed, never a dead
+        // end.
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonCodedError(
+            message: "blocked", code: DaemonClientError.activeLinkBlockedCode, status: 400
+        )
+        backend.adoptError = DaemonClientError.daemonError(
+            message: "there is no legacy Claude directory to adopt — /placeholder/.claude is already managed",
+            status: 409
+        )
+        let model = makeModel(backend)
+        _ = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
+
+        let resolved = await model.resolveLegacyHome(startFresh: false)
+        #expect(resolved)
+        #expect(model.step == .confirm)
+    }
+
+    @Test("Adopt-time running-session warnings surface like the activate path's")
+    func adoptionWarningsSurface() async {
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonCodedError(
+            message: "blocked", code: DaemonClientError.activeLinkBlockedCode, status: 400
+        )
+        backend.adoptionResult = LegacyHomeAdoption(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Insight", isDefault: true),
+            warnings: ["1 running Claude session may lose session storage."],
+            backupPath: "/placeholder/.claude.pre-modeldeck-2026"
+        )
+        let model = makeModel(backend)
+        _ = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
+
+        _ = await model.resolveLegacyHome(startFresh: false)
+        #expect(model.completionWarning?.contains("running Claude session") == true)
+    }
+
+    /// TRIPWIRE #590 round 2 (CodeRabbit): a successful adoption followed by
+    /// a failed second login-command request must still reach the sign-in
+    /// step with the initially fetched command — never a commandless sign-in
+    /// surface or a dead-ended offer.
+    @Test("A failed login-command re-fetch after adoption falls back to the initial command")
+    func loginCommandRefetchFailureUsesInitialFallback() async {
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonCodedError(
+            message: "blocked", code: DaemonClientError.activeLinkBlockedCode, status: 400
+        )
+        let model = makeModel(backend)
+        _ = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
+        backend.loginCommandError = DaemonClientError.httpStatus(503)
+
+        let resolved = await model.resolveLegacyHome(startFresh: true)
+        #expect(resolved)
+        #expect(model.step == .signIn)
+        #expect(model.loginCommand == "'claude' /login")
+        #expect(model.lastError == nil)
+        #expect(backend.launchedCommands == ["'claude' /login"])
+    }
+
+    @Test("A non-blocked activation failure still surfaces as an error, never the offer")
+    func otherActivationFailuresKeepTheHonestError() async {
+        let backend = StubOnboardingBackend()
+        backend.loginResult = activationLogin
+        backend.activateError = DaemonClientError.daemonError(message: "account is disabled", status: 400)
+        let model = makeModel(backend)
+
+        let began = await model.begin(provider: .claude, label: "Insight", purpose: "", colorHex: nil)
+        #expect(!began)
+        #expect(model.step == .details)
+        #expect(model.lastError == "account is disabled")
     }
 
     @Test("A failed prior-active lookup is surfaced, never silently unrestored")

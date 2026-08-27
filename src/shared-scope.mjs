@@ -168,6 +168,25 @@ function collisionName(name, accountId, occupied) {
   return candidate;
 }
 
+// PR #590 round 5: identity of a shared-memory item at copy time — lstat
+// facts only (type, inode, size, mtime; recursive for directories), enough
+// to tell "still the bytes the attach copied" from "another linked profile
+// replaced or edited it since". null means the item is absent.
+async function memoryItemIdentity(target) {
+  let stat = null;
+  try { stat = await fs.promises.lstat(target); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (!stat) return null;
+  const kind = stat.isDirectory() ? 'd' : stat.isSymbolicLink() ? 'l' : 'f';
+  const self = `${kind}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+  if (kind !== 'd') return self;
+  const parts = [self];
+  for (const entry of (await fs.promises.readdir(target)).sort()) {
+    parts.push(`${entry}=${await memoryItemIdentity(path.join(target, entry))}`);
+  }
+  return parts.join('\n');
+}
+
 function pathIsWithin(candidate, root) {
   const relative = path.relative(root, candidate);
   return relative === ''
@@ -206,8 +225,13 @@ export class SharedScopeEngine {
     this.clearTimeout = options.clearTimeout || globalThis.clearTimeout;
     this.debounceMs = Number(options.debounceMs ?? 250);
     this.beforeAtomicRename = options.beforeAtomicRename || null;
+    this.afterUndoQuarantine = options.afterUndoQuarantine || null;
     this.afterMcpRead = options.afterMcpRead || null;
     this.watchers = new Map();
+    // account id -> shared-memory target names the most recent attach copied
+    // for that account (PR #590 round 4) — consumed by undoProfileMemoryMerge
+    // when a caller's operation dies after the copies landed.
+    this.attachedMemoryItems = new Map();
     this.reconcileTimer = null;
     this.operation = null;
     this.deferredTail = Promise.resolve();
@@ -698,6 +722,12 @@ export class SharedScopeEngine {
       await this.backupMemory(profile, stat);
       if (stat?.isDirectory() && !mergedProfiles.has(profile.account.id)) {
         const occupied = new Set(await fs.promises.readdir(this.sharedMemoryDir));
+        // PR #590 round 4: record every shared target this attach creates so
+        // a caller whose operation fails after the copies landed can undo
+        // them — otherwise a retry re-copies the same items and
+        // collisionName mints renamed duplicates.
+        const copied = [];
+        this.attachedMemoryItems.set(profile.account.id, copied);
         for (const item of await fs.promises.readdir(memoryPath, { withFileTypes: true })) {
           const targetName = occupied.has(item.name)
             ? collisionName(item.name, profile.account.id, occupied)
@@ -713,6 +743,10 @@ export class SharedScopeEngine {
               force: false,
             });
             await fs.promises.rename(temporary, target);
+            // Round 5: the recorded identity lets the undo prove the item is
+            // still the copy this attach made — a linked profile's session
+            // can modify it at any moment, and modified items must survive.
+            copied.push({ name: targetName, identity: await memoryItemIdentity(target) });
           } catch (error) {
             await fs.promises.rm(temporary, { recursive: true, force: true }).catch(() => {});
             throw error;
@@ -728,6 +762,79 @@ export class SharedScopeEngine {
       }
       await this.linkMemory({ profile, path: memoryPath, stat });
     }
+  }
+
+  // Issue #586 (PR #590 round 3): adoption replaces a profile home
+  // wholesale, so the merge bookkeeping recorded for the PREVIOUS home is
+  // stale — the id in mergedProfiles, the memory.absent marker, AND any
+  // memory backup (round 4: backupMemory skips when either backup entry
+  // exists, so a stale copy from a failed prior attempt would shadow the
+  // adopted memory and a later disable would restore it). Forgetting all of
+  // it makes the reconcile treat the home as newly arrived.
+  async resetProfileMemoryMerge(account) {
+    if (!account || account.provider !== 'claude') return;
+    this.attachedMemoryItems.delete(account.id);
+    const manifest = this.readJsonSync(this.manifestFile, {});
+    const merged = new Set(Array.isArray(manifest.mergedProfiles) ? manifest.mergedProfiles : []);
+    if (merged.delete(account.id)) {
+      await this.atomicWriteJson(this.manifestFile, {
+        ...manifest,
+        mergedProfiles: [...merged].sort(),
+      });
+    }
+    const profile = this.managedProfiles().find((item) => item.account.id === account.id);
+    if (!profile) return;
+    for (const entry of [MEMORY_DIRECTORY, `${MEMORY_DIRECTORY}.absent`]) {
+      await fs.promises.rm(
+        path.join(this.backupDirectory(profile), entry),
+        { recursive: true, force: true },
+      ).catch(() => {});
+    }
+  }
+
+  // PR #590 round 4: the rollback counterpart to resetProfileMemoryMerge — a
+  // reconcile that dies AFTER attachMemoryProfiles copied this account's
+  // items into shared memory must not strand those copies, or the retry
+  // re-copies them and collisionName mints renamed duplicates. Removes
+  // exactly the shared targets the last attach recorded for this account,
+  // then forgets the merge bookkeeping. Round 5: removal only when the item
+  // is still identical to the copy the attach made — other managed profiles
+  // stay symlinked at the shared directory throughout, so a live session can
+  // edit or replace a recorded name inside the failure window, and that
+  // newer content must survive the rollback (the retry then lands the
+  // adopted copy under a collision name instead of clobbering).
+  // Round 6: rename-first closes the check-then-delete window instead of
+  // shrinking it. The rename atomically captures a single inode under a
+  // quarantine name, the identity is read from THAT path, and the delete
+  // removes exactly what was examined — a replacement landing at the
+  // original name at any moment is a different path and survives untouched.
+  async undoProfileMemoryMerge(account) {
+    if (!account || account.provider !== 'claude') return;
+    for (const item of this.attachedMemoryItems.get(account.id) || []) {
+      const target = path.join(this.sharedMemoryDir, item.name);
+      const quarantine = `${target}.modeldeck-undo-${crypto.randomUUID()}`;
+      // A failed capture (item already gone, or unreadable) resolves to
+      // keeping whatever is there.
+      try { await fs.promises.rename(target, quarantine); }
+      catch { continue; }
+      if (this.afterUndoQuarantine) await this.afterUndoQuarantine({ name: item.name });
+      // An unreadable identity is treated as modified: when in doubt, keep.
+      const identity = await memoryItemIdentity(quarantine).catch(() => undefined);
+      if (identity != null && identity === item.identity) {
+        await fs.promises.rm(quarantine, { recursive: true, force: true }).catch(() => {});
+        continue;
+      }
+      console.error(`[modeldeck] shared-memory rollback kept an item modified after the failed attach copied it: ${item.name}`);
+      // Modified content goes back under its original name; if a concurrent
+      // write re-occupied the name meanwhile, a collision name preserves
+      // both rather than clobbering either.
+      const occupied = new Set(await fs.promises.readdir(this.sharedMemoryDir).catch(() => []));
+      const restoreName = occupied.has(item.name)
+        ? collisionName(item.name, account.id, occupied)
+        : item.name;
+      await fs.promises.rename(quarantine, path.join(this.sharedMemoryDir, restoreName)).catch(() => {});
+    }
+    await this.resetProfileMemoryMerge(account);
   }
 
   async detachProfile(account) {

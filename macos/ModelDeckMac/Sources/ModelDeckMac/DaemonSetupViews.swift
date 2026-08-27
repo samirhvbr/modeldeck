@@ -156,20 +156,25 @@ struct DaemonSetupCard: View {
         }
     }
 
-    /// Issue #98: the calm Keychain heads-up shown while a fresh install is
-    /// in flight — BEFORE the daemon's first refresh triggers the per-
-    /// account macOS Keychain prompts. Only rendered on the install path
-    /// this session (never on plain launch evaluation or drift updates).
+    /// Issues #98 + #588: the calm Keychain heads-up shown while a fresh
+    /// install is in flight — BEFORE the daemon's startup token read fires
+    /// the "stored in 'modeldeck'" prompt, and before the first refresh
+    /// triggers the per-account prompts. Paragraphs render in
+    /// `keychainBodiesInPromptOrder` (the order the prompts fire). Only
+    /// rendered on the install path this session (never on plain launch
+    /// evaluation or drift updates).
     @ViewBuilder
     private var keychainCoachingIfActive: some View {
         if model.keychainPromptCoachingActive {
             VStack(alignment: .leading, spacing: 3) {
                 Label(SystemPromptCoaching.keychainHeadline, systemImage: "key")
                     .font(.system(size: 11, weight: .medium))
-                Text(SystemPromptCoaching.keychainBody)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                ForEach(SystemPromptCoaching.keychainBodiesInPromptOrder, id: \.self) { body in
+                    Text(body)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding(.top, 2)
         }

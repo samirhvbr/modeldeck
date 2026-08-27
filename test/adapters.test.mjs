@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   HELPER_MISSING_ERROR,
   activateClaudeProfile,
+  adoptLegacyClaudeHome,
   claudePinnedEnvFileContent,
   claudeProxyPointerShellSnippet,
   claudeProfileEnv,
@@ -1041,6 +1042,116 @@ test('migration rejects symlinks that could escape an approved profile home', as
     profilesDir: path.join(root, 'profiles'),
     selections: [{ sourceDir: source, profileName: 'selected' }],
   }), /contains a symbolic link/);
+});
+
+// TRIPWIRE #586: first-run adoption. A legacy real ~/.claude must be
+// adoptable into an already-created profile home — contents carried over,
+// owner-only enforced, the legacy source never mutated.
+test('adopts a legacy Claude home into an existing profile home without touching the source', async (t) => {
+  const root = temporaryRoot(t);
+  const legacy = path.join(root, '.claude');
+  const nested = path.join(legacy, 'projects');
+  const profilesDir = path.join(root, 'claude-profiles');
+  fs.mkdirSync(nested, { recursive: true, mode: 0o755 });
+  fs.writeFileSync(path.join(legacy, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o644 });
+  fs.writeFileSync(path.join(nested, 'settings.json'), '{}', { mode: 0o664 });
+  fs.chmodSync(legacy, 0o700);
+  const profileRef = await createClaudeProfileHome({ profilesDir, profileName: 'Insight' });
+
+  const adopted = await adoptLegacyClaudeHome({ sourceDir: legacy, profileRef, profilesDir });
+  assert.equal(adopted, profileRef);
+  assert.equal(fs.readFileSync(path.join(profileRef, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+  assert.equal(fs.statSync(profileRef).mode & 0o777, 0o700);
+  assert.equal(fs.statSync(path.join(profileRef, '.claude.json')).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(path.join(profileRef, 'projects')).mode & 0o777, 0o700);
+  // The legacy source is untouched — moving it aside is the service's own
+  // separate, backup-preserving step.
+  assert.equal(fs.readFileSync(path.join(legacy, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+  assert.equal(fs.statSync(path.join(legacy, '.claude.json')).mode & 0o777, 0o644);
+  // No staged/discard temporaries left behind.
+  assert.deepEqual(fs.readdirSync(fs.realpathSync(profilesDir)).sort(), ['insight']);
+});
+
+test('legacy adoption rejects symlinked sources with plain-language copy', async (t) => {
+  const root = temporaryRoot(t);
+  const legacy = path.join(root, '.claude');
+  const outside = path.join(root, 'outside.json');
+  const profilesDir = path.join(root, 'claude-profiles');
+  fs.mkdirSync(legacy, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(outside, '{}');
+  fs.symlinkSync(outside, path.join(legacy, '.credentials.json'));
+  const profileRef = await createClaudeProfileHome({ profilesDir, profileName: 'Insight' });
+
+  // Review #590: this string reaches a first-run user — it must name their
+  // folder and the Start Fresh escape, never "approved cswap profile home".
+  await assert.rejects(
+    adoptLegacyClaudeHome({ sourceDir: legacy, profileRef, profilesDir }),
+    (error) => {
+      assert.match(error.message, /Your existing Claude folder contains a symbolic link/);
+      assert.match(error.message, /Start Fresh/);
+      return true;
+    },
+  );
+  assert.deepEqual(fs.readdirSync(fs.realpathSync(profilesDir)).sort(), ['insight']);
+});
+
+// TRIPWIRE #590 review BLOCKER: the swap discards the displaced profile
+// home, so adoption must refuse a populated one — an established account's
+// credentials and history are not adoption's to destroy. ModelDeck's own
+// explainer (CLAUDE.md) is the one allowed occupant.
+test('legacy adoption refuses a populated profile home and destroys nothing', async (t) => {
+  const root = temporaryRoot(t);
+  const legacy = path.join(root, '.claude');
+  const profilesDir = path.join(root, 'claude-profiles');
+  fs.mkdirSync(legacy, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(legacy, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const profileRef = await createClaudeProfileHome({ profilesDir, profileName: 'Established' });
+  fs.writeFileSync(path.join(profileRef, 'CLAUDE.md'), 'explainer', { mode: 0o600 });
+  fs.writeFileSync(path.join(profileRef, '.credentials.json'), '{"fixture":"precious"}', { mode: 0o600 });
+
+  await assert.rejects(
+    adoptLegacyClaudeHome({ sourceDir: legacy, profileRef, profilesDir }),
+    /profile home is not empty/,
+  );
+  assert.equal(fs.readFileSync(path.join(profileRef, '.credentials.json'), 'utf8'), '{"fixture":"precious"}');
+
+  // The explainer alone does not count as populated.
+  const emptyRef = await createClaudeProfileHome({ profilesDir, profileName: 'Fresh' });
+  fs.writeFileSync(path.join(emptyRef, 'CLAUDE.md'), 'explainer', { mode: 0o600 });
+  assert.equal(await adoptLegacyClaudeHome({ sourceDir: legacy, profileRef: emptyRef, profilesDir }), emptyRef);
+  assert.equal(fs.readFileSync(path.join(emptyRef, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+});
+
+// TRIPWIRE #590 round 2 (CodeRabbit): the emptiness check runs before a copy
+// that can take minutes. Content landing in the profile home DURING the copy
+// must be restored and the adoption refused — never moved aside and deleted.
+test('legacy adoption refuses when the profile home gains content during the copy', async (t) => {
+  const root = temporaryRoot(t);
+  const legacy = path.join(root, '.claude');
+  const profilesDir = path.join(root, 'claude-profiles');
+  fs.mkdirSync(legacy, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(legacy, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const profileRef = await createClaudeProfileHome({ profilesDir, profileName: 'Raced' });
+
+  // The race: a concurrent writer lands credentials in the (checked-empty)
+  // home while the potentially minutes-long copy is still running.
+  const realCp = fs.promises.cp;
+  fs.promises.cp = async (source, destination, options) => {
+    const copied = await realCp(source, destination, options);
+    fs.writeFileSync(path.join(profileRef, '.credentials.json'), '{"fixture":"landed-during-copy"}', { mode: 0o600 });
+    return copied;
+  };
+  t.after(() => { fs.promises.cp = realCp; });
+
+  await assert.rejects(
+    adoptLegacyClaudeHome({ sourceDir: legacy, profileRef, profilesDir }),
+    /profile home is not empty/,
+  );
+  // The mid-copy content survives in place; nothing was swapped in.
+  assert.equal(fs.readFileSync(path.join(profileRef, '.credentials.json'), 'utf8'), '{"fixture":"landed-during-copy"}');
+  assert.equal(fs.existsSync(path.join(profileRef, '.claude.json')), false);
+  // No staged/discard temporaries left behind.
+  assert.deepEqual(fs.readdirSync(fs.realpathSync(profilesDir)).sort(), ['raced']);
 });
 
 test('parses Codex multi-bucket rate limits', () => {

@@ -30,6 +30,7 @@ struct AddAccountSheet: View {
             header
             switch model.step {
             case .details: detailsStep
+            case .adoptLegacy: adoptLegacyStep
             case .signIn: signInStep
             case .confirm: confirmStep
             }
@@ -365,6 +366,19 @@ struct AddAccountSheet: View {
         }
     }
 
+    // MARK: Issue #586 — a real ~/.claude blocked activation; offer adoption
+
+    private var adoptLegacyStep: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("This Mac already has a Claude setup — the ~/.claude folder. ModelDeck can use it as this subscription, so your existing sign-in and settings carry over. Usually no login is needed at all.")
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Either way, the current folder is kept as a backup next to ~/.claude — nothing is deleted. Quit any running Claude Code sessions before continuing.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var footer: some View {
         HStack {
             if model.isBusy {
@@ -413,6 +427,22 @@ struct AddAccountSheet: View {
                 .keyboardShortcut(.defaultAction)
                 .disabled(model.isBusy
                     || label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            case .adoptLegacy:
+                // Busy-disabled like the action buttons: a cancel-remove
+                // racing an in-flight adoption is the #590 zombie-account
+                // window.
+                Button("Cancel") { confirmingCancel = true }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(model.isBusy)
+                Button("Start Fresh") {
+                    Task { await model.resolveLegacyHome(startFresh: true) }
+                }
+                .disabled(model.isBusy)
+                Button("Use Existing Setup") {
+                    Task { await model.resolveLegacyHome(startFresh: false) }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(model.isBusy)
             case .signIn:
                 Button("Cancel") { confirmingCancel = true }
                     .keyboardShortcut(.cancelAction)
@@ -443,6 +473,7 @@ struct AddAccountSheet: View {
         // Step 1 is the same "add a subscription" for every provider — the
         // Connect verb belongs to the button and to step 2 (Tim's ruling).
         case .details: return "Add Subscription"
+        case .adoptLegacy: return "Use your existing Claude setup?"
         case .signIn: return "Sign in to \(providerDisplayName)"
         case .confirm: return isGrokFlow ? "Grok is connected" : "Subscription added"
         }
@@ -453,7 +484,9 @@ struct AddAccountSheet: View {
 
     private var stepNumber: Int {
         switch model.step {
-        case .details: return 1
+        // The adoption offer is still part of getting the subscription set
+        // up, so it stays "Step 1".
+        case .details, .adoptLegacy: return 1
         case .signIn: return 2
         case .confirm: return isGrokFlow ? 2 : 3
         }

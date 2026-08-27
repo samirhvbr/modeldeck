@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Issue #588 — Keychain prompt explained before macOS shows it (mockup)</title>
+<style>
+  body { margin: 0; padding: 40px; background: #6b6b6b; font-family: -apple-system, "SF Pro Text", "Helvetica Neue", sans-serif; display: flex; flex-direction: column; align-items: center; gap: 36px; }
+  .caption { color: #ddd; font-size: 13px; max-width: 520px; text-align: center; }
+  /* The popover's daemon-setup card (existing chrome; only the coaching copy changes). */
+  .popover { width: 360px; background: #f5f5f7; border-radius: 12px; padding: 10px; box-shadow: 0 18px 50px rgba(0,0,0,.45); box-sizing: border-box; }
+  .card { background: rgba(0,0,0,.055); border-radius: 8px; padding: 12px; }
+  .progress-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .spinner { width: 12px; height: 12px; border: 2px solid rgba(0,0,0,.18); border-top-color: rgba(0,0,0,.5); border-radius: 50%; }
+  .progress-row span { font-size: 11px; color: #6e6e73; }
+  .coach-head { display: flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 500; color: #1d1d1f; margin: 2px 0 4px; }
+  .coach-head .key { font-size: 11px; }
+  .coach { font-size: 11px; color: #6e6e73; line-height: 1.5; margin: 0 0 7px; }
+  .coach:last-child { margin-bottom: 0; }
+  /* Reference: the macOS prompt itself (NOT ours to change — shown so the copy can be judged against it). */
+  .osprompt { width: 430px; background: #ececec; border-radius: 10px; padding: 18px 18px 14px; box-shadow: 0 18px 50px rgba(0,0,0,.45); display: flex; gap: 14px; box-sizing: border-box; opacity: .96; }
+  .osprompt .lock { font-size: 34px; line-height: 1; }
+  .osprompt .msg { font-size: 12px; color: #1d1d1f; line-height: 1.45; }
+  .osprompt .msg b { display: block; margin-bottom: 6px; }
+  .pw { margin: 10px 0 12px; display: flex; align-items: center; gap: 8px; font-size: 12px; color: #1d1d1f; }
+  .pw input { flex: 1; border: 1px solid #c8c8cc; border-radius: 4px; padding: 3px 6px; background: #fff; }
+  .osfooter { display: flex; justify-content: flex-end; gap: 8px; }
+  .btn { font-size: 12px; padding: 3px 12px; border-radius: 6px; border: 1px solid rgba(0,0,0,.12); background: linear-gradient(#fff,#f3f3f3); color: #1d1d1f; }
+  .btn.primary { background: linear-gradient(#4d9dfa,#2f7cf6); color: #fff; border-color: #2f6fe0; font-weight: 600; }
+</style>
+</head>
+<body>
+  <div class="caption">Mockup 1 — the popover's install card while the background service starts.<br>
+  Existing chrome from issues #96/#98; what's new is the first coaching paragraph, which explains the
+  “modeldeck” Keychain prompt BEFORE macOS shows it (it appears the moment the user clicks Install,
+  ahead of the service's first Keychain read). The second paragraph is the existing per-subscription
+  heads-up, reworded to say those prompts come later.</div>
+  <div class="popover">
+    <div class="card">
+      <div class="progress-row"><div class="spinner"></div><span>Installing background service…</span></div>
+      <div class="coach-head"><span class="key">&#128273;</span> Next: Keychain permission prompts</div>
+      <p class="coach">First, right as the service starts, macOS will say &ldquo;security&rdquo; wants to use confidential information stored in &ldquo;modeldeck&rdquo; &mdash; that item is ModelDeck's own service key, a random token this app just created so only ModelDeck can change its local service. It is not your Claude or Codex sign-in, and it never leaves this Mac. Click Always Allow (macOS may ask for your Mac login password once).</p>
+      <p class="coach">Then, as each Claude subscription first refreshes, macOS will ask permission for the service to read that subscription's sign-in from your Keychain &mdash; one prompt per subscription, from macOS itself. Choose Always Allow (it may ask for your password once per subscription); plain Allow asks again on every refresh. Properly signed app updates won't re-prompt.</p>
+    </div>
+  </div>
+
+  <div class="caption">For reference only — the macOS prompt the copy above is defusing (from Rick's fresh
+  install, issue #588). This dialog belongs to macOS and is unchanged; it's shown here so the
+  explanation can be judged against what the user will actually see next.</div>
+  <div class="osprompt">
+    <div class="lock">&#128274;</div>
+    <div>
+      <div class="msg"><b>security wants to use your confidential information stored in &ldquo;modeldeck&rdquo; in your keychain.</b>
+      To allow this, enter the &ldquo;login&rdquo; keychain password.</div>
+      <div class="pw">Password: <input type="password" disabled placeholder=""></div>
+      <div class="osfooter">
+        <button class="btn">Always Allow</button>
+        <button class="btn">Deny</button>
+        <button class="btn primary">Allow</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

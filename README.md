@@ -9,9 +9,10 @@ all of your Claude Code and Codex CLI accounts — live "% left" meters,
 reset countdowns, and one-click account switching.
 
 **Local-first. No cloud backend. No telemetry. Your provider credentials
-are never copied, stored, or transmitted by ModelDeck.** The only secret
-ModelDeck creates is its own local Keychain token that guards the daemon's
-API — it contains nothing of yours. The only optional outbound calls of
+are never copied, stored, or transmitted by ModelDeck.** The only secrets
+ModelDeck creates are its own local Keychain items — the token that guards
+the daemon's API and, if you use the managed proxy, a client key per
+profile — and they contain nothing of yours. The only optional outbound calls of
 ModelDeck's own are the daily update check (reads this repository's public
 releases feed) and the update download you approve (fetches the release
 asset) — update checks are off unless you enable them.
@@ -111,7 +112,7 @@ This is the point of the tool, so it's worth being explicit:
 | Cloud services | **None.** No backend, no sync, no accounts. |
 | Telemetry | **None.** Nothing is phoned home, ever. |
 | Provider credentials | **Never copied or persisted by ModelDeck.** Sign-in happens in the provider's own browser flow, and credentials stay in the provider-managed profile/Keychain; ModelDeck uses them in place, at runtime, only for usage and auth-state reads. |
-| ModelDeck's own secrets | One Keychain item of its own: a locally generated random token that authorizes the app to the daemon's localhost API. It contains no provider data. |
+| ModelDeck's own secrets | A few Keychain items of its own, all locally generated: one random token that authorizes the app to the daemon's localhost API, plus — only if you use the managed proxy — one client key per profile (service `cli-proxy-api-client.<profile>`) that ModelDeck mints for its own local proxy. None contain provider data. |
 | Network | Daemon binds to `127.0.0.1` only. Outbound calls go solely to the providers you already use, with credentials they already hold. |
 | Removal | Removing an account deletes only ModelDeck's reference — never your Keychain entries or provider auth state. |
 
@@ -139,6 +140,58 @@ Open **Settings → Accounts → Add Account** and follow the three-step flow
 for each account — e.g. "Work", "Personal", "Side Project". Each gets its
 own isolated profile home and signs in through the provider's own login
 flow.
+
+## Uninstall
+
+First, what uninstalling **never** touches: `~/.claude`, `~/.codex`, and
+your provider credentials. Those belong to the CLIs and their own sign-in
+flows; every removal path below leaves them exactly as they are, and every
+account you added keeps working from its provider's point of view.
+
+**If you installed the DMG**
+
+1. Quit ModelDeck (menu bar icon → right-click → Quit ModelDeck).
+2. Drag ModelDeck from Applications to the Trash. The background service
+   and the launch-at-login entry live inside the app bundle, so removing
+   the app removes them too — no Terminal needed.
+3. Optionally, delete the data ModelDeck kept (skip this if you might
+   reinstall — it's what makes a reinstall pick up where you left off):
+   - `~/Library/Application Support/ModelDeck` — settings, usage history,
+     and the isolated per-account profile homes ModelDeck created. Deleting
+     it removes those managed sign-ins; your own `~/.claude` and `~/.codex`
+     are not in here. (If you run the daemon with `MODELDECK_DATA_DIR` or
+     `MODELDECK_DB_PATH` set, delete those locations instead.)
+   - `~/Library/Preferences/app.modeldeck.mac.plist`,
+     `~/Library/Caches/app.modeldeck.mac`, and (if you ever ran the
+     from-source launch agent) `~/Library/LaunchAgents/ai.hermes.modeldeck.plist`.
+
+**If you installed via Homebrew**
+
+```bash
+brew uninstall modeldeck
+```
+
+removes the app and leaves your data in place for a reinstall. To delete
+the data as well (same caveat about managed account profiles as above):
+
+```bash
+brew uninstall --zap modeldeck
+```
+
+**Keychain items (both install methods)**
+
+Neither the Trash nor `--zap` can remove Keychain items, so two kinds may
+remain — both are ModelDeck's own locally generated secrets, containing
+nothing of yours. Open **Keychain Access**, search for `modeldeck` and
+`cli-proxy-api-client`, and delete what turns up; or from Terminal:
+
+```bash
+security delete-generic-password -s modeldeck -a mutation-token
+```
+
+The `cli-proxy-api-client.*` items exist only if you used the managed
+proxy feature, one per profile; delete each with
+`security delete-generic-password -s "cli-proxy-api-client.<profile>" -a ""`.
 
 ## How it works
 

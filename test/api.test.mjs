@@ -728,6 +728,592 @@ test('activates Claude and Codex accounts without changing defaults when provide
   assert.equal(response.status, 403);
 });
 
+// TRIPWIRE #586: the first-run dead end. A real legacy ~/.claude blocks
+// activation (clobber guard), and the daemon must offer a working in-app
+// resolution: adopt copies the legacy home into the profile, moves the
+// original to a backup (never deleted), and activates — all in one call.
+test('adopt-legacy-home resolves the first-run active-link-blocked dead end', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  // The field state: ~/.claude is a real directory from prior Claude use.
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  let result = await request(fixture, `/api/accounts/${claude.id}/activate`, { method: 'POST', body: '{}' });
+  assert.equal(result.response.status, 400);
+  assert.equal(result.body.code, 'active-link-blocked');
+
+  result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.account.isDefault, true);
+  assert.deepEqual(result.body.warnings, []);
+  assert.match(result.body.backupPath, /\.claude\.pre-modeldeck-/);
+  // The active link is now a symlink to the profile, which carries the
+  // legacy contents; the original survives at the reported backup path.
+  assert.equal(fs.readlinkSync(fixture.claudeActiveLink), fs.realpathSync(fixture.claudeHome));
+  assert.equal(fs.readFileSync(path.join(fixture.claudeHome, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+  assert.equal(fs.readFileSync(path.join(result.body.backupPath, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+  assert.equal(fixture.store.getAccount(claude.id).metadata.adoptedLegacyHome, true);
+
+  // Once managed, a second adoption has nothing to adopt.
+  result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 409);
+  assert.match(result.body.error, /already managed/);
+});
+
+test('adopt-legacy-home mode fresh moves the legacy directory aside without importing it', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"fresh"}' });
+  assert.equal(result.response.status, 200);
+  assert.equal(fs.readlinkSync(fixture.claudeActiveLink), fs.realpathSync(fixture.claudeHome));
+  // Fresh mode: the profile stays empty and the legacy content lives only in
+  // the backup.
+  assert.equal(fs.existsSync(path.join(fixture.claudeHome, '.claude.json')), false);
+  assert.equal(fs.readFileSync(path.join(result.body.backupPath, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+  assert.notEqual(fixture.store.getAccount(claude.id).metadata.adoptedLegacyHome, true);
+
+  const bad = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"sideways"}' });
+  assert.equal(bad.response.status, 400);
+  assert.match(bad.body.error, /unknown legacy adoption mode/);
+});
+
+// TRIPWIRE #590 review MAJOR (delete race): an account removed while its
+// adoption is mid-copy must abort cleanly — no zombie row under a fresh id,
+// no backup rename, ~/.claude untouched.
+test('adopt-legacy-home aborts when the account is deleted mid-adoption', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const realAdopt = fixture.service.adoptClaudeLegacy;
+  fixture.service.adoptClaudeLegacy = async (options) => {
+    const copied = await realAdopt(options);
+    fixture.store.deleteAccount(claude.id);
+    return copied;
+  };
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 409);
+  assert.match(result.body.error, /removed or disabled while the adoption was running/);
+  // No resurrection under a new id, no backup rename, active link untouched.
+  assert.equal(fixture.store.listAccounts().filter((a) => a.provider === 'claude').length, 0);
+  assert.ok(fs.lstatSync(fixture.claudeActiveLink).isDirectory());
+  assert.equal(fs.readdirSync(path.dirname(fixture.claudeActiveLink)).filter((name) => name.includes('pre-modeldeck')).length, 0);
+});
+
+// TRIPWIRE #590 round 2 (verify lane): a delete landing AFTER the flip must
+// UNDO the flip. The old undo was a bare rename(dir → symlink) — ENOTDIR
+// unconditionally, swallowed by .catch — which left ~/.claude a symlink to
+// the deleted account's home and the real home stranded at the backup path.
+test('adopt-legacy-home undoes the flip when the account is deleted after activation', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  // The race window: metadata refresh runs after the flip; the delete lands
+  // inside it.
+  fixture.service.refreshClaudeProfileMetadata = async (account) => {
+    fixture.store.deleteAccount(claude.id);
+    return account;
+  };
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 409);
+  assert.match(result.body.error, /removed or disabled while the adoption was running/);
+  assert.match(result.body.error, /previous Claude setup was restored/);
+  // The flip was undone: the active link is the real legacy directory again,
+  // never a symlink into a dead account's profile home.
+  assert.equal(fs.lstatSync(fixture.claudeActiveLink).isSymbolicLink(), false);
+  assert.equal(fs.readFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+  // The backup slot was consumed by the restore — nothing stranded.
+  assert.deepEqual(fs.readdirSync(path.dirname(fixture.claudeActiveLink)), ['.claude']);
+  assert.deepEqual(fixture.store.listAccounts().filter((a) => a.provider === 'claude'), []);
+});
+
+// TRIPWIRE #590 round 2 (CodeRabbit stale-account finding): an update that
+// repoints the account's profile home while the adoption copy runs must
+// abort — the flow would otherwise activate a profile the record no longer
+// names.
+test('adopt-legacy-home aborts when the profile home is repointed mid-adoption', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const otherHome = path.join(fixture.root, 'claude-profiles', 'elsewhere');
+  fs.mkdirSync(otherHome, { recursive: true, mode: 0o700 });
+  const realAdopt = fixture.service.adoptClaudeLegacy;
+  fixture.service.adoptClaudeLegacy = async (options) => {
+    const copied = await realAdopt(options);
+    fixture.store.saveAccount({ ...claude, profileRef: otherHome });
+    return copied;
+  };
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 409);
+  assert.match(result.body.error, /profile home was repointed while the adoption was running/);
+  // No flip, no backup rename — the legacy home is untouched.
+  assert.ok(fs.lstatSync(fixture.claudeActiveLink).isDirectory());
+  assert.equal(fs.readFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+  assert.equal(fs.readdirSync(path.dirname(fixture.claudeActiveLink)).filter((name) => name.includes('pre-modeldeck')).length, 0);
+  // The repointed record survives exactly as the update wrote it.
+  assert.equal(fixture.store.getAccount(claude.id).profileRef, otherHome);
+});
+
+// TRIPWIRE #590 review MAJOR (live-session race): a rollback that fails must
+// name the backup path in the error instead of swallowing it.
+test('adopt-legacy-home names the backup path when the rollback cannot run', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, 'history.jsonl'), '{}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  // A live session recreates a non-empty ~/.claude in the window between the
+  // backup rename and the flip; activation then refuses and the rollback
+  // rename lands on the occupied path (ENOTEMPTY).
+  fixture.service.activateClaude = async () => {
+    fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(fixture.claudeActiveLink, 'session-scratch.json'), '{}', { mode: 0o600 });
+    throw new Error('Claude activation requires a one-time migration: move the existing directory aside at a quiet moment before activating: (fixture)');
+  };
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"fresh"}' });
+  assert.equal(result.response.status, 400);
+  assert.match(result.body.error, /preserved at .*\.claude\.pre-modeldeck-/);
+  assert.match(result.body.error, /could not move it back automatically/);
+  // The named backup really holds the user's data.
+  const backup = result.body.error.match(/preserved at (\S+);/)[1];
+  assert.equal(fs.readFileSync(path.join(backup, 'history.jsonl'), 'utf8'), '{}');
+});
+
+// TRIPWIRE #590 round 2 (N1): shared scope writes .claude.json + a memory
+// symlink into a brand-new profile home before the adoption offer runs —
+// verified-ModelDeck artifacts must not dead-end adoption, while a recorded
+// identity in .claude.json still refuses it.
+test('adopt-legacy-home tolerates shared-scope artifacts but refuses a recorded identity', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  // The shared-scope shape of a just-created home: reconciled mcp document +
+  // memory symlink at ModelDeck's own shared memory dir + explainer.
+  const sharedMemory = fs.mkdtempSync(path.join(fixture.root, 'shared-memory-'));
+  fixture.service.sharedScope.sharedMemoryDir = sharedMemory;
+  fs.writeFileSync(path.join(fixture.claudeHome, '.claude.json'), '{"mcpServers":{}}', { mode: 0o600 });
+  fs.writeFileSync(path.join(fixture.claudeHome, 'CLAUDE.md'), 'explainer', { mode: 0o600 });
+  fs.symlinkSync(sharedMemory, path.join(fixture.claudeHome, 'memory'));
+
+  const adopted = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(adopted.response.status, 200, JSON.stringify(adopted.body));
+  assert.equal(fs.readFileSync(path.join(fixture.claudeHome, '.claude.json'), 'utf8'), '{"fixture":"legacy"}');
+
+  // Same artifacts plus a recorded identity: refused, nothing destroyed.
+  const secondHome = path.join(fixture.root, 'claude-profiles', 'second');
+  fs.mkdirSync(secondHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(secondHome, '.claude.json'), '{"mcpServers":{},"oauthAccount":{"emailAddress":"kept@example.invalid"}}', { mode: 0o600 });
+  const second = fixture.store.saveAccount({ provider: 'claude', label: 'Established', profileRef: secondHome });
+  fs.unlinkSync(fixture.claudeActiveLink);
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  const refused = await request(fixture, `/api/accounts/${second.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(refused.response.status, 400);
+  assert.match(refused.body.error, /profile home is not empty/);
+  assert.match(fs.readFileSync(path.join(secondHome, '.claude.json'), 'utf8'), /kept@example.invalid/);
+});
+
+// TRIPWIRE #590 round 2 (N2): a delete landing AFTER the flip must actually
+// restore ~/.claude (unlink the symlink first — a directory cannot rename
+// over one), never leave it pointing at a dead account's home.
+test('adopt-legacy-home restores the real home when the account vanishes after the flip', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, 'history.jsonl'), '{}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  // The narrowest window: scopeClaudeSecureStorage runs right after the
+  // flip; a delete landing there exercises the post-flip restore.
+  const realScope = fixture.service.scopeClaudeSecureStorage.bind(fixture.service);
+  fixture.service.scopeClaudeSecureStorage = async (profileRef) => {
+    fixture.store.deleteAccount(claude.id);
+    return realScope(profileRef);
+  };
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"fresh"}' });
+  assert.equal(result.response.status, 409);
+  const restored = fs.lstatSync(fixture.claudeActiveLink);
+  assert.ok(restored.isDirectory() && !restored.isSymbolicLink());
+  assert.equal(fs.readFileSync(path.join(fixture.claudeActiveLink, 'history.jsonl'), 'utf8'), '{}');
+  assert.equal(fixture.store.listAccounts().filter((a) => a.provider === 'claude').length, 0);
+});
+
+// TRIPWIRE #590 round 2 (N3): a MISSING ~/.claude is not "already managed" —
+// the endpoint degenerates to a plain activation instead of letting the
+// client skip the flip and recreate the original trap.
+test('adopt-legacy-home with no legacy directory activates instead of claiming managed', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 200);
+  assert.equal(result.body.backupPath, null);
+  assert.equal(fs.readlinkSync(fixture.claudeActiveLink), fs.realpathSync(fixture.claudeHome));
+});
+
+// TRIPWIRE #590 round 3 (R3-A): in the no-legacy-directory branch, an
+// account vanishing mid-activation must not leave ~/.claude pointing at the
+// dead account's home — pre-call state was "no link", so restore is unlink.
+test('adopt-legacy-home ENOENT branch unlinks the flip when the account vanishes', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const realScope = fixture.service.scopeClaudeSecureStorage.bind(fixture.service);
+  fixture.service.scopeClaudeSecureStorage = async (profileRef) => {
+    fixture.store.deleteAccount(claude.id);
+    return realScope(profileRef);
+  };
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 409);
+  assert.equal(fs.existsSync(fixture.claudeActiveLink), false);
+});
+
+// TRIPWIRE #590 round 3 (R3-B): adoption forgets the pre-adoption home's
+// memory-merge bookkeeping so the reconcile treats the adopted home as new.
+test('adoption resets the shared-scope memory-merge record for the account', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const manifestFile = fixture.service.sharedScope.manifestFile;
+  fs.mkdirSync(path.dirname(manifestFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(manifestFile, JSON.stringify({ memoryEnabled: true, mergedProfiles: [claude.id, 'other-account'] }), { mode: 0o600 });
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 200, JSON.stringify(result.body));
+  const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+  assert.deepEqual(manifest.mergedProfiles, ['other-account']);
+});
+
+// TRIPWIRE #590 round 3 (R3-C): a reconcile throw after the copy restores an
+// empty profile home (retry never bricked by the emptiness guard), stamps no
+// adoption metadata, and surfaces a plain-language error.
+test('a failed post-adoption reconcile restores the empty home and keeps retry alive', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const realReconcile = fixture.service.accountProfileSetChanged.bind(fixture.service);
+  fixture.service.accountProfileSetChanged = async () => { throw new Error('top-level user-memory path is not a directory'); };
+
+  const failed = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(failed.response.status, 400);
+  assert.match(failed.body.error, /shared settings were being reapplied/);
+  assert.match(failed.body.error, /Start Fresh is still available/);
+  assert.deepEqual(fs.readdirSync(claude.profileRef), []);
+  assert.notEqual(fixture.store.getAccount(claude.id).metadata.adoptedLegacyHome, true);
+  assert.ok(fs.lstatSync(fixture.claudeActiveLink).isDirectory());
+
+  // With the reconcile healthy again the retry adopts cleanly.
+  fixture.service.accountProfileSetChanged = realReconcile;
+  const retried = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(retried.response.status, 200, JSON.stringify(retried.body));
+  assert.equal(fs.readlinkSync(fixture.claudeActiveLink), fs.realpathSync(claude.profileRef));
+});
+
+// TRIPWIRE #590 round 4 (CodeRabbit major): a reconcile that dies AFTER the
+// adopted memory reached the shared directory must not strand those copies —
+// the retry re-copies the same items and collisionName would mint renamed
+// duplicates of every one of them. The rollback removes exactly what the
+// failed attach copied and nothing else.
+test('a failed post-adoption reconcile removes the items it copied into shared memory', async (t) => {
+  const fixture = await startFixture({
+    // Inert engine timers: no watcher-scheduled reconcile may race the
+    // deterministic fail-then-retry sequence below.
+    sharedScopeSetTimeout: () => 0,
+    sharedScopeClearTimeout: () => {},
+  });
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  // Shared scope live before adoption, with one pre-existing shared item.
+  fs.mkdirSync(path.join(fixture.claudeHome, 'memory'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeHome, 'memory', 'seed.md'), 'pre-adoption seed', { mode: 0o600 });
+  const scope = fixture.service.sharedScope;
+  await scope.enable();
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  fs.mkdirSync(path.join(fixture.claudeActiveLink, 'memory'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, 'memory', 'notes.md'), 'adopted memory', { mode: 0o600 });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  // Fail AFTER attachMemoryProfiles copied the adopted items into shared
+  // memory: linkMemory is the step right behind the copy loop.
+  const realLink = scope.linkMemory.bind(scope);
+  scope.linkMemory = async () => { throw new Error('injected link failure'); };
+
+  const failed = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(failed.response.status, 400);
+  assert.match(failed.body.error, /shared settings were being reapplied/);
+  assert.equal(fs.existsSync(path.join(scope.sharedMemoryDir, 'notes.md')), false);
+  // The pre-existing shared item is untouched by the rollback.
+  assert.equal(fs.readFileSync(path.join(scope.sharedMemoryDir, 'seed.md'), 'utf8'), 'pre-adoption seed');
+
+  scope.linkMemory = realLink;
+  const retried = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(retried.response.status, 200, JSON.stringify(retried.body));
+  // Exactly one copy of each item — no collision-renamed duplicates.
+  assert.deepEqual(fs.readdirSync(scope.sharedMemoryDir).sort(), ['notes.md', 'seed.md']);
+  assert.equal(fs.readFileSync(path.join(scope.sharedMemoryDir, 'notes.md'), 'utf8'), 'adopted memory');
+});
+
+// TRIPWIRE #590 round 5 (CodeRabbit residual): other managed profiles stay
+// symlinked at the shared memory directory while the adoption reconcile
+// runs, so a live session can replace a just-copied item inside the failure
+// window. The rollback must recognize the item is no longer the copy it made
+// and keep the newer content — never delete by name alone.
+test('the rollback keeps a shared-memory item another session replaced in the failure window', async (t) => {
+  const fixture = await startFixture({
+    sharedScopeSetTimeout: () => 0,
+    sharedScopeClearTimeout: () => {},
+  });
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(path.join(fixture.claudeHome, 'memory'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeHome, 'memory', 'seed.md'), 'pre-adoption seed', { mode: 0o600 });
+  const scope = fixture.service.sharedScope;
+  await scope.enable();
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  fs.mkdirSync(path.join(fixture.claudeActiveLink, 'memory'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, 'memory', 'notes.md'), 'adopted memory', { mode: 0o600 });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  // linkMemory runs right after the copy loop: replace the copied item the
+  // way a concurrently linked session would, then fail the reconcile.
+  const realLink = scope.linkMemory.bind(scope);
+  scope.linkMemory = async () => {
+    fs.writeFileSync(path.join(scope.sharedMemoryDir, 'notes.md'), 'newer session write', { mode: 0o600 });
+    throw new Error('injected link failure');
+  };
+
+  const failed = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(failed.response.status, 400);
+  assert.equal(fs.readFileSync(path.join(scope.sharedMemoryDir, 'notes.md'), 'utf8'), 'newer session write');
+
+  scope.linkMemory = realLink;
+  const retried = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(retried.response.status, 200, JSON.stringify(retried.body));
+  // The session's write survives under its own name; the adopted copy lands
+  // under a collision name instead of clobbering it.
+  assert.equal(fs.readFileSync(path.join(scope.sharedMemoryDir, 'notes.md'), 'utf8'), 'newer session write');
+  const entries = fs.readdirSync(scope.sharedMemoryDir).sort();
+  const collision = entries.find((name) => /^notes\.modeldeck-.+\.md$/.test(name));
+  assert.ok(collision, JSON.stringify(entries));
+  assert.equal(fs.readFileSync(path.join(scope.sharedMemoryDir, collision), 'utf8'), 'adopted memory');
+  assert.deepEqual(entries, [collision, 'notes.md', 'seed.md'].sort());
+});
+
+// TRIPWIRE #590 round 6 (CodeRabbit residual): checking identity and then
+// deleting by path leaves a window where a linked session's replacement
+// lands between the two and the delete destroys it. The rollback now renames
+// the item to a quarantine path first, examines THAT path, and deletes only
+// the quarantined inode — a replacement arriving at the original name at any
+// moment survives. The afterUndoQuarantine hook injects the replacement
+// deterministically inside the equivalent window.
+test('the rollback preserves a replacement landing between identity check and delete', async (t) => {
+  let onQuarantine = null;
+  const fixture = await startFixture({
+    sharedScopeSetTimeout: () => 0,
+    sharedScopeClearTimeout: () => {},
+    sharedScopeAfterUndoQuarantine: async (context) => { if (onQuarantine) await onQuarantine(context); },
+  });
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(path.join(fixture.claudeHome, 'memory'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeHome, 'memory', 'seed.md'), 'pre-adoption seed', { mode: 0o600 });
+  const scope = fixture.service.sharedScope;
+  await scope.enable();
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  fs.mkdirSync(path.join(fixture.claudeActiveLink, 'memory'), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, 'memory', 'notes.md'), 'adopted memory', { mode: 0o600 });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const realLink = scope.linkMemory.bind(scope);
+  scope.linkMemory = async () => { throw new Error('injected link failure'); };
+  // The copied item's identity matches its record, so without quarantine the
+  // rollback would proceed to delete — this replacement lands exactly in the
+  // window between the identity examination and the removal.
+  onQuarantine = async ({ name }) => {
+    if (name !== 'notes.md') return;
+    fs.writeFileSync(path.join(scope.sharedMemoryDir, 'notes.md'), 'replacement inside the delete window', { mode: 0o600 });
+  };
+
+  const failed = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(failed.response.status, 400);
+  assert.equal(fs.readFileSync(path.join(scope.sharedMemoryDir, 'notes.md'), 'utf8'), 'replacement inside the delete window');
+  // The quarantined stale copy was removed; no leftover quarantine entries.
+  assert.deepEqual(fs.readdirSync(scope.sharedMemoryDir).sort(), ['notes.md', 'seed.md']);
+
+  scope.linkMemory = realLink;
+  onQuarantine = null;
+  const retried = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(retried.response.status, 200, JSON.stringify(retried.body));
+  assert.equal(fs.readFileSync(path.join(scope.sharedMemoryDir, 'notes.md'), 'utf8'), 'replacement inside the delete window');
+  const entries = fs.readdirSync(scope.sharedMemoryDir).sort();
+  const collision = entries.find((name) => /^notes\.modeldeck-.+\.md$/.test(name));
+  assert.ok(collision, JSON.stringify(entries));
+  assert.equal(fs.readFileSync(path.join(scope.sharedMemoryDir, collision), 'utf8'), 'adopted memory');
+});
+
+// TRIPWIRE #590 (CodeRabbit thread, .claude.json replaceability): a missing
+// oauthAccount proves nothing about authorship — a user's own .claude.json
+// (theme, customApiKeyResponses, hand-written servers) has no signed-in
+// identity either, and the presence-only test let adoption destroy it with a
+// 200. Only the exact shared-scope-generated shape (an object holding
+// nothing but an mcpServers object) is replaceable.
+test('adoption refuses a user-authored .claude.json that merely lacks oauthAccount', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const userOwned = '{"mcpServers":{"mine":{"command":"placeholder"}},"theme":"dark","customApiKeyResponses":{"approved":[]}}';
+  fs.writeFileSync(path.join(fixture.claudeHome, '.claude.json'), userOwned, { mode: 0o600 });
+
+  const refused = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(refused.response.status, 400);
+  assert.match(refused.body.error, /profile home is not empty/);
+  // The user's file survives byte for byte, and nothing was activated.
+  assert.equal(fs.readFileSync(path.join(fixture.claudeHome, '.claude.json'), 'utf8'), userOwned);
+  assert.ok(fs.lstatSync(fixture.claudeActiveLink).isDirectory());
+});
+
+// TRIPWIRE #590 (CodeRabbit follow-up on the same thread): writeMcpDocument
+// always emits the mcpServers key, so a bare {} is not provably
+// ModelDeck-authored — it blocks adoption like any other unrecognized
+// content instead of being guessed replaceable.
+test('adoption refuses a destination .claude.json containing a bare empty object', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  fs.writeFileSync(path.join(fixture.claudeHome, '.claude.json'), '{}', { mode: 0o600 });
+
+  const refused = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(refused.response.status, 400);
+  assert.match(refused.body.error, /profile home is not empty/);
+  assert.equal(fs.readFileSync(path.join(fixture.claudeHome, '.claude.json'), 'utf8'), '{}');
+  assert.ok(fs.lstatSync(fixture.claudeActiveLink).isDirectory());
+});
+
+// TRIPWIRE #590 (CodeRabbit thread, pin rollback — post-flip race): the
+// scope call after the flip re-aims the shell pin at the new profile home;
+// a delete landing right after it used to roll back only ~/.claude, leaving
+// the pin pointing at the profile home the rollback itself just deleted.
+test('the post-flip rollback restores the previous shell pin state', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const previousPin = '# previous pin content\n';
+  fs.writeFileSync(fixture.service.claudeShellEnvFile, previousPin, { mode: 0o600 });
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const realScope = fixture.service.scopeClaudeSecureStorage.bind(fixture.service);
+  fixture.service.scopeClaudeSecureStorage = async (profileRef) => {
+    fixture.store.deleteAccount(claude.id);
+    return realScope(profileRef);
+  };
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 409);
+  // Filesystem rollback held (legacy home back in place, copy removed) …
+  assert.ok(fs.lstatSync(fixture.claudeActiveLink).isDirectory());
+  // … and the pin is the pre-operation one — it must not reference the
+  // deleted profile home.
+  assert.equal(fs.readFileSync(fixture.service.claudeShellEnvFile, 'utf8'), previousPin);
+});
+
+// TRIPWIRE #590 (CodeRabbit thread, pin rollback — no-legacy branch): with
+// no pin before the call, the rollback removes the one the scope call wrote
+// instead of leaving it aimed at the dead account's home.
+test('the no-legacy rollback clears the shell pin the scope call wrote', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  const claude = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+  const realScope = fixture.service.scopeClaudeSecureStorage.bind(fixture.service);
+  fixture.service.scopeClaudeSecureStorage = async (profileRef) => {
+    fixture.store.deleteAccount(claude.id);
+    return realScope(profileRef);
+  };
+
+  const result = await request(fixture, `/api/accounts/${claude.id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(result.response.status, 409);
+  assert.equal(fs.existsSync(fixture.claudeActiveLink), false);
+  assert.equal(fs.existsSync(fixture.service.claudeShellEnvFile), false);
+});
+
+// TRIPWIRE #586 (recorded comment: retry-pileup): repeated blocked attempts
+// must never clobber anything or collide profile homes, and the orphans they
+// leave are individually removable without touching the survivor.
+test('repeated blocked add attempts accumulate no damage and clean up account by account', async (t) => {
+  const fixture = await startFixture();
+  t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
+
+  fs.mkdirSync(fixture.claudeActiveLink, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(fixture.claudeActiveLink, '.claude.json'), '{"fixture":"legacy"}', { mode: 0o600 });
+  const seeded = fixture.store.listAccounts().find((account) => account.provider === 'claude');
+
+  const created = [seeded];
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const home = path.join(fixture.root, 'claude-profiles', `retry-${attempt}`);
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    created.push(fixture.store.saveAccount({ provider: 'claude', label: 'Insight', profileRef: home }));
+    const blocked = await request(fixture, `/api/accounts/${created.at(-1).id}/activate`, { method: 'POST', body: '{}' });
+    assert.equal(blocked.body.code, 'active-link-blocked');
+  }
+  assert.equal(new Set(created.map((account) => account.profileRef)).size, 3);
+  assert.ok(fs.lstatSync(fixture.claudeActiveLink).isDirectory());
+
+  const adopted = await request(fixture, `/api/accounts/${created[2].id}/adopt-legacy-home`, { method: 'POST', body: '{"mode":"adopt"}' });
+  assert.equal(adopted.response.status, 200);
+  for (const orphan of created.slice(0, 2)) {
+    const gone = await request(fixture, `/api/accounts/${orphan.id}`, { method: 'DELETE' });
+    assert.equal(gone.response.status, 200);
+  }
+  assert.equal(fixture.store.listAccounts().filter((a) => a.provider === 'claude').length, 1);
+  assert.equal(fs.readlinkSync(fixture.claudeActiveLink), fs.realpathSync(created[2].profileRef));
+});
+
 test('Claude activation response warns about running unpinned sessions (issue #66)', async (t) => {
   const fixture = await startFixture({ listProviderProcesses: async () => ['claude'] });
   t.after(async () => { await fixture.app.close(); fixture.store.close(); fs.rmSync(fixture.root, { recursive: true, force: true }); });
