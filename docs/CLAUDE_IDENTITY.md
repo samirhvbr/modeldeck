@@ -41,7 +41,20 @@ Consequences on affected builds, verified live on 2026-07-21:
 ModelDeck automates this: the daemon detects the installed CLI version and,
 from the historical 2.1.216 boundary on, issues activation-driven login specs
 (`GET /api/accounts/:id/login` returns `flow: "activation"` and
-`requiresActivation: true` with a plain `claude /login` command). Both app
+`requiresActivation: true` with a `claude /login` command). Since issue #596
+that command also carries the profile-pinned env pair: activation steers the
+credential on affected releases, but only `CLAUDE_CONFIG_DIR` steers the
+`.claude.json` identity write — the file is a sibling of the `~/.claude`
+symlink, so in a terminal that never got the `~/.zshenv` shell pins an
+env-free login strands the identity in the default home and the profile
+verifies as signed out. Within the app flow, activation and the pin always
+name the same profile, so the env-only cross-wiring above cannot occur
+there. One residual hazard is accepted (decision 0038): a stale copy of the
+pinned command, replayed after a later account switch, disagrees with the
+then-active home — on affected 2.1.216-era builds that splits identity
+(env-steered) and credential (resolved-home-steered) across two profiles.
+The verify identity-mismatch refusal remains the backstop for logins
+replayed outside the flow. Both app
 sign-in flows (add-account and the roster's "Sign in again") activate the
 target, run the login, verify, and restore the previously active account
 after verification passes. When the version cannot be detected, ModelDeck
@@ -58,8 +71,19 @@ identity against the account's recorded identity. On disagreement it
 failure with the target left active so a corrective `/login` lands in the
 right slot. An unauthenticated verify that finds the plain Keychain service
 present while the profile-scoped service is absent carries a fixed,
-non-secret `verifyHint`; the app shows it only in the manual verify flow, and
-it is never persisted or copied into `/api/state`.
+non-secret `verifyHint`; the app surfaces it only in the sign-in and manual
+verify flows, and it is never persisted or copied into `/api/state`. The same
+channel carries a second fixed hint (issue #596): serving a login command
+snapshots the default home's `.claude.json` identity (first snapshot per
+attempt wins — a re-served command never overwrites a live baseline), and a
+signed-out verify that finds that identity changed names the stray login
+instead of reporting a generic "not signed in yet". The snapshot comparison —
+not file mtime — is what keeps long-standing pre-adoption identities, whose
+file unpinned sessions rewrite constantly, from flagging every ordinary
+signed-out verify. An unreadable file (mid-rewrite, non-regular, oversized)
+reads as "unknown" on either side and makes no claim. Known limit: a stray
+login as the identity already sitting in the default home compares equal and
+falls through to the Keychain-slot hint or the generic result.
 
 For compatibility, `GET /api/tools` retains the historical classifier
 (`credentialScoping: "config-dir" | "resolved-home"`). It now describes the

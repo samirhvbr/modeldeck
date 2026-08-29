@@ -270,10 +270,11 @@ struct Decision0035GrokColumnTests {
         #expect(spoken != display.text(.sum), "the spoken form must be a sentence, not the bare number")
     }
 
-    /// The provider mark is its own element with its own label; Grok ships no
-    /// bundled artwork, and the fallback slot must still announce the provider.
-    @Test func grokProviderMarkKeepsALabelWithoutArtwork() {
-        #expect(ProviderIcons.image(for: .grok) == nil)
+    /// The provider mark is its own element with its own label. Grok ships
+    /// bundled artwork now (generated official mark), and the accessibility
+    /// label still announces the provider.
+    @Test func grokProviderMarkCarriesArtworkAndALabel() {
+        #expect(ProviderIcons.image(for: .grok) != nil)
         // ProviderMarkView labels the slot with exactly this string.
         #expect(DeckProvider.grok.displayName == "Grok")
     }

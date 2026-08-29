@@ -1691,9 +1691,11 @@ test('add-account flow: create, login spec, verify, and reference-only delete', 
 });
 
 // Issue #99's historical >=2.1.216 boundary keeps this login spec
-// activation-driven (plain `claude /login`, no command-level env override),
-// and verify must refuse a read-back identity that contradicts the intended
-// account instead of laundering it.
+// activation-driven, and verify must refuse a read-back identity that
+// contradicts the intended account instead of laundering it. Issue #596:
+// the served command also carries the profile env pin — activation steers
+// the credential on affected releases, the pin steers the .claude.json
+// identity write in shells that have no pin of their own.
 test('historical-boundary CLI: activation-driven login spec and identity-mismatch refusal', async (t) => {
   const daemonClaudePath = '/fixture/daemon-bin/claude';
   const canonicalClaudePath = '/fixture/Claude Code/claude';
@@ -1717,14 +1719,19 @@ test('historical-boundary CLI: activation-driven login spec and identity-mismatc
   const seeded = fixture.store.listAccounts().find((account) => account.provider === 'claude');
   fixture.store.saveAccount({ ...seeded, identity: 'intended@example.invalid' });
 
-  // The spec drives sign-in through activation, never through env scoping.
+  // The spec drives sign-in through activation AND pins the profile env
+  // (issue #596 tripwire): the served command must never depend on the
+  // invoking shell's environment for where the identity write lands.
   let result = await request(fixture, `/api/accounts/${seeded.id}/login`);
   assert.equal(result.response.status, 200);
   assert.equal(result.body.flow, 'activation');
   assert.equal(result.body.requiresActivation, true);
   assert.match(result.body.command, /claude.* \/login$/);
-  assert.equal(result.body.command, `'${canonicalClaudePath}' /login`);
-  assert.ok(!result.body.command.includes('CLAUDE_CONFIG_DIR'));
+  const realProfile = fs.realpathSync(seeded.profileRef);
+  assert.equal(
+    result.body.command,
+    `CLAUDE_CONFIG_DIR='${realProfile}' CLAUDE_SECURESTORAGE_CONFIG_DIR='${realProfile}' '${canonicalClaudePath}' /login`,
+  );
   assert.ok(!result.body.command.includes('logout'));
 
   // Post-login read-back disagrees with the intended account: the response

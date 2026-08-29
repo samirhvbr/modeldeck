@@ -6,6 +6,7 @@ import path from 'node:path';
 import { Store } from '../src/db.mjs';
 import {
   CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT,
+  CLAUDE_STRAY_LOGIN_VERIFY_HINT,
   ModelDeckService,
 } from '../src/service.mjs';
 import { codexDeadCredentialError } from '../src/adapters/codex.mjs';
@@ -843,7 +844,8 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
       assert.equal(path.isAbsolute(spec.command), true);
       assert.equal(spec.command, fs.realpathSync(canonicalPath));
       assert.equal(calls.find((call) => call.args[0] === '--version').binary, spec.command);
-      assert.equal(spec.preview, `'${spec.command}' /login`);
+      assert.ok(spec.preview.endsWith(`'${spec.command}' /login`));
+      assert.match(spec.preview, /^CLAUDE_CONFIG_DIR=/);
       assert.equal(spec.flow, 'activation');
     } finally { data.close(); }
   });
@@ -870,7 +872,7 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
     } finally { data.close(); }
   });
 
-  await t.test('2.1.216 and later drive sign-in through activation', async () => {
+  await t.test('2.1.216 and later drive sign-in through activation with the env pair pinned (#596 tripwire)', async () => {
     for (const version of ['2.1.216', '2.2.0', '3.0.1']) {
       const claudeExecutable = '/fixture/bin/claude';
       const data = fixture({
@@ -884,9 +886,15 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
         assert.equal(spec.flow, 'activation');
         assert.equal(spec.requiresActivation, true);
         assert.deepEqual(spec.args, ['/login']);
-        // No command-level env override: activation steers affected releases.
-        assert.deepEqual(spec.env, {});
-        assert.doesNotMatch(spec.preview, /CLAUDE_CONFIG_DIR|CLAUDE_SECURESTORAGE_CONFIG_DIR/);
+        // Issue #596 tripwire: the activation-flow command must carry the
+        // profile pin itself. Activation steers the credential on affected
+        // releases, but only this env pin steers the .claude.json identity
+        // write — an unpinned shell otherwise lands it in the default home
+        // and sign-in fails silently. Never make the login command depend on
+        // the invoking shell's environment again.
+        const real = fs.realpathSync(data.firstHome);
+        assert.deepEqual(spec.env, { CLAUDE_CONFIG_DIR: real, CLAUDE_SECURESTORAGE_CONFIG_DIR: real });
+        assert.match(spec.preview, /^CLAUDE_CONFIG_DIR='[^']+' CLAUDE_SECURESTORAGE_CONFIG_DIR='[^']+' /);
         assert.match(spec.preview, /\/login$/);
         assert.doesNotMatch(spec.preview, /logout/);
       } finally { data.close(); }
@@ -995,6 +1003,145 @@ test('Claude verify refuses a read-back identity that contradicts the account', 
     } finally { data.close(); }
   });
 
+  // Issue #596: a login from an unpinned shell lands in the DEFAULT
+  // ~/.claude.json (sibling of the active-profile symlink) and used to be
+  // indistinguishable from "not signed in yet". The detector compares the
+  // default home's identity against a snapshot taken when the login command
+  // was served — never file mtime, which unrelated config writes refresh.
+  const strayFixture = (overrides = {}) => fixture({
+    claudePath: '/fixture/bin/claude',
+    realpath: async (value) => value,
+    exec: async (_binary, args) => ({ stdout: args[0] === '--version' ? 'Claude Code 2.2.0' : '' }),
+    readClaudeAuth: async () => ({ authenticated: false, identity: null }),
+    // Both slot conditions hold in the field failure; the stray-login
+    // diagnostic must win when it fires because it names the actual cause.
+    claudeCredentialKeychainSlotState: async () => ({ profileScoped: false, unscoped: true }),
+    ...overrides,
+  });
+  const writeDefaultHomeConfig = (data, contents) => {
+    const defaultHome = path.dirname(data.claudeActiveLink);
+    fs.mkdirSync(defaultHome, { recursive: true });
+    fs.writeFileSync(path.join(defaultHome, '.claude.json'), JSON.stringify(contents));
+  };
+
+  await t.test('an identity appearing in the default home after the login was served names what happened', async () => {
+    const data = strayFixture();
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.loginSpec(account.id);
+      writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'stray@example.invalid', accountUuid: 'u-1' } });
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.authenticated, false);
+      assert.equal(result.verifyHint, CLAUDE_STRAY_LOGIN_VERIFY_HINT);
+      assert.equal(data.store.getAccount(account.id).metadata.verifyHint, undefined);
+    } finally { data.close(); }
+  });
+
+  await t.test('a long-standing default-home identity does not flag a signed-out verify, even freshly rewritten', async () => {
+    const data = strayFixture();
+    try {
+      writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'old@example.invalid', accountUuid: 'u-0' } });
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.loginSpec(account.id);
+      // Unpinned sessions rewrite this file constantly (history, project
+      // trust) without a new login; a fresh mtime must not read as one.
+      writeDefaultHomeConfig(data, {
+        oauthAccount: { emailAddress: 'old@example.invalid', accountUuid: 'u-0' },
+        history: ['unrelated write'],
+      });
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.authenticated, false);
+      // Falls through to the accurate Keychain-slot diagnostic instead.
+      assert.equal(result.verifyHint, CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT);
+    } finally { data.close(); }
+  });
+
+  await t.test('a default-home identity with no served login command stays an ordinary signed-out verify', async () => {
+    const data = strayFixture();
+    try {
+      writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'old@example.invalid', accountUuid: 'u-0' } });
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.authenticated, false);
+      assert.equal(result.verifyHint, CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT);
+    } finally { data.close(); }
+  });
+
+  await t.test('a clean authenticated verify concludes the attempt: later default-home changes stop flagging', async () => {
+    let authResult = { authenticated: false, identity: null };
+    const data = strayFixture({ readClaudeAuth: async () => authResult });
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.loginSpec(account.id);
+      authResult = { authenticated: true, identity: 'user@example.invalid' };
+      await data.service.verifyAccount(account.id);
+      // The attempt is over; an unpinned login by ANYONE later must not be
+      // pinned on this account's long-finished sign-in.
+      writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'later@example.invalid', accountUuid: 'u-9' } });
+      authResult = { authenticated: false, identity: null };
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.verifyHint, CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT);
+    } finally { data.close(); }
+  });
+
+  await t.test('an unreadable default config at serve time makes no stray claim', async () => {
+    const data = strayFixture();
+    try {
+      // Mid-rewrite truncation at snapshot time: the baseline must record
+      // "unknown", not "no identity" — else the long-standing identity below
+      // would read as a fresh stray login.
+      const defaultHome = path.dirname(data.claudeActiveLink);
+      fs.mkdirSync(defaultHome, { recursive: true });
+      fs.writeFileSync(path.join(defaultHome, '.claude.json'), '{"oauthAccount":{"emailAddr');
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.loginSpec(account.id);
+      writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'old@example.invalid', accountUuid: 'u-0' } });
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.verifyHint, CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT);
+    } finally { data.close(); }
+  });
+
+  await t.test('re-serving the login command never disarms a live attempt', async () => {
+    const data = strayFixture();
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.loginSpec(account.id);
+      writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'stray@example.invalid', accountUuid: 'u-1' } });
+      // A Copy-button refetch (or any out-of-band GET) after the stray login
+      // landed must not overwrite the baseline with the strayed identity.
+      await data.service.loginSpec(account.id);
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.verifyHint, CLAUDE_STRAY_LOGIN_VERIFY_HINT);
+    } finally { data.close(); }
+  });
+
+  await t.test('concurrent serves capture exactly one baseline (atomic check-and-set)', async () => {
+    const data = strayFixture();
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      let snapshots = 0;
+      const original = data.service.claudeDefaultHomeIdentitySnapshot.bind(data.service);
+      data.service.claudeDefaultHomeIdentitySnapshot = async () => {
+        snapshots += 1;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return original();
+      };
+      await Promise.all([data.service.loginSpec(account.id), data.service.loginSpec(account.id)]);
+      assert.equal(snapshots, 1);
+    } finally { data.close(); }
+  });
+
+  await t.test('deleting the account clears its stray-login baseline like the sibling maps', async () => {
+    const data = strayFixture();
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.loginSpec(account.id);
+      assert.equal(data.service.claudeStrayLoginBaseline.has(account.id), true);
+      await data.service.deleteAccount(account.id);
+      assert.equal(data.service.claudeStrayLoginBaseline.has(account.id), false);
+    } finally { data.close(); }
+  });
+
   await t.test('a failed slot diagnostic preserves the ordinary unauthenticated result', async () => {
     const data = fixture({
       readClaudeAuth: async () => ({ authenticated: false, identity: null }),
@@ -1004,6 +1151,34 @@ test('Claude verify refuses a read-back identity that contradicts the account', 
       const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
       const result = await data.service.verifyAccount(account.id);
       assert.equal(result.authenticated, false);
+      assert.equal(result.verifyHint, undefined);
+    } finally { data.close(); }
+  });
+
+  // Two cases carried over from PR #597's suite, adapted to the baseline
+  // design that replaced its mtime detector.
+  await t.test('a default-home config gaining non-identity keys produces no stray hint', async () => {
+    const data = strayFixture();
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.loginSpec(account.id);
+      writeDefaultHomeConfig(data, { firstStartTime: '2026-08-29T00:00:00.000Z' });
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.authenticated, false);
+      assert.equal(result.verifyHint, CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT);
+    } finally { data.close(); }
+  });
+
+  await t.test('an authenticated verify never carries the stray-login hint', async () => {
+    const data = strayFixture({
+      readClaudeAuth: async () => ({ authenticated: true, identity: 'user@example.invalid' }),
+    });
+    try {
+      const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+      await data.service.loginSpec(account.id);
+      writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'stray@example.invalid', accountUuid: 'u-1' } });
+      const result = await data.service.verifyAccount(account.id);
+      assert.equal(result.authenticated, true);
       assert.equal(result.verifyHint, undefined);
     } finally { data.close(); }
   });

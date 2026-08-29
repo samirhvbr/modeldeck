@@ -12,13 +12,12 @@ struct ProviderIconTests {
         // Build scripts and the bundled PNG filenames depend on these.
         #expect(ProviderIcons.resourceBaseName(for: .claude) == "provider-claude")
         #expect(ProviderIcons.resourceBaseName(for: .codex) == "provider-codex")
-        // Decision 0035: ModelDeck ships no Grok artwork (there is no
-        // installed Grok desktop app to take an .icns from). The deck's
-        // provider mark falls back to the initial. If artwork ever lands,
-        // this line and `bundledProviders` change together — and every
-        // bundle-shape tripwire below starts covering it automatically.
-        #expect(ProviderIcons.resourceBaseName(for: .grok) == nil)
-        #expect(ProviderIcons.bundledProviders == [.claude, .codex])
+        // Grok artwork is generated, not extracted (no installed Grok
+        // desktop app to take an .icns from) — see
+        // scripts/generate-grok-provider-icon.swift. Listing it here puts it
+        // under every bundle-shape tripwire below.
+        #expect(ProviderIcons.resourceBaseName(for: .grok) == "provider-grok")
+        #expect(ProviderIcons.bundledProviders == [.claude, .codex, .grok])
     }
 
     @Test func iconsLoadWithEveryDeclaredPixelSize() {
@@ -62,9 +61,10 @@ struct ProviderIconTests {
 
     // Pin the artwork identity byte-for-byte (CodeRabbit on PR #107: the
     // structural assertions above would pass with duplicated or wrong RGBA
-    // artwork). These digests are the shipped PNGs extracted from
+    // artwork). Claude/Codex digests are the shipped PNGs extracted from
     // Claude.app 1.24012.0 / ChatGPT.app 26.715.70719 (see issue #103);
-    // regenerating the assets is expected to update them deliberately.
+    // Grok digests are the scripts/generate-grok-provider-icon.swift render.
+    // Regenerating the assets is expected to update them deliberately.
     private static let expectedDigests: [String: String] = [
         "provider-claude-32": "c3465ac9002332e5987b9e22b2b1a56a0984570692c72ea433b85a90feb81662",
         "provider-claude-64": "2a6272970391363092c12c23cf16bd7510dde7fd18c3603f0a5f1a5d888869dd",
@@ -72,6 +72,9 @@ struct ProviderIconTests {
         "provider-codex-32": "c6ca70e636afdf954a9d2ab2c8c7212f390f0d4b9fa9f98e9d654b1119bad1f3",
         "provider-codex-64": "78da8368337ce1f49cbcde8b8112864e3644ef563f777ed7677bdfee7f8725f5",
         "provider-codex-128": "fee4f7a7a68187fa61d00789751ad9f160a40ca2b0a194492cff88353a9d9c5a",
+        "provider-grok-32": "817693bc0aca7550f1d13187663d32c7e558226dfa621d8474595a85b2aeb216",
+        "provider-grok-64": "f1d72e48141f6938908e29173cdebdad43e3085ab286a9d91ec75f101689ba34",
+        "provider-grok-128": "ad4992a4e980ab6c65acd3a8676b1f260ad2053cb2f1dcbbc8fa1a81787ddea4",
     ]
 
     private static func digest(ofResource name: String) throws -> String {
@@ -93,11 +96,13 @@ struct ProviderIconTests {
         }
     }
 
-    @Test func claudeAndCodexArtworkDiffer() throws {
+    @Test func noTwoProvidersShareArtwork() throws {
         for pixels in ProviderIcons.pixelSizes {
-            let claude = try Self.digest(ofResource: "provider-claude-\(pixels)")
-            let codex = try Self.digest(ofResource: "provider-codex-\(pixels)")
-            #expect(claude != codex, "providers must not share artwork at \(pixels)px")
+            let digests = try ProviderIcons.bundledProviders.map { provider in
+                try Self.digest(ofResource: "\(ProviderIcons.resourceBaseName(for: provider)!)-\(pixels)")
+            }
+            #expect(Set(digests).count == digests.count,
+                    "providers must not share artwork at \(pixels)px")
         }
     }
 }

@@ -315,6 +315,15 @@ export const CLAUDE_RESOLVED_HOME_CREDENTIALS_MIN_VERSION = '2.1.216';
 // into /api/state.
 export const CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT = "A Claude credential exists in the default Keychain slot, but none was found for this ModelDeck profile. Run this account's login command again, then verify.";
 
+// Additive POST /verify diagnostic only (issue #596): names where a stray
+// login landed, same contract as the Keychain hint above. Fixed non-secret
+// string — carries no identity or credential values and is never persisted
+// or copied into /api/state. (PR #597 shipped a 30-minute-mtime variant of
+// this; the review-hardening pass replaced the time window with the
+// serve-time baseline below because unrelated config writes refresh the
+// file's mtime constantly.)
+export const CLAUDE_STRAY_LOGIN_VERIFY_HINT = "A sign-in completed into the default Claude config (~/.claude.json) instead of this account's profile — the terminal that ran it wasn't pinned. Run the sign-in command ModelDeck provides (it pins the profile itself), then verify.";
+
 // Issue #89: refresh failures whose message carries this phrase mean the
 // stored credentials are unusable (missing or expired) — the account needs a
 // fresh provider login, no matter what the presence probe says. Expired OAuth
@@ -715,6 +724,15 @@ export class ModelDeckService {
     this.claudePath = options.claudePath || 'claude';
     this.claudeProfilesDir = options.claudeProfilesDir || path.join(os.homedir(), 'Library', 'Application Support', 'ModelDeck', 'claude-profiles');
     this.claudeActiveLink = options.claudeActiveLink || path.join(os.homedir(), '.claude');
+    // Issue #596: where an UNPINNED `claude` writes its default .claude.json.
+    // Defaults to the active link's parent (production: the user's home).
+    // Note the coincidence is deliberate but not guaranteed — a nonstandard
+    // MODELDECK_CLAUDE_ACTIVE_LINK override should override this too.
+    this.claudeDefaultHome = options.claudeDefaultHome || path.dirname(this.claudeActiveLink);
+    // Issue #596: per-account snapshot of the default home's identity, taken
+    // when a login command is served, compared on signed-out verifies. Memory
+    // only — never persisted, cleared on a successful verify.
+    this.claudeStrayLoginBaseline = new Map();
     this.configLintZshenvPath = options.zshenvPath || path.join(os.homedir(), '.zshenv');
     this.configLintLaunchctlPath = options.launchctlPath || '/bin/launchctl';
     // Issue #66: shell snippet sourced by the install-shell-env.sh block so
@@ -3181,13 +3199,40 @@ export class ModelDeckService {
         await this.toolExecutablePath(this.claudePath),
       );
       const flow = await this.claudeLoginFlow(claudeExecutable);
+      // Issue #596 detector, half 1: snapshot the default home's identity at
+      // serve time so a signed-out verify can tell "a login landed in the
+      // default home during this attempt" apart from long-standing unmanaged
+      // state. First snapshot per attempt wins: re-serving the command (the
+      // sheet's Copy refetch, an out-of-band GET) must never overwrite a
+      // baseline after a stray login already landed, or the re-serve would
+      // disarm the very diagnostic this exists for. Only a clean
+      // authenticated verify or account deletion concludes the attempt.
+      // The PROMISE is stored, not the value: check-and-set stays atomic
+      // (no await between them), so concurrent serves cannot both capture
+      // and a later capture can never replace the first.
+      if (!this.claudeStrayLoginBaseline.has(account.id)) {
+        this.claudeStrayLoginBaseline.set(account.id, this.claudeDefaultHomeIdentitySnapshot());
+      }
       if (flow === 'activation') {
         // Issue #99 fix direction 1: the caller must activate this account
         // first (requiresActivation) so ~/.claude resolves to the target
-        // profile, then run the plain login below — no env override, because
-        // the environment is not sufficient on affected releases. Verify the
-        // identity while the target is still active; only then optionally
-        // restore the previously active account.
+        // profile — on affected releases the credential keys off that
+        // resolved home and the environment cannot steer it. The env pin
+        // below is still required (issue #596): the identity file
+        // .claude.json is a SIBLING of the symlink, so in an unpinned shell
+        // the login writes it to the default home where the profile
+        // read-back never looks; where the ~/.zshenv shell pins exist it is
+        // redundant-but-harmless, both sources resolving to the same
+        // activation-recorded real path. Within the app flow, activation and
+        // the pin name the same profile and cannot disagree the way the
+        // pre-#99 env-only guidance could. Residual hazard, accepted
+        // (decision 0038): a COPY of this command replayed after a later
+        // account switch disagrees with the then-active home, and on the
+        // 2.1.216-era builds that splits identity and credential across
+        // profiles (docs/CLAUDE_IDENTITY.md scopes it; the verify mismatch
+        // refusal remains the backstop). Verify the identity while the
+        // target is still active; only then optionally restore the
+        // previously active account.
         return {
           provider: 'claude',
           account,
@@ -3195,8 +3240,8 @@ export class ModelDeckService {
           requiresActivation: true,
           command: claudeExecutable,
           args: ['/login'],
-          env: {},
-          preview: `${shellQuote(claudeExecutable)} /login`,
+          env: { CLAUDE_CONFIG_DIR: profileRef, CLAUDE_SECURESTORAGE_CONFIG_DIR: profileRef },
+          preview: `CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(claudeExecutable)} /login`,
         };
       }
       return {
@@ -3224,6 +3269,59 @@ export class ModelDeckService {
     };
   }
 
+  // Issue #596: identity snapshot of the DEFAULT home's .claude.json —
+  // the file an UNPINNED `claude` writes. `known: false` means the read
+  // failed for any reason other than the file not existing (mid-rewrite
+  // truncation, a non-regular file, an oversized file): the state is
+  // unknown, which must never be conflated with "no identity" — a null
+  // baseline over a real long-standing identity would flag every later
+  // signed-out verify as a stray login. Metadata read only, never a
+  // credential; normalization mirrors readClaudeProfileIdentity so
+  // baseline and verify-time reads always compare like with like.
+  async claudeDefaultHomeIdentitySnapshot() {
+    const file = path.join(this.claudeDefaultHome, '.claude.json');
+    let raw;
+    try {
+      const stat = await fs.promises.lstat(file);
+      // Regular files only, size-bounded: a FIFO here would hang the read
+      // (and the daemon's fs threadpool) and this is an unmanaged path.
+      if (!stat.isFile() || stat.size > 8 * 1024 * 1024) return { known: false };
+      raw = await fs.promises.readFile(file, 'utf8');
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { known: true, identity: null, accountUuid: null };
+      return { known: false };
+    }
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { return { known: false }; }
+    const email = parsed?.oauthAccount?.emailAddress;
+    const uuid = parsed?.oauthAccount?.accountUuid;
+    return {
+      known: true,
+      identity: typeof email === 'string' && email.trim() ? email.trim().toLowerCase() : null,
+      accountUuid: typeof uuid === 'string' && uuid.trim() ? uuid.trim() : null,
+    };
+  }
+
+  // Issue #596 detector, half 2: on a signed-out verify, an oauthAccount in
+  // the DEFAULT home's .claude.json that CHANGED since this account's login
+  // command was served is a login that escaped the profile during this
+  // attempt. Comparing against the serve-time baseline (not file mtime) is
+  // what keeps long-standing pre-adoption identities — whose file Claude
+  // Code rewrites constantly for history and project trust — from flagging
+  // every ordinary signed-out verify. Either side unknown → no claim. The
+  // baseline lives in memory only, so a daemon restart mid-attempt merely
+  // degrades this hint to the generic result.
+  async claudeStrayDefaultLogin(accountId) {
+    // The map holds the snapshot promise (see loginSpec); it never rejects.
+    const baseline = await this.claudeStrayLoginBaseline.get(accountId);
+    if (!baseline?.known) return null;
+    const current = await this.claudeDefaultHomeIdentitySnapshot();
+    if (!current.known) return null;
+    if (!current.identity && !current.accountUuid) return null;
+    if (current.identity === baseline.identity && current.accountUuid === baseline.accountUuid) return null;
+    return { strayed: true };
+  }
+
   // Issue #8, step 3: read back the authenticated identity via the provider's
   // own status command (never a logout, never credential files) and persist
   // it on the account so the roster can show "Signed in as …".
@@ -3235,14 +3333,28 @@ export class ModelDeckService {
       : await this.readCodexAuth({ binary: this.codexPath, codexHome: account.profileRef, profilesDir: this.codexProfilesDir });
     let verifyHint;
     if (account.provider === 'claude' && !result.authenticated) {
-      // Best effort only: a denied/unavailable Keychain diagnostic must not
-      // turn an ordinary signed-out result into a verification error.
-      const slots = await this.claudeCredentialKeychainSlotState({
-        claudeConfigDir: account.profileRef,
-        platform: this.platform,
-      }).catch(() => null);
-      if (slots?.profileScoped === false && slots.unscoped === true) {
-        verifyHint = CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT;
+      // Issue #596: an unpinned shell writes the login identity to the
+      // DEFAULT ~/.claude.json — a sibling of the active-profile symlink,
+      // which the flip cannot steer. When the profile reads signed-out but
+      // the default home's identity changed since this account's login
+      // command was served, name what happened instead of the generic "not
+      // signed in yet" — it pinpoints WHY the profile is empty, which the
+      // bare Keychain-slot observation cannot. Metadata only (identity
+      // fields, never credential values), and best effort like the Keychain
+      // diagnostic below.
+      const stray = await this.claudeStrayDefaultLogin(account.id).catch(() => null);
+      if (stray) {
+        verifyHint = CLAUDE_STRAY_LOGIN_VERIFY_HINT;
+      } else {
+        // Best effort only: a denied/unavailable Keychain diagnostic must not
+        // turn an ordinary signed-out result into a verification error.
+        const slots = await this.claudeCredentialKeychainSlotState({
+          claudeConfigDir: account.profileRef,
+          platform: this.platform,
+        }).catch(() => null);
+        if (slots?.profileScoped === false && slots.unscoped === true) {
+          verifyHint = CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT;
+        }
       }
     }
     // Issue #99 fix direction 2 (the #65 blind spot's enforcement teeth):
@@ -3265,6 +3377,11 @@ export class ModelDeckService {
           identityMismatch: { expected: account.identity, actual: result.identity },
         };
       }
+    }
+    // Issue #596: a clean authenticated verify ends the login attempt this
+    // account's baseline was tracking.
+    if (account.provider === 'claude' && result.authenticated) {
+      this.claudeStrayLoginBaseline.delete(account.id);
     }
     let saved = account;
     // Issue #26: persist the plan facts the status read surfaced alongside
@@ -4435,6 +4552,7 @@ export class ModelDeckService {
     if (deleted) {
       this.accountRefreshErrors.delete(accountId);
       this.claudeCredentialExpiries.delete(accountId);
+      this.claudeStrayLoginBaseline.delete(accountId);
     }
     if (deleted && account?.isDefault) this.invalidateToolProbe();
     if (deleted) await this.accountProfileSetChanged();

@@ -487,8 +487,12 @@ export function createApp({
         });
       }
       // Issue #8, step 2: the provider-owned login command for one account.
-      // Read-only spec (same trust boundary as GET /api/launch) — the app
-      // runs it in the user's own terminal; the daemon never performs logins.
+      // Same trust boundary as GET /api/launch — the app runs the command in
+      // the user's own terminal; the daemon never performs logins. One
+      // deliberate side effect (issue #596): serving a Claude spec SEEDS the
+      // stray-login baseline if no attempt is live. Seed-only by design: an
+      // ungated GET may start tracking but can never clear or overwrite a
+      // baseline, so it cannot disarm the stray-login diagnostic.
       const loginMatch = url.pathname.match(/^\/api\/accounts\/([^/]+)\/login$/);
       if (req.method === 'GET' && loginMatch) {
         const account = ownedStore.getAccount(decodeURIComponent(loginMatch[1]));
