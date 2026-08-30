@@ -1505,6 +1505,8 @@ test('settings API validates partial updates and drives worst-capacity threshold
     deckHealthLabels: '',
     // TRIPWIRE (#388): 0.4.6 defaults the dashboard ON for a new database.
     usageAnalyticsEnabled: true,
+    // Issue #605: extra read-only transcript scan roots — none by default.
+    extraClaudeScanRoots: [],
   });
   result = await request(fixture, '/api/settings', { method: 'PUT', body: JSON.stringify({ layout: 'single-column', notificationThresholdPercent: 30 }) });
   assert.equal(result.body.layout, 'single-column');

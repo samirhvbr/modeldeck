@@ -168,6 +168,8 @@ test('TRIPWIRE: settings API immediately reschedules warehouse ingest when analy
 
 test('TRIPWIRE: every warehouse pass ingests all three corpora, scans findings, and refits usage estimates', async () => {
   const data = schedulerFixture();
+  const extraScanRoot = { path: '/tmp/modeldeck-warehouse-extra-placeholder', profileSlug: 'profile-placeholder' };
+  data.store.saveSettings({ extraClaudeScanRoots: [extraScanRoot] });
   try {
     const starting = data.service.startWarehouseIngest();
     await awaitCurrentPass(data.service, data.timers);
@@ -182,6 +184,8 @@ test('TRIPWIRE: every warehouse pass ingests all three corpora, scans findings, 
     ]);
     assert.equal(data.calls[0].options.store, data.store);
     assert.equal(data.calls[0].options.directory, '/tmp/modeldeck-warehouse-claude-placeholder');
+    assert.deepEqual(data.calls[0].options.extraRoots, [extraScanRoot],
+      'issue #605: each pass reads the extra scan roots from live settings');
     assert.equal(data.calls[1].options.store, data.store);
     assert.equal(data.calls[1].options.profilesRoot, '/tmp/modeldeck-warehouse-codex-placeholder');
     assert.equal(data.calls[2].options.store, data.store);

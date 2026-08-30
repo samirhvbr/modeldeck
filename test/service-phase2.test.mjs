@@ -1023,12 +1023,19 @@ test('Claude verify refuses a read-back identity that contradicts the account', 
     fs.mkdirSync(defaultHome, { recursive: true });
     fs.writeFileSync(path.join(defaultHome, '.claude.json'), JSON.stringify(contents));
   };
+  // Issue #608: loginSpec stores the baseline snapshot promise WITHOUT
+  // awaiting it (the atomic check-and-set from #600), so the fs read can
+  // land after this test's next default-home write under full-suite
+  // threadpool load. Tests pin the intended "baseline before write"
+  // ordering explicitly instead of racing it.
+  const strayBaselineCaptured = (data, accountId) => data.service.claudeStrayLoginBaseline.get(accountId);
 
   await t.test('an identity appearing in the default home after the login was served names what happened', async () => {
     const data = strayFixture();
     try {
       const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
       await data.service.loginSpec(account.id);
+      await strayBaselineCaptured(data, account.id);
       writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'stray@example.invalid', accountUuid: 'u-1' } });
       const result = await data.service.verifyAccount(account.id);
       assert.equal(result.authenticated, false);
@@ -1043,6 +1050,7 @@ test('Claude verify refuses a read-back identity that contradicts the account', 
       writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'old@example.invalid', accountUuid: 'u-0' } });
       const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
       await data.service.loginSpec(account.id);
+      await strayBaselineCaptured(data, account.id);
       // Unpinned sessions rewrite this file constantly (history, project
       // trust) without a new login; a fresh mtime must not read as one.
       writeDefaultHomeConfig(data, {
@@ -1073,6 +1081,7 @@ test('Claude verify refuses a read-back identity that contradicts the account', 
     try {
       const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
       await data.service.loginSpec(account.id);
+      await strayBaselineCaptured(data, account.id);
       authResult = { authenticated: true, identity: 'user@example.invalid' };
       await data.service.verifyAccount(account.id);
       // The attempt is over; an unpinned login by ANYONE later must not be
@@ -1095,6 +1104,7 @@ test('Claude verify refuses a read-back identity that contradicts the account', 
       fs.writeFileSync(path.join(defaultHome, '.claude.json'), '{"oauthAccount":{"emailAddr');
       const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
       await data.service.loginSpec(account.id);
+      await strayBaselineCaptured(data, account.id);
       writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'old@example.invalid', accountUuid: 'u-0' } });
       const result = await data.service.verifyAccount(account.id);
       assert.equal(result.verifyHint, CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT);
@@ -1106,6 +1116,7 @@ test('Claude verify refuses a read-back identity that contradicts the account', 
     try {
       const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
       await data.service.loginSpec(account.id);
+      await strayBaselineCaptured(data, account.id);
       writeDefaultHomeConfig(data, { oauthAccount: { emailAddress: 'stray@example.invalid', accountUuid: 'u-1' } });
       // A Copy-button refetch (or any out-of-band GET) after the stray login
       // landed must not overwrite the baseline with the strayed identity.

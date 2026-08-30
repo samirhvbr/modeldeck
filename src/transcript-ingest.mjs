@@ -43,13 +43,16 @@ function compareNames(left, right) {
   return left.name.localeCompare(right.name);
 }
 
-function fileMetadata(projectsDir, filePath, profileSlug) {
+function fileMetadata(projectsDir, filePath, profileSlug, sourceLabel) {
   const relativeSegments = path.relative(projectsDir, filePath).split(path.sep);
   const subagentsIndex = relativeSegments.lastIndexOf('subagents');
   const isSubagent = subagentsIndex >= 0;
   return {
     path: filePath,
-    relativePath: path.join(profileSlug, 'projects', ...relativeSegments),
+    // The label keeps relativePath (and the event keys derived from it)
+    // unique when an extra root is attributed to a managed profile's slug:
+    // managed files are labeled by slug, extra-root files by their root path.
+    relativePath: path.join(sourceLabel, 'projects', ...relativeSegments),
     profileSlug,
     isSubagent,
     agentId: isSubagent ? path.basename(filePath, '.jsonl') : null,
@@ -61,8 +64,11 @@ function fileMetadata(projectsDir, filePath, profileSlug) {
 
 /// Enumerate managed profile directories directly and never traverse a
 /// symlink. In particular, ~/.claude is not a scan root, so an active-profile
-/// symlink cannot duplicate a profile's transcript rows.
-export async function enumerateTranscriptFiles(profilesDirectory) {
+/// symlink cannot duplicate a profile's transcript rows. Extra roots
+/// (issue #605) are standalone Claude homes scanned under the same rule:
+/// a root that is itself a symlink, or that overlaps the managed profiles
+/// directory, is skipped with a reason instead of scanned.
+export async function enumerateTranscriptFiles(profilesDirectory, extraRoots = []) {
   if (typeof profilesDirectory !== 'string' || !profilesDirectory.trim()) {
     throw new Error('Claude profiles directory is required');
   }
@@ -81,7 +87,7 @@ export async function enumerateTranscriptFiles(profilesDirectory) {
   const files = [];
   let skippedSymlinks = 0;
 
-  async function walk(directory, projectsDir, profileSlug) {
+  async function walk(directory, projectsDir, profileSlug, sourceLabel) {
     let entries;
     try { entries = await fs.promises.readdir(directory, { withFileTypes: true }); }
     catch (error) {
@@ -94,18 +100,95 @@ export async function enumerateTranscriptFiles(profilesDirectory) {
       if (entry.isSymbolicLink()) {
         skippedSymlinks += 1;
       } else if (entry.isDirectory()) {
-        await walk(target, projectsDir, profileSlug);
+        await walk(target, projectsDir, profileSlug, sourceLabel);
       } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
-        files.push(fileMetadata(projectsDir, target, profileSlug));
+        files.push(fileMetadata(projectsDir, target, profileSlug, sourceLabel));
       }
     }
   }
 
   for (const entry of rootEntries) {
     const projectsDir = path.join(root, entry.name, 'projects');
-    await walk(projectsDir, projectsDir, entry.name);
+    await walk(projectsDir, projectsDir, entry.name, entry.name);
   }
-  return { root, profiles: rootEntries.length, files, skippedSymlinks };
+
+  let extraRootsScanned = 0;
+  const extraRootsSkipped = [];
+  const seenExtraPaths = new Set();
+  // Overlap and duplicate checks compare CANONICAL paths: path.resolve keeps
+  // symlinked parent components, so an alias of the managed directory (or of
+  // another extra root) would otherwise slip past the lexical comparison and
+  // double-ingest the same files under a second source label.
+  const canonicalManagedRoot = await fs.promises.realpath(root);
+  for (const extra of Array.isArray(extraRoots) ? extraRoots : []) {
+    const extraPath = typeof extra?.path === 'string' && extra.path.trim()
+      ? path.resolve(extra.path)
+      : null;
+    const profileSlug = typeof extra?.profileSlug === 'string' && extra.profileSlug.trim()
+      ? extra.profileSlug.trim()
+      : null;
+    if (!extraPath || !profileSlug) {
+      extraRootsSkipped.push({
+        path: extraPath || String(extra?.path ?? ''),
+        reason: 'entry must carry a path and a profileSlug',
+      });
+      continue;
+    }
+    let extraStat;
+    try { extraStat = await fs.promises.lstat(extraPath); }
+    catch (error) {
+      if (error?.code === 'ENOENT') {
+        extraRootsSkipped.push({ path: extraPath, reason: 'does not exist' });
+      } else {
+        // A misconfigured root (unreadable, malformed path) must not fail
+        // the whole ingest pass; the managed directory still gets scanned.
+        extraRootsSkipped.push({
+          path: extraPath,
+          reason: `cannot be inspected (${error?.code || 'unknown error'})`,
+        });
+      }
+      continue;
+    }
+    if (extraStat.isSymbolicLink()) {
+      extraRootsSkipped.push({ path: extraPath, reason: 'root is a symlink' });
+      continue;
+    }
+    if (!extraStat.isDirectory()) {
+      extraRootsSkipped.push({ path: extraPath, reason: 'root is not a directory' });
+      continue;
+    }
+    let canonicalPath;
+    try { canonicalPath = await fs.promises.realpath(extraPath); }
+    catch (error) {
+      extraRootsSkipped.push({
+        path: extraPath,
+        reason: `cannot be inspected (${error?.code || 'unknown error'})`,
+      });
+      continue;
+    }
+    if (canonicalPath === canonicalManagedRoot
+      || canonicalPath.startsWith(canonicalManagedRoot + path.sep)
+      || canonicalManagedRoot.startsWith(canonicalPath + path.sep)) {
+      extraRootsSkipped.push({ path: extraPath, reason: 'overlaps the managed profiles directory' });
+      continue;
+    }
+    if (seenExtraPaths.has(canonicalPath)) {
+      extraRootsSkipped.push({ path: extraPath, reason: 'duplicate root' });
+      continue;
+    }
+    seenExtraPaths.add(canonicalPath);
+    const projectsDir = path.join(canonicalPath, 'projects');
+    await walk(projectsDir, projectsDir, profileSlug, canonicalPath);
+    extraRootsScanned += 1;
+  }
+  return {
+    root,
+    profiles: rootEntries.length,
+    files,
+    skippedSymlinks,
+    extraRootsScanned,
+    extraRootsSkipped,
+  };
 }
 
 function recordSessionId(record, file) {
@@ -337,6 +420,7 @@ function flushBatch(store, batch, summary, reconcile = false) {
 export async function ingestTranscriptArchive({
   store,
   directory,
+  extraRoots = [],
   machine = 'studio',
   warn = () => {},
   batchLines = DEFAULT_BATCH_LINES,
@@ -344,9 +428,11 @@ export async function ingestTranscriptArchive({
   if (!store?.ingestTranscriptBatch) throw new Error('transcript ingest requires a Store');
   if (!text(machine)) throw new Error('transcript ingest machine is required');
   if (!Number.isInteger(batchLines) || batchLines < 1) throw new Error('transcript ingest batchLines must be a positive integer');
-  const enumeration = await enumerateTranscriptFiles(directory);
+  const enumeration = await enumerateTranscriptFiles(directory, extraRoots);
   const summary = {
     profiles: enumeration.profiles,
+    extraRootsScanned: enumeration.extraRootsScanned,
+    extraRootsSkipped: enumeration.extraRootsSkipped.length,
     files: enumeration.files.length,
     filesSkipped: 0,
     sessions: 0,
@@ -362,6 +448,10 @@ export async function ingestTranscriptArchive({
   function warning(message) {
     summary.warnings += 1;
     warn(`transcript-ingest: ${message}`);
+  }
+
+  for (const skipped of enumeration.extraRootsSkipped) {
+    warning(`skipped extra scan root ${skipped.path}: ${skipped.reason}`);
   }
 
   let work = enumeration.files;

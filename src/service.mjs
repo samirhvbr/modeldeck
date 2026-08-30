@@ -1591,6 +1591,7 @@ export class ModelDeckService {
         ['transcriptArchive', () => this.ingestTranscriptArchive({
           store: this.store,
           directory: this.claudeProfilesDir,
+          extraRoots: this.store.getSettings().extraClaudeScanRoots,
           machine: this.warehouseIngestMachine,
         })],
         ['codexRollouts', () => this.ingestCodexRollouts({

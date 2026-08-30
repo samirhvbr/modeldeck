@@ -481,6 +481,45 @@ test('poolTotalFormat accepts short strings and rejects everything else', () => 
   } finally { store.close(); }
 });
 
+// Issue #605 extra scan roots: structured entries, validated by the daemon
+// (it owns the scan), so a typo'd key or relative path is rejected at write
+// time instead of silently never scanning.
+test('extraClaudeScanRoots accepts labeled absolute paths and rejects everything else', () => {
+  const store = new Store(':memory:');
+  try {
+    assert.deepEqual(store.getSettings().extraClaudeScanRoots, []);
+    const entry = { path: '/placeholder/claude-home', profileSlug: 'profile-placeholder' };
+    assert.deepEqual(store.saveSettings({ extraClaudeScanRoots: [entry] }).extraClaudeScanRoots, [entry]);
+    assert.deepEqual(store.saveSettings({ extraClaudeScanRoots: [] }).extraClaudeScanRoots, []);
+    assert.throws(() => store.saveSettings({ extraClaudeScanRoots: 'not-a-list' }), /extraClaudeScanRoots/);
+    assert.throws(() => store.saveSettings({ extraClaudeScanRoots: [null] }), /extraClaudeScanRoots/);
+    assert.throws(
+      () => store.saveSettings({ extraClaudeScanRoots: [{ ...entry, extra: true }] }),
+      /extraClaudeScanRoots/,
+    );
+    assert.throws(
+      () => store.saveSettings({ extraClaudeScanRoots: [{ path: 'relative/home', profileSlug: 'p' }] }),
+      /absolute path/,
+    );
+    assert.throws(
+      () => store.saveSettings({ extraClaudeScanRoots: [{ path: '/placeholder/\0home', profileSlug: 'p' }] }),
+      /absolute path/,
+      'a NUL byte would make lstat throw a non-ENOENT error at scan time',
+    );
+    assert.throws(
+      () => store.saveSettings({ extraClaudeScanRoots: [{ path: '/placeholder', profileSlug: ' ' }] }),
+      /profileSlug/,
+    );
+    assert.throws(
+      () => store.saveSettings({ extraClaudeScanRoots: Array.from({ length: 9 }, (_, index) => ({
+        path: `/placeholder/${index}`,
+        profileSlug: 'profile-placeholder',
+      })) }),
+      /at most 8/,
+    );
+  } finally { store.close(); }
+});
+
 // Issue #242 deck chip labels: same free-string discipline again — the app
 // owns the grammar ('' = dot only, 'show' = dot + verdict word), the store
 // validates only string/length so old and new builds round-trip each

@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -176,6 +177,8 @@ test('Claude transcript ingest handles both eras, dedupes API calls, and single-
   });
   assert.deepEqual(first, {
     profiles: 2,
+    extraRootsScanned: 0,
+    extraRootsSkipped: 0,
     files: 3,
     filesSkipped: 0,
     sessions: 2,
@@ -293,6 +296,8 @@ test('Claude transcript ingest handles both eras, dedupes API calls, and single-
   });
   assert.deepEqual(second, {
     profiles: 2,
+    extraRootsScanned: 0,
+    extraRootsSkipped: 0,
     files: 3,
     filesSkipped: 3,
     sessions: 0,
@@ -1230,6 +1235,148 @@ test('transcript enumeration does not follow profile or nested project symlinks'
   assert.equal(result.profiles, 1, 'the symlinked profile root is not a profile');
   assert.equal(result.files.length, 0);
   assert.equal(result.skippedSymlinks, 1);
+});
+
+// Issue #605: extra scan roots are standalone Claude homes attributed to a
+// profile label. The managed-root symlink discipline holds for them whole:
+// a symlinked root, an overlap with the managed directory, a duplicate, and
+// a missing path are all skipped with a reason, never scanned.
+test('TRIPWIRE #605: extra scan roots hold the symlink and overlap rules', async (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-extra-roots-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const managedRoot = path.join(base, 'claude-profiles');
+  fs.mkdirSync(path.join(managedRoot, 'profile-placeholder', 'projects'), { recursive: true });
+  const extraHome = path.join(base, 'extra-home');
+  const extraProjects = path.join(extraHome, 'projects', '-workspace-placeholder');
+  fs.mkdirSync(extraProjects, { recursive: true });
+  fs.writeFileSync(path.join(extraProjects, 'session-extra-placeholder.jsonl'), '{}\n');
+  const outsideProjects = path.join(base, 'outside', 'projects');
+  fs.mkdirSync(outsideProjects, { recursive: true });
+  fs.writeFileSync(path.join(outsideProjects, 'session-outside-placeholder.jsonl'), '{}\n');
+  fs.symlinkSync(path.join(base, 'outside', 'projects'), path.join(extraHome, 'projects', 'linked'));
+  fs.symlinkSync(extraHome, path.join(base, 'linked-home'));
+  fs.symlinkSync(base, path.join(base, 'alias-base'));
+
+  const result = await enumerateTranscriptFiles(managedRoot, [
+    { path: extraHome, profileSlug: 'profile-placeholder' },
+    { path: extraHome, profileSlug: 'other-placeholder' },
+    { path: path.join(base, 'linked-home'), profileSlug: 'profile-placeholder' },
+    { path: managedRoot, profileSlug: 'profile-placeholder' },
+    { path: path.join(managedRoot, 'profile-placeholder'), profileSlug: 'profile-placeholder' },
+    { path: path.join(base, 'absent-home'), profileSlug: 'profile-placeholder' },
+    { profileSlug: 'profile-placeholder' },
+    // Symlinked PARENT components: lstat sees a real directory, so only the
+    // canonical-path comparison can catch these aliases.
+    { path: path.join(base, 'alias-base', 'extra-home'), profileSlug: 'profile-placeholder' },
+    { path: path.join(base, 'alias-base', 'claude-profiles'), profileSlug: 'profile-placeholder' },
+  ]);
+  assert.equal(result.extraRootsScanned, 1);
+  assert.deepEqual(result.extraRootsSkipped.map((skipped) => skipped.reason), [
+    'duplicate root',
+    'root is a symlink',
+    'overlaps the managed profiles directory',
+    'overlaps the managed profiles directory',
+    'does not exist',
+    'entry must carry a path and a profileSlug',
+    'duplicate root',
+    'overlaps the managed profiles directory',
+  ]);
+  const canonicalExtraHome = fs.realpathSync(extraHome);
+  assert.deepEqual(result.files.map((file) => file.path), [
+    path.join(canonicalExtraHome, 'projects', '-workspace-placeholder', 'session-extra-placeholder.jsonl'),
+  ], 'the symlinked directory inside the extra root is never traversed');
+  assert.equal(result.files[0].profileSlug, 'profile-placeholder');
+  assert.equal(
+    result.files[0].relativePath,
+    path.join(canonicalExtraHome, 'projects', '-workspace-placeholder', 'session-extra-placeholder.jsonl'),
+    'extra-root files are labeled by root path so they can never shadow managed files of the same slug',
+  );
+  assert.equal(result.skippedSymlinks, 1);
+});
+
+// Issue #605 read-only guarantee (insight-fleet standing rule): ingesting an
+// extra root attributes its rows to the configured profile and leaves the
+// scanned tree untouched — no writes, no renames, no mtime churn.
+test('TRIPWIRE #605: extra scan root ingest is read-only and profile-attributed', async (t) => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-extra-ingest-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const managedRoot = path.join(base, 'claude-profiles');
+  fs.mkdirSync(path.join(managedRoot, 'lend-management', 'projects'), { recursive: true });
+  const extraHome = path.join(base, 'insight-home');
+  const extraProjects = path.join(extraHome, 'projects', '-workspace-placeholder');
+  fs.mkdirSync(extraProjects, { recursive: true });
+  fs.writeFileSync(path.join(extraProjects, 'session-insight-placeholder.jsonl'), `${JSON.stringify({
+    type: 'assistant',
+    sessionId: 'session-insight-placeholder',
+    uuid: 'record-insight-placeholder',
+    timestamp: '2026-08-29T10:00:00.000Z',
+    cwd: '/workspace/placeholder',
+    message: {
+      id: 'message-insight-placeholder',
+      model: 'claude-placeholder',
+      usage: { input_tokens: 5, output_tokens: 7 },
+    },
+  })}\n`);
+
+  function snapshotTree(directory) {
+    const rows = [];
+    (function collect(current) {
+      for (const entry of fs.readdirSync(current, { withFileTypes: true })
+        .sort((left, right) => left.name.localeCompare(right.name))) {
+        const target = path.join(current, entry.name);
+        const stat = fs.lstatSync(target);
+        rows.push({
+          path: path.relative(directory, target),
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          mode: stat.mode,
+          digest: stat.isFile()
+            ? crypto.createHash('sha256').update(fs.readFileSync(target)).digest('hex')
+            : null,
+        });
+        if (entry.isDirectory()) collect(target);
+      }
+    })(directory);
+    return rows;
+  }
+  const before = snapshotTree(extraHome);
+
+  const store = new Store(':memory:');
+  t.after(() => store.close());
+  const warnings = [];
+  const summary = await ingestTranscriptArchive({
+    store,
+    directory: managedRoot,
+    extraRoots: [
+      { path: extraHome, profileSlug: 'lend-management' },
+      { path: path.join(base, 'absent-home'), profileSlug: 'lend-management' },
+    ],
+    warn: (message) => warnings.push(message),
+  });
+  assert.equal(summary.extraRootsScanned, 1);
+  assert.equal(summary.extraRootsSkipped, 1);
+  assert.equal(summary.requests, 1);
+  assert.equal(summary.warnings, 1);
+  assert.match(warnings[0], /skipped extra scan root .*absent-home: does not exist/);
+  assert.deepEqual(
+    store.db.prepare('SELECT session_id, profile_slug FROM transcript_sessions').all()
+      .map((row) => ({ sessionId: row.session_id, profileSlug: row.profile_slug })),
+    [{ sessionId: 'session-insight-placeholder', profileSlug: 'lend-management' }],
+  );
+  assert.deepEqual(
+    store.db.prepare('SELECT profile_slug FROM transcript_requests').all()
+      .map((row) => row.profile_slug),
+    ['lend-management'],
+  );
+  assert.deepEqual(snapshotTree(extraHome), before, 'the extra root is scanned strictly read-only');
+
+  const second = await ingestTranscriptArchive({
+    store,
+    directory: managedRoot,
+    extraRoots: [{ path: extraHome, profileSlug: 'lend-management' }],
+  });
+  assert.equal(second.filesSkipped, 1, 'ingest state keyed by absolute path skips the unchanged file');
+  assert.deepEqual(snapshotTree(extraHome), before);
 });
 
 test('legacy non-assistant request IDs and requestId-less uuid fallback remain countable', async (t) => {

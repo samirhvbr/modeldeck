@@ -233,6 +233,12 @@ export const DEFAULT_SETTINGS = Object.freeze({
   // retained as a kill switch, and a stored value always wins — changing this
   // default never rewrites an existing database's settings document.
   usageAnalyticsEnabled: true,
+  // Issue #605: additional Claude homes for transcript ingest to scan
+  // READ-ONLY, each attributed to an existing profile label. Entries are
+  // { path, profileSlug }. Enumeration skips a root that is itself a symlink
+  // or that overlaps the managed profiles directory, and never traverses
+  // symlinks inside one — the same rule as the managed root.
+  extraClaudeScanRoots: Object.freeze([]),
 });
 
 function validateSetting(key, value) {
@@ -267,6 +273,24 @@ function validateSetting(key, value) {
   }
   if (key === 'poolTotalFormat' && (typeof value !== 'string' || value.length > 64)) {
     throw new Error('poolTotalFormat must be a string of at most 64 characters');
+  }
+  if (key === 'extraClaudeScanRoots') {
+    if (!Array.isArray(value) || value.length > 8) {
+      throw new Error('extraClaudeScanRoots must be an array of at most 8 entries');
+    }
+    for (const entry of value) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)
+        || Object.keys(entry).some((entryKey) => !['path', 'profileSlug'].includes(entryKey))) {
+        throw new Error('each extraClaudeScanRoots entry must be a { path, profileSlug } object');
+      }
+      if (typeof entry.path !== 'string' || entry.path.includes('\0')
+        || !path.isAbsolute(entry.path) || entry.path.length > 1024) {
+        throw new Error('extraClaudeScanRoots path must be an absolute path of at most 1024 characters');
+      }
+      if (typeof entry.profileSlug !== 'string' || !entry.profileSlug.trim() || entry.profileSlug.length > 128) {
+        throw new Error('extraClaudeScanRoots profileSlug must be a non-empty string of at most 128 characters');
+      }
+    }
   }
 }
 
