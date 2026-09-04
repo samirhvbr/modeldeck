@@ -126,10 +126,30 @@ flow would invalidate the outer signature and notarization ticket. For a bump:
 Every release includes one checklist step: check the pin against upstream
 (`gh release list -R router-for-me/CLIProxyAPI` or the releases page),
 decide bump-or-hold, and record the decision — tag reviewed, verdict, one
-line of reasoning — on the release's tracking issue. "Checked v7.2.130 →
-hold, no security-relevant changes" is a complete record; the point is that
-every release either moved the pin deliberately or kept it deliberately,
-never by omission.
+line of reasoning — on the release's tracking issue. The verdict answers two
+questions, not one:
+
+1. **Security**: does any skipped release carry a security fix? (This was
+   the original, sole lens.)
+2. **Compatibility**: does any skipped release carry a change staying behind
+   would break — a bumped client fingerprint or minimum client version,
+   support for a new provider model, or a CLI protocol change? Holding is
+   only safe when both answers are no.
+
+A compatibility-relevant finding converts the hold into a bump that rides
+the next app release, pulled forward on the calendar when the incompatibility
+already bites current CLIs or models. That is a normal release in every gate;
+the out-of-cycle expedite path stays security-only ("CVE-only", below and in
+decision 0012) and does not widen.
+
+"Checked v7.2.130 → hold, nothing security-relevant, nothing
+compatibility-relevant" is a complete record; the point is that every
+release either moved the pin deliberately or kept it deliberately, never by
+omission. Decision 0039 added the second lens after a hold that was
+security-clean still left the proxy unable to speak for a new Codex CLI and
+a new Anthropic model (2026-09-01). Compatibility findings that affect Tim's
+live machine (not just the bundle) also go to the pairing policy in the
+private live-proxy ops doc (`docs/live-proxy-ops.md`, mirror-stripped).
 
 Outside the release cadence there is exactly one reason to bump the pin: a
 security fix in the bundled binary — a published CVE or an upstream security
@@ -332,6 +352,7 @@ in sync with it:
 - `docs/HANDOFF.md`
 - `docs/ACCOUNT_ONBOARDING.md`
 - `docs/lane-routing-policy.md`
+- `docs/live-proxy-ops.md`
 - `docs/incidents/`
 - `scripts/lane-codex.sh`
 - `scripts/lane-watch.mjs`

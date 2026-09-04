@@ -560,24 +560,32 @@ struct DeckPopoverView: View {
             Label("Restarting the proxy… (attempt \(attempt))", systemImage: "arrow.clockwise")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+        // Both actionable rows exist only where ModelDeck owns the proxy.
+        // Under `coexist` the `.stopped` phase is the launch-time stop, and
+        // a Start link there launches the bundled binary onto the user's own
+        // port (2026-09-01 incident; see managedProxyStartOffered).
         case .stopped:
-            HStack(spacing: 6) {
-                Label("Proxy stopped", systemImage: "pause.circle")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Button("Start") { Task { await proxyModel.startManaging() } }
-                    .buttonStyle(.link)
-                    .font(.caption)
+            if managedProxyStartOffered(recordedChoice: onboardingModel.choice) {
+                HStack(spacing: 6) {
+                    Label("Proxy stopped", systemImage: "pause.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Start") { Task { await proxyModel.startManaging() } }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
             }
         case .failed(let message):
-            HStack(spacing: 6) {
-                Label("Proxy stopped working", systemImage: "exclamationmark.triangle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .help(message)
-                Button("Try Again") { Task { await proxyModel.retry() } }
-                    .buttonStyle(.link)
-                    .font(.caption)
+            if managedProxyStartOffered(recordedChoice: onboardingModel.choice) {
+                HStack(spacing: 6) {
+                    Label("Proxy stopped working", systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .help(message)
+                    Button("Try Again") { Task { await proxyModel.retry() } }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
             }
         }
     }

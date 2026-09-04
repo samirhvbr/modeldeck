@@ -66,6 +66,7 @@ STRIPPED_PATHS=(
   "docs/HANDOFF.md"
   "docs/ACCOUNT_ONBOARDING.md"
   "docs/lane-routing-policy.md"
+  "docs/live-proxy-ops.md"
   "docs/incidents"
   "scripts/lane-codex.sh"
   "scripts/lane-watch.mjs"

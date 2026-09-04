@@ -340,16 +340,22 @@ test('malformed or absent capture files are silently skipped', async () => {
 // same plan tier resets on the hour) must not be flagged duplicate-token.
 test('regression: statusline ingest never poisons weeklyResetFingerprint duplicate detection', async () => {
   const { store, service, accountA, accountB, writeCapture } = makeFixture({
-    // Probe: distinct weekly resets → genuinely different accounts.
+    // Probe: distinct weekly resets → genuinely different accounts. The
+    // explicit observedAt keeps the probe older than the capture below no
+    // matter when this test runs — probe rows without one are stamped with
+    // the real wall clock at insert (db recordUsage), which made a
+    // future-dated capture fixture rot into a failure once the calendar
+    // caught up (green until 2026-08-31, red from 2026-09-01).
     fetchClaude: async ({ claudeConfigDir }) => [{
       scope: 'weekly',
       usedPercent: 5,
       resetsAt: claudeConfigDir.endsWith('work') ? '2026-07-28T00:00:00.000Z' : '2026-07-30T00:00:00.000Z',
+      observedAt: '2026-07-24T00:00:00.000Z',
       source: 'claude-oauth-api',
     }],
   });
   // Identical weekly resets_at in BOTH captures, observed after any probe row.
-  const capture = CAPTURE('2026-09-01T00:00:00.000Z');
+  const capture = CAPTURE('2026-07-24T12:00:00.000Z');
   writeCapture(accountA, capture);
   writeCapture(accountB, capture);
   await service.refreshClaude();
@@ -364,6 +370,21 @@ test('regression: statusline ingest never poisons weeklyResetFingerprint duplica
   assert.deepEqual(weeklyRows.map((row) => row.source), ['claude-statusline', 'claude-statusline']);
   const state = await service.accountsWithAuthState();
   assert.ok(state.every((account) => account.authState !== 'duplicate-token'));
+});
+
+// TRIPWIRE statusline-fixture-date-rot: rows recorded without an explicit
+// observedAt are stamped with the real wall clock, so a future-dated literal
+// makes a test's outcome flip the day the calendar catches up — the
+// fingerprint regression test above wrote its capture at 2026-09-01T00:00Z
+// and went red on exactly that date. Fires the day a rotting literal lands,
+// not months later.
+test('TRIPWIRE statusline-fixture-date-rot — no timestamp literal in this file is in the future', () => {
+  const source = fs.readFileSync(new URL(import.meta.url), 'utf8');
+  const stamps = source.match(/2\d{3}-\d{2}-\d{2}T[\d:.]+(?:Z|[+-]\d{2}:\d{2})/g) || [];
+  assert.ok(stamps.length > 0, 'timestamp scan matched nothing — regex rotted?');
+  for (const iso of stamps) {
+    assert.ok(Date.parse(iso) < Date.now(), `fixture timestamp ${iso} is in the future and will rot into a wall-clock-dependent test`);
+  }
 });
 
 test('refreshClaude ingests captures as part of the pass', async () => {

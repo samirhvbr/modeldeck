@@ -27,12 +27,12 @@ test('CLIProxyAPI pin records the resolved release, commit, and official Go arch
   const pin = readCLIProxyPin(fileURLToPath(pinPath));
   assert.deepEqual(pin, {
     repository: 'https://github.com/router-for-me/CLIProxyAPI',
-    tag: 'v7.2.130',
-    commit: 'f43aad7637ad813745bf7d341acb5663617570c5',
+    tag: 'v7.2.149',
+    commit: '2a6b87aca083a5bf498ac1f68a1b636c500d7aaa',
     goVersion: '1.26.4',
     goDarwinArm64Sha256: 'b62ad2b6d7d2464f12a5bcad7ff47f19d08325773b5efd21610e445a05a9bf53',
     bundlePath: 'Contents/Resources/cliproxyapi/cliproxyapi',
-    version: '7.2.130',
+    version: '7.2.149',
   });
 });
 

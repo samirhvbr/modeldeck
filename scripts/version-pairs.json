@@ -1,0 +1,15 @@
+{
+  "verifiedOn": "2026-09-03",
+  "liveProxy": {
+    "version": "7.2.149",
+    "binaryPath": "~/bin/cliproxyapi",
+    "launchdLabel": "com.cliproxyapi.server"
+  },
+  "codexCli": "0.152.1",
+  "claudeCli": "2.1.259",
+  "stampedClaudeClient": {
+    "version": "2.1.258",
+    "minRequired": "2.1.251"
+  },
+  "notes": "Pair verified in-session 2026-09-03: live proxy v7.2.149 (upstream's own fix in v7.2.148 bumped the stamped Claude client from 2.1.220 to 2.1.258 and registered claude-fable-5-1); Claude Code 2.1.259 ran a real Fable 5.1 session through the proxy on a Max account; Codex CLI 0.152.1 ran a real gpt-5.6-sol session through the proxy."
+}

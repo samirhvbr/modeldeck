@@ -85,7 +85,14 @@ async function assertFixtureAuthFormat(authDir) {
   assert.equal(claude.type, 'claude');
   assert.equal(claude.email, 'pin-bump-claude@example.invalid');
   assert.equal(claude.weight, 7);
-  assert.deepEqual(claude['excluded-models'], ['claude-fable-fixture']);
+  // The fixture is written with the legacy `excluded-models` key; CLIProxyAPI
+  // >= v7.2.140 canonicalizes it to `excluded_models` on load and rewrites the
+  // file (found live at the v7.2.149 bump). Either spelling must still carry
+  // the bench, and ModelDeck's reader below must see it either way.
+  assert.deepEqual(
+    claude['excluded_models'] ?? claude['excluded-models'],
+    ['claude-fable-fixture'],
+  );
   assert.match(claude.access_token, /placeholder-not-a-credential$/);
   assert.equal(codex.type, 'codex');
   assert.equal(codex.account_id, 'acct-pin-bump-placeholder');

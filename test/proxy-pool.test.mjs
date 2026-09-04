@@ -48,13 +48,16 @@ function fixture(t, { spawn, serviceOptions = {} } = {}) {
   const claudeHome = path.join(claudeProfilesDir, 'work');
   const codexHome = path.join(codexProfilesDir, 'work');
   const cliproxyAuthDir = path.join(root, 'cliproxy-auth');
+  const cliproxyConfigDir = path.join(root, 'cliproxy-config');
   const claudeActiveLink = path.join(root, 'active', '.claude');
   const claudeShellEnvFile = path.join(root, 'claude-env.sh');
-  for (const directory of [claudeProfilesDir, codexProfilesDir, claudeHome, codexHome, cliproxyAuthDir]) {
+  for (const directory of [claudeProfilesDir, codexProfilesDir, claudeHome, codexHome, cliproxyAuthDir, cliproxyConfigDir]) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
     fs.chmodSync(directory, 0o700);
   }
   fs.mkdirSync(path.dirname(claudeActiveLink), { recursive: true });
+  // Issue #625: the login spawn must name the serving proxy's config file.
+  fs.writeFileSync(path.join(cliproxyConfigDir, 'config.yaml'), 'port: 9137\n', { mode: 0o600 });
 
   const store = new Store(':memory:');
   const claude = store.saveAccount({
@@ -77,6 +80,7 @@ function fixture(t, { spawn, serviceOptions = {} } = {}) {
     claudeActiveLink,
     claudeShellEnvFile,
     cliproxyAuthDir,
+    cliproxyConfigDir,
     cliproxyPath: CLIPROXY_PATH,
     cliproxyBaseUrl: PROXY_BASE_URL,
     spawn: spawn || (() => fakeChild()),
@@ -105,6 +109,7 @@ function fixture(t, { spawn, serviceOptions = {} } = {}) {
     claudeHome,
     codexHome,
     cliproxyAuthDir,
+    cliproxyConfigDir,
     claudeActiveLink,
     claudeShellEnvFile,
   };
@@ -158,7 +163,7 @@ test('Claude pool join spawns the exact login command and watches for its matchi
   });
   assert.equal(calls.length, 1);
   assert.equal(calls[0].binary, CLIPROXY_PATH);
-  assert.deepEqual(calls[0].args, ['-claude-login']);
+  assert.deepEqual(calls[0].args, ['-config', path.join(data.cliproxyConfigDir, 'config.yaml'), '-claude-login']);
   assert.equal(calls[0].options.shell, false);
   assert.deepEqual(calls[0].options.env, { HOME: '/fixture/home', PATH: '/fixture/bin' });
 });
@@ -251,6 +256,254 @@ test('a dead login child reports exit detail without leaking its token-bearing o
   });
 });
 
+// Issue #625 — Tim clicked "Add to proxy pool…" under coexist and the join
+// failed twice: first the daemon's static PATH could not see ~/bin, then the
+// helper it did find read /config.yaml from cwd `/` and exited 0. Every
+// TRIPWIRE below fails on the pre-fix code.
+
+/// An `exec` double standing in for lsof: the port listing and the per-pid
+/// executable lookup are the only two calls the probe may make.
+function fakeLsof({ pids = [], executables = {}, listFails = false } = {}) {
+  const calls = [];
+  const exec = async (command, args) => {
+    calls.push({ command, args });
+    if (args[0] === '-nP') {
+      if (listFails) throw Object.assign(new Error('lsof: no match'), { code: 1 });
+      return { stdout: `${pids.join('\n')}\n`, stderr: '' };
+    }
+    if (args[0] === '-p') {
+      const executable = executables[args[1]];
+      if (executable === undefined) throw new Error('process exited');
+      return { stdout: `p${args[1]}\nftxt\nn${executable}\nftxt\nn/usr/lib/dyld\n`, stderr: '' };
+    }
+    throw new Error(`unexpected exec ${command} ${args.join(' ')}`);
+  };
+  return { exec, calls };
+}
+
+function executableFixture(root, name = 'cliproxyapi') {
+  const file = path.join(root, 'serving', name);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  return file;
+}
+
+test('TRIPWIRE #625 login-spawn-passes-config — every login spawn names the config file under CLIPROXY_CONFIG_DIR', async (t) => {
+  const calls = [];
+  const data = fixture(t, {
+    spawn(binary, args) {
+      calls.push({ binary, args });
+      const child = fakeChild();
+      queueMicrotask(() => writeAuth(data, 'claude-pool-target.json', {
+        type: 'claude', email: CLAUDE_EMAIL, weight: 0, access_token: 'credential-never-consumed',
+      }));
+      return child;
+    },
+  });
+  await data.service.joinProxyPool(data.claude.id);
+  assert.equal(calls.length, 1);
+  const configIndex = calls[0].args.indexOf('-config');
+  assert.notEqual(configIndex, -1, 'the login spawn must carry -config');
+  assert.equal(calls[0].args[configIndex + 1], path.join(data.cliproxyConfigDir, 'config.yaml'));
+  assert.equal(calls[0].args.at(-1), '-claude-login');
+});
+
+test('TRIPWIRE #625 join-refuses-without-config — a missing config.yaml is refused before any spawn, with a plain reason', async (t) => {
+  let spawns = 0;
+  const data = fixture(t, { spawn: () => { spawns += 1; return fakeChild(); } });
+  fs.rmSync(path.join(data.cliproxyConfigDir, 'config.yaml'));
+
+  await assert.rejects(() => data.service.joinProxyPool(data.claude.id), (error) => {
+    assert.equal(error.statusCode, 409);
+    assert.match(error.message, /config\.yaml is missing/);
+    assert.ok(!error.message.includes(data.cliproxyConfigDir), 'the configured path is not echoed');
+    return true;
+  });
+  assert.equal(spawns, 0);
+});
+
+test('TRIPWIRE #625 coexist-spawns-the-serving-binary — a bare cliproxyapi name resolves to the executable of the process on the proxy port', async (t) => {
+  const calls = [];
+  let data;
+  const servingRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-serving-'));
+  t.after(() => fs.rmSync(servingRoot, { recursive: true, force: true }));
+  const serving = executableFixture(servingRoot);
+  const lsof = fakeLsof({ pids: ['4242'], executables: { 4242: serving } });
+  data = fixture(t, {
+    spawn(binary, args) {
+      calls.push({ binary, args });
+      const child = fakeChild();
+      queueMicrotask(() => writeAuth(data, 'claude-pool-target.json', {
+        type: 'claude', email: CLAUDE_EMAIL, weight: 0, access_token: 'credential-never-consumed',
+      }));
+      return child;
+    },
+    serviceOptions: {
+      cliproxyPath: 'cliproxyapi',
+      lsofPath: '/fixture/sbin/lsof',
+      processUid: () => 501,
+      exec: lsof.exec,
+      toolPathFallbackDirs: [],
+    },
+  });
+
+  await data.service.joinProxyPool(data.claude.id);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].binary, serving, 'the spawned binary is the port holder, not the bare name');
+  // The probe asked lsof for this user's listeners on the proxy port, then
+  // the program text of that pid; PATH resolution (`which`) never ran.
+  assert.deepEqual(lsof.calls.map((call) => call.args[0]), ['-nP', '-p']);
+  assert.deepEqual(lsof.calls[0].args, ['-nP', '-iTCP:9137', '-sTCP:LISTEN', '-a', '-u', '501', '-t']);
+  assert.deepEqual(lsof.calls[1].args, ['-p', '4242', '-a', '-d', 'txt', '-Fn']);
+});
+
+test('#625 an absolute configured binary path is honoured without probing the port', async (t) => {
+  const lsof = fakeLsof({ pids: ['4242'], executables: { 4242: '/elsewhere/cliproxyapi' } });
+  const calls = [];
+  const data = fixture(t, {
+    spawn(binary, args) {
+      calls.push({ binary, args });
+      const child = fakeChild();
+      queueMicrotask(() => writeAuth(data, 'claude-pool-target.json', {
+        type: 'claude', email: CLAUDE_EMAIL, weight: 0, access_token: 'credential-never-consumed',
+      }));
+      return child;
+    },
+    serviceOptions: { lsofPath: '/fixture/sbin/lsof', processUid: () => 501, exec: lsof.exec },
+  });
+  await data.service.joinProxyPool(data.claude.id);
+  assert.equal(calls[0].binary, CLIPROXY_PATH);
+  assert.deepEqual(lsof.calls, [], 'MODELDECK_CLIPROXY_BIN is the operator\'s word');
+});
+
+test('#625 the port probe trusts only a regular executable named cliproxyapi owned by a same-user listener', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'modeldeck-serving-'));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const impostor = executableFixture(root, 'not-the-proxy');
+  const directory = path.join(root, 'cliproxyapi');
+  fs.mkdirSync(directory);
+  const unreadable = path.join(root, 'gone', 'cliproxyapi');
+  const notExecutable = path.join(root, 'plain', 'cliproxyapi');
+  fs.mkdirSync(path.dirname(notExecutable));
+  fs.writeFileSync(notExecutable, 'not a program', { mode: 0o644 });
+  const cases = [
+    { name: 'a differently named program on the port', executables: { 1: impostor } },
+    { name: 'a directory posing as the binary', executables: { 1: directory } },
+    { name: 'a path that no longer exists', executables: { 1: unreadable } },
+    { name: 'a regular file without the execute bit', executables: { 1: notExecutable } },
+    { name: 'a relative program text', executables: { 1: 'cliproxyapi' } },
+    { name: 'a pid that exited between the calls', executables: {} },
+  ];
+  for (const testCase of cases) {
+    const lsof = fakeLsof({ pids: ['1'], executables: testCase.executables });
+    const data = fixture(t, {
+      serviceOptions: {
+        cliproxyPath: 'cliproxyapi',
+        lsofPath: '/fixture/sbin/lsof',
+        processUid: () => 501,
+        exec: lsof.exec,
+        toolPathFallbackDirs: [],
+      },
+    });
+    assert.equal(await data.service.servingProxyExecutable(), null, testCase.name);
+  }
+  // Nothing listening: lsof exits non-zero, the probe answers null.
+  const idle = fakeLsof({ listFails: true });
+  const data = fixture(t, {
+    serviceOptions: { cliproxyPath: 'cliproxyapi', lsofPath: '/fixture/sbin/lsof', processUid: () => 501, exec: idle.exec },
+  });
+  assert.equal(await data.service.servingProxyExecutable(), null);
+  // A non-loopback base URL is never probed: the port holder would be a
+  // different machine's.
+  const remote = fakeLsof({ pids: ['1'], executables: { 1: impostor } });
+  const remoteData = fixture(t, {
+    serviceOptions: {
+      cliproxyPath: 'cliproxyapi', cliproxyBaseUrl: 'http://proxy.example.invalid:8317',
+      lsofPath: '/fixture/sbin/lsof', processUid: () => 501, exec: remote.exec,
+    },
+  });
+  assert.equal(await remoteData.service.servingProxyExecutable(), null);
+  assert.deepEqual(remote.calls, []);
+  // No uid to filter on means no probe at all: a listener owned by another
+  // user must never be a candidate.
+  const noUid = fakeLsof({ pids: ['1'], executables: { 1: impostor } });
+  const noUidData = fixture(t, {
+    serviceOptions: { cliproxyPath: 'cliproxyapi', lsofPath: '/fixture/sbin/lsof', processUid: () => null, exec: noUid.exec },
+  });
+  assert.equal(await noUidData.service.servingProxyExecutable(), null);
+  assert.deepEqual(noUid.calls, []);
+});
+
+test('#625 an explicit null lsofPath disables the port probe even on macOS; unset picks the system lsof', async (t) => {
+  const seen = [];
+  const exec = async (command, args) => { seen.push([command, ...args]); throw Object.assign(new Error('no match'), { code: 1 }); };
+  const disabled = fixture(t, {
+    serviceOptions: { cliproxyPath: 'cliproxyapi', platform: 'darwin', lsofPath: null, processUid: () => 501, exec },
+  });
+  assert.equal(await disabled.service.servingProxyExecutable(), null);
+  assert.deepEqual(seen, [], 'null must switch the probe off, not fall through to the default');
+
+  const defaulted = fixture(t, {
+    serviceOptions: { cliproxyPath: 'cliproxyapi', platform: 'darwin', processUid: () => 501, exec },
+  });
+  assert.equal(await defaulted.service.servingProxyExecutable(), null);
+  assert.equal(seen[0]?.[0], '/usr/sbin/lsof');
+
+  seen.length = 0;
+  const linux = fixture(t, {
+    serviceOptions: { cliproxyPath: 'cliproxyapi', platform: 'linux', processUid: () => 501, exec },
+  });
+  assert.equal(await linux.service.servingProxyExecutable(), null);
+  assert.deepEqual(seen, [], 'no default lsof off macOS');
+});
+
+test('TRIPWIRE #625 unresolvable-binary-is-a-plain-refusal — no serving proxy and no PATH hit means a 409 that names the program, not a bare "failed to start"', async (t) => {
+  let spawns = 0;
+  const lsof = fakeLsof({ listFails: true });
+  const data = fixture(t, {
+    spawn: () => { spawns += 1; return fakeChild(); },
+    serviceOptions: {
+      cliproxyPath: 'cliproxyapi',
+      lsofPath: '/fixture/sbin/lsof',
+      processUid: () => 501,
+      exec: async (command, args) => {
+        if (command === '/usr/bin/which') throw Object.assign(new Error('not found'), { code: 1 });
+        return lsof.exec(command, args);
+      },
+      toolPathFallbackDirs: [path.join(os.tmpdir(), 'modeldeck-625-no-such-dir')],
+    },
+  });
+
+  await assert.rejects(() => data.service.joinProxyPool(data.claude.id), (error) => {
+    assert.equal(error.statusCode, 409);
+    assert.match(error.message, /Couldn't find the cliproxyapi program/);
+    return true;
+  });
+  assert.equal(spawns, 0);
+});
+
+// The code was never dropped by the daemon (the #625 review reproduced the
+// pre-fix text: "...before a matching auth file appeared (ENOENT)"); it sat at
+// the tail of an 85-character sentence in a two-line row. This guards both
+// its presence and its position right after "failed to start".
+test('TRIPWIRE #625 spawn-error-code-leads-the-message — a child that dies with ENOENT reports the code right after "failed to start"', async (t) => {
+  const data = fixture(t, {
+    spawn() {
+      const child = fakeChild();
+      queueMicrotask(() => {
+        child.emit('error', Object.assign(new Error('spawn cliproxyapi ENOENT'), { code: 'ENOENT' }));
+        child.finish(-2, null);
+      });
+      return child;
+    },
+  });
+  await assert.rejects(() => data.service.joinProxyPool(data.claude.id), (error) => {
+    assert.equal(error.statusCode, 502);
+    assert.match(error.message, /failed to start \(ENOENT\)/);
+    return true;
+  });
+});
+
 test('join concurrency is guarded per provider while Codex uses its remembered account id', async (t) => {
   const calls = [];
   let enteredClaude;
@@ -259,9 +512,9 @@ test('join concurrency is guarded per provider while Codex uses its remembered a
     spawn(binary, args, options) {
       const child = fakeChild();
       calls.push({ binary, args, options, child });
-      if (args[0] === '-claude-login') {
+      if (args.at(-1) === '-claude-login') {
         enteredClaude();
-      } else if (args[0] === '-codex-login') {
+      } else if (args.at(-1) === '-codex-login') {
         queueMicrotask(() => writeAuth(data, 'codex-pool-target.json', {
           type: 'codex',
           account_id: CODEX_ACCOUNT_ID,
@@ -290,7 +543,7 @@ test('join concurrency is guarded per provider while Codex uses its remembered a
     alreadyMember: false,
   });
   assert.ok(calls.some((call) => call.binary === CLIPROXY_PATH
-    && JSON.stringify(call.args) === JSON.stringify(['-codex-login'])));
+    && JSON.stringify(call.args) === JSON.stringify(['-config', path.join(data.cliproxyConfigDir, 'config.yaml'), '-codex-login'])));
 
   writeAuth(data, 'claude-pool-target.json', { type: 'claude', email: CLAUDE_EMAIL, weight: 3, access_token: 'credential-never-consumed' });
   assert.equal((await claudeJoin).proxyPool, 'member');

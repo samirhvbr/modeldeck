@@ -370,6 +370,22 @@ public func managedProxyMayRunAtLaunch(
     recordedChoice?.wantsManagedProxy == true
 }
 
+/// Whether the deck may offer Start / Try Again for the bundled proxy under
+/// this choice. Same rule as launch: a user who runs their own proxy
+/// (`coexist`), declined a managed one, or has not answered yet gets no way
+/// to start the bundled binary from the deck.
+///
+/// Field incident, 2026-09-01: under a recorded `coexist` the launch-time
+/// stop left the lifecycle in `.stopped`, the deck rendered that as
+/// "Proxy stopped · Start", and one click during an outage put the bundled
+/// (pinned, older) binary on the port ahead of the user's own upgraded
+/// launch agent, which then failed to bind for two days.
+public func managedProxyStartOffered(
+    recordedChoice: ManagedProxyOnboardingChoice?
+) -> Bool {
+    managedProxyMayRunAtLaunch(recordedChoice: recordedChoice)
+}
+
 // MARK: - Copy
 
 /// Every user-visible string in the flow, in one place so the tests can hold

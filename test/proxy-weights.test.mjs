@@ -306,6 +306,27 @@ test('a Fable exclusion travels with the weight; its absence omits the key (#272
   assert.ok(!('proxyFableExcluded' in unbenched));
 });
 
+test('TRIPWIRE pin-bump-excluded-key: the snake_case spelling the proxy rewrites to still reads as benched', async (t) => {
+  // CLIProxyAPI >= v7.2.140 canonicalizes `excluded-models` to
+  // `excluded_models` on load and writes the file back. Before the v7.2.149
+  // pin bump the daemon read only the hyphenated key, so every benched
+  // account would have shown as routing Fable the moment the proxy touched
+  // its file. Both spellings must read as the bench.
+  const fixture = makeFixture({
+    authFiles: {
+      'claude-tim@example.com.json': JSON.stringify({
+        type: 'claude', email: 'tim@example.com', weight: 8, access_token: 'credential-never-consumed',
+        excluded_models: ['claude-fable-5'],
+      }),
+    },
+  });
+  t.after(() => cleanup(fixture));
+  const claude = (await fixture.service.accountsWithAuthState())
+    .find((a) => a.provider === 'claude');
+  assert.equal(claude.proxyWeight, 8);
+  assert.equal(claude.proxyFableExcluded, true);
+});
+
 test('non-Fable exclusions and malformed excluded-models do not read as benched (#272)', async (t) => {
   const fixture = makeFixture({
     authFiles: {

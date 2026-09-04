@@ -1,6 +1,6 @@
 {
   "name": "modeldeck",
-  "version": "1.1.8",
+  "version": "1.1.9",
   "private": true,
   "type": "module",
   "description": "Local project-aware AI account and usage control plane.",
@@ -13,6 +13,7 @@
     "test": "node --test",
     "test:cliproxyapi-pin": "node --test test/cliproxyapi-pin-compat.test.mjs && node scripts/cliproxyapi-compat.mjs verify",
     "release:check": "node scripts/release-checks.mjs",
+    "skew:check": "node scripts/version-skew-check.mjs",
     "test:coverage": "node --test --experimental-test-coverage",
     "demo:seed": "node scripts/seed-demo.mjs",
     "usage:ingest": "node scripts/ingest-usage.mjs",

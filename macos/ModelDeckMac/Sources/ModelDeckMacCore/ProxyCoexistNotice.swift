@@ -51,8 +51,8 @@ public enum ProxyCoexistNotice {
     ///
     /// - `phase`: slice C's lifecycle phase. Only `.externalInstanceDetected`
     ///   is ours; every other phase is either healthy-and-silent or an
-    ///   actionable state that keeps its own row (Start / Try Again), which
-    ///   Tim's ruling does not touch.
+    ///   actionable state whose row (Start / Try Again) renders only where
+    ///   ModelDeck owns the proxy (#614) — either way, not this notice's.
     /// - `choice`: the recorded onboarding answer. `coexist` means the user
     ///   chose this, so the tooltip states WHY managed-only features are off
     ///   rather than reading as a fault.

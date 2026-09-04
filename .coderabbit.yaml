@@ -1,0 +1,61 @@
+# CodeRabbit configuration — modeldeck-private (2026-08-30), modeled on
+# insight-chat's Aug-2026-schema config. Driver: the cost audit at
+# timharris707/insight-chat#574 ($405 of the $500 monthly cap spent by Aug 30;
+# this repo ran 72 PRs at ~1.8 review passes each on defaults). Billing is per
+# file changed, and every push re-triggered a review under the defaults.
+# Role: independent second reader at PR time. Posture: NON-BLOCKING — no check
+# runs, no commit status, no Request Changes, never in required checks.
+# Findings are triaged and dispositioned before merge per the repo's merge flow
+# (docs/agents/team-workflow.md).
+language: "en-US"
+tone_instructions: "Terse, engineering-grade. Flag only likely defects. No style nits, no praise, no restating the diff."
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  # Aug-2026 schema: review_progress (GitHub check runs) is the canonical status
+  # surface and defaults true; commit_status is only honored while it is
+  # disabled, and fail_commit_status applies to whichever surface is active.
+  # All three off so CodeRabbit never appears in `gh pr checks` — non-blocking
+  # is structural, not habit.
+  review_progress: false
+  commit_status: false
+  fail_commit_status: false
+  high_level_summary: true
+  poem: false
+  # Billing is per file changed (#574): the npm lockfile is generated churn
+  # with no review value. Exclusion-only glob — everything else stays in scope.
+  path_filters:
+    - "!package-lock.json"
+  auto_review:
+    enabled: true
+    # One review per PR (#574): no draft reviews, no re-review on later pushes
+    # or rebases — the first automatic review is the only one. A human can
+    # still ask for another pass with `@coderabbitai review`.
+    drafts: false
+    auto_incremental_review: false
+    # Docs-only PRs merge in minutes; skip them rather than produce post-merge
+    # commentary. This repo's recurring docs titles: "Handoff: …" (tracked
+    # .claude/handoff.md refreshes) and "… progress-log entry …" (release
+    # bookkeeping). CodeRabbit matches keywords ANYWHERE in the title
+    # (case-insensitive), so keep these substrings out of code-PR titles.
+    # The skip-review label is the manual lever; it does not exist yet — the
+    # filter is inert until the label is created.
+    ignore_title_keywords:
+      - "handoff:"
+      - "progress-log"
+    labels:
+      - "!skip-review"
+  finishing_touches:
+    # Suggestions only — no unreviewed bot commits on PRs. unit_tests
+    # defaults to enabled and can commit generated tests to the PR branch;
+    # CodeRabbit's own review of this PR flagged the gap.
+    unit_tests:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+chat:
+  auto_reply: true

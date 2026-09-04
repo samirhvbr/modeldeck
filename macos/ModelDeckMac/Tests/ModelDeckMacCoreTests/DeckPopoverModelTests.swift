@@ -512,6 +512,63 @@ struct DeckBuilderTests {
         #expect(withReset.windows.map(\.scope) == ["5h", "week", "spend"])
     }
 
+    // MARK: - Issue #621: unknown-kind windows with nothing to say
+
+    private func unknownKindState(
+        remaining: Double? = 100,
+        resetsIn: TimeInterval? = nil
+    ) -> DeckState {
+        DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio", isDefault: true)],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 71, resetsIn: 57 * 60),
+                snapshot("c1", scope: "week", remaining: 50, resetsIn: 2 * 86_400),
+                snapshot("c1", scope: "nimbus quill", remaining: remaining, resetsIn: resetsIn),
+            ]
+        )
+    }
+
+    /// TRIPWIRE #621: a limit kind the deck cannot name, at zero/unknown
+    /// usage with no reset, is hidden; it comes back as soon as the provider
+    /// states usage or a reset for it. Known kinds are never hidden by this.
+    @Test func unknownKindWindowHiddenUntilItSaysSomething() {
+        // Zero usage, no reset: hidden.
+        let zero = DeckBuilder.rows(state: unknownKindState(remaining: 100), now: now)[0]
+        #expect(zero.windows.map(\.scope) == ["5h", "week"])
+        // Unknown usage, no reset: hidden.
+        let unknown = DeckBuilder.rows(state: unknownKindState(remaining: nil), now: now)[0]
+        #expect(unknown.windows.map(\.scope) == ["5h", "week"])
+        // Real usage: visible, ranked with the model-scoped windows.
+        let used = DeckBuilder.rows(state: unknownKindState(remaining: 60), now: now)[0]
+        #expect(used.windows.map(\.scope) == ["5h", "week", "nimbus quill"])
+        // A stated reset: visible even at zero usage.
+        let reset = DeckBuilder.rows(state: unknownKindState(remaining: 100, resetsIn: 86_400), now: now)[0]
+        #expect(reset.windows.map(\.scope) == ["5h", "week", "nimbus quill"])
+    }
+
+    /// TRIPWIRE #621: the hide rule must not swallow a known window that
+    /// happens to be untouched and unanchored — the 5-hour row reads
+    /// "Resets 5 hours after first use" at 100% left and must stay.
+    @Test func knownKindsAreNeverHiddenForBeingEmpty() {
+        let state = DeckState(
+            accounts: [account("c1", provider: "claude", label: "Studio", isDefault: true)],
+            usage: [
+                snapshot("c1", scope: "5h", remaining: 100),
+                snapshot("c1", scope: "week", remaining: 100),
+                snapshot("c1", scope: "Fable weekly", remaining: 100),
+                // Mixed case on purpose: its title equals the scope text, so
+                // recognition must not be inferred from the rendered title.
+                snapshot("c1", scope: "Usage period", remaining: 100),
+            ]
+        )
+        let row = DeckBuilder.rows(state: state, now: now)[0]
+        #expect(row.windows.map(\.scope) == ["5h", "Usage period", "week", "Fable weekly"])
+        #expect(DeckBuilder.isKnownKind("Usage period"))
+        #expect(DeckBuilder.isKnownKind("5h"))
+        #expect(DeckBuilder.isKnownKind("GPT-5.3-Codex-Spark weekly"))
+        #expect(!DeckBuilder.isKnownKind("nimbus quill"))
+    }
+
     // MARK: - Issue #139: payload-stated spend dollar amounts
 
     private let enUS = Locale(identifier: "en_US")
@@ -1823,10 +1880,12 @@ struct NoResetPlaceholderTests {
     // #145 rule still governs every window that isn't provably fresh — a
     // scope whose duration is unknowable can't be classified, so it keeps
     // the empty slot and the never-rendered internal fallback string.
+    // Issue #621: an unknown scope at 100% left with no reset is hidden
+    // outright now, so the subject here carries real usage to stay a row.
     @Test func unknownScopeWithoutResetShowsEmptySlot() {
         let state = DeckState(
             accounts: [account("c1", provider: "claude", label: "Studio")],
-            usage: [snapshot("c1", scope: "mystery", remaining: 100, resetsIn: nil)]
+            usage: [snapshot("c1", scope: "mystery", remaining: 60, resetsIn: nil)]
         )
         let row = DeckBuilder.rows(state: state, now: now)[0]
         let window = row.windows[0]

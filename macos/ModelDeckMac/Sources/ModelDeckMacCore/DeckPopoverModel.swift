@@ -933,7 +933,7 @@ public enum DeckBuilder {
                 let snapshots = usageByAccount[account.id] ?? []
                 let windows = snapshots
                     .map { window(from: $0, thresholds: thresholds, now: now) }
-                    .filter { !isMeaninglessSpend($0) }
+                    .filter { !isMeaninglessWindow($0) }
                     .sorted { lhs, rhs in
                         let l = windowRank(scope: lhs.scope)
                         let r = windowRank(scope: rhs.scope)
@@ -1168,10 +1168,21 @@ public enum DeckBuilder {
     /// meaningless for subscription users — hide it entirely.
     /// Issue #139: payload-stated amounts make the row meaningful again —
     /// "$0.00 of $500.00" tells the user a live extra-usage budget exists.
-    static func isMeaninglessSpend(_ window: DeckWindow) -> Bool {
-        guard window.isSpend, window.resetsAt == nil, window.spendText == nil else { return false }
+    /// Issue #621: the same rule covers a window of a kind the deck has no
+    /// title for — Anthropic's payload carried a "nimbus_quill" limit at 0%
+    /// with no reset on every account for weeks. It reappears the moment the
+    /// provider states usage or a reset for it; known kinds are never hidden.
+    static func isMeaninglessWindow(_ window: DeckWindow) -> Bool {
+        guard window.isSpend || !isKnownKind(window.scope) else { return false }
+        guard window.resetsAt == nil, window.spendText == nil else { return false }
         guard let remaining = window.remainingPercent else { return true } // unknown usage
         return remaining >= 100 // zero usage
+    }
+
+    /// Whether the scope is of a kind the deck recognises, independent of
+    /// how its title happens to be spelled (CodeRabbit on #622).
+    static func isKnownKind(_ scope: String) -> Bool {
+        knownTitle(for: scope) != nil
     }
 
     /// Issue #139: "$245.63 of $500.00" from the daemon's payload-stated
@@ -1207,6 +1218,12 @@ public enum DeckBuilder {
     /// "week:<model>" prefix form and the daemon's "<Model> weekly" labels)
     /// → "Weekly · <Model>", "spend" → "Spend", anything else passes through.
     public static func windowTitle(for scope: String) -> String {
+        knownTitle(for: scope) ?? scope
+    }
+
+    /// The title for a scope of a kind the deck recognises; nil for any
+    /// other scope (#621 hides those while they carry nothing).
+    static func knownTitle(for scope: String) -> String? {
         let lower = scope.lowercased()
         switch lower {
         case "5h", "5hr", "5-hour", "five_hour", "session":
@@ -1237,7 +1254,7 @@ public enum DeckBuilder {
                     return "Weekly · \(model.prefix(1).uppercased() + model.dropFirst())"
                 }
             }
-            return scope
+            return nil
         }
     }
 

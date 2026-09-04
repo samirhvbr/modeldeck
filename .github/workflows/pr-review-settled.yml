@@ -42,3 +42,10 @@ permissions:
 jobs:
   review-settled:
     uses: timharris707/skills/.github/workflows/review-settled.yml@main
+    with:
+      # Mirrors .coderabbit.yaml's auto_review skips: PRs CodeRabbit is
+      # configured not to review must not wedge the gate waiting for one.
+      # Keep these two lists in sync (same pairing as the skills repo's
+      # own caller).
+      skip-title-regex: 'handoff:|progress-log'
+      skip-label: skip-review

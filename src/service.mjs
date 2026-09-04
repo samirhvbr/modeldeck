@@ -767,6 +767,12 @@ export class ModelDeckService {
     // report on a developer's live proxy install. Null = nothing observed.
     this.cliproxyConfigDir = options.cliproxyConfigDir || null;
     this.cliproxyPathExists = options.cliproxyPathExists || ((target) => fs.existsSync(target));
+    // Issue #625: the pool sign-in runs the binary that is actually serving
+    // the proxy port, found through lsof. Unset = /usr/sbin/lsof on macOS and
+    // no probe elsewhere; an explicit null disables the probe (tests inject
+    // a path plus an `exec` double, so no fixture reaches the real lsof).
+    this.lsofPath = options.lsofPath;
+    this.processUid = options.processUid || (() => (typeof process.getuid === 'function' ? process.getuid() : null));
     // Issue #396: the in-app repair for an expired pool credential. Same
     // no-homedir-default rule — a fixture never receives a live key path, and
     // without one the repair reports itself unavailable WITH the reason
@@ -4750,7 +4756,11 @@ export class ModelDeckService {
         parseableFiles += 1;
         const type = stringValue('type');
         const weight = integerValue('weight');
-        const excluded = stringArrayValue('excluded-models');
+        // CLIProxyAPI >= v7.2.140 canonicalizes this key to snake_case on
+        // load and rewrites the file (pin-bump finding, v7.2.149): read both
+        // spellings so a bench written as `excluded-models` still reads as
+        // benched after the proxy has renamed it to `excluded_models`.
+        const excluded = [...stringArrayValue('excluded_models'), ...stringArrayValue('excluded-models')];
         // #282 adversarial review, minor: an identity alone is not
         // membership. The login child writes tokens with the identity; a
         // parseable {type,email} torso (partial write, hand-made file)
@@ -5178,10 +5188,27 @@ export class ModelDeckService {
       };
     }
 
-    const args = [account.provider === 'claude' ? '-claude-login' : '-codex-login'];
+    // Issue #625: without `-config`, the login helper reads ./config.yaml from
+    // the daemon's cwd (`/`), finds nothing, and exits 0 with no auth file.
+    // The same config the serving proxy runs on is the only sensible one.
+    if (!this.cliproxyConfigDir) {
+      throw serviceError('CLIProxyAPI config directory is not configured', 409);
+    }
+    const configFile = path.join(this.cliproxyConfigDir, 'config.yaml');
+    let configStat = null;
+    try { configStat = await fs.promises.stat(configFile); } catch { configStat = null; }
+    if (!configStat?.isFile()) {
+      throw serviceError("The proxy's config.yaml is missing from its config directory, so the sign-in cannot start", 409);
+    }
+    const binary = await this.cliproxyLoginBinary();
+    if (!binary) {
+      throw serviceError("Couldn't find the cliproxyapi program to run the sign-in", 409);
+    }
+
+    const args = ['-config', configFile, account.provider === 'claude' ? '-claude-login' : '-codex-login'];
     let child;
     try {
-      child = this.spawn(this.cliproxyPath, args, {
+      child = this.spawn(binary, args, {
         // Browser OAuth needs process basics, not the daemon's provider keys,
         // mutation token, or unrelated ambient credentials.
         env: proxyLoginEnv(this.childEnv),
@@ -5236,7 +5263,7 @@ export class ModelDeckService {
       }
       if (childOutcome?.kind === 'error') {
         throw serviceError(
-          `CLIProxyAPI ${account.provider} login failed to start before a matching auth file appeared${childOutcome.code ? ` (${childOutcome.code})` : ''}`,
+          `CLIProxyAPI ${account.provider} login failed to start${childOutcome.code ? ` (${childOutcome.code})` : ''}; no matching auth file appeared`,
           502,
         );
       }
@@ -5273,6 +5300,71 @@ export class ModelDeckService {
       const interval = Math.max(1, Math.min(this.proxyJoinPollIntervalMs, remaining));
       await this.proxyJoinWait(childSettled, interval);
     }
+  }
+
+  // Issue #625 — which `cliproxyapi` runs the pool sign-in. An absolute
+  // configured path (MODELDECK_CLIPROXY_BIN) is the operator's word and wins.
+  // A bare name is resolved first to the executable of the process serving
+  // the proxy port: under coexist that is the user's launch agent's binary,
+  // under a managed proxy the app's bundled copy, and either way the version
+  // the pool actually runs. Only then does PATH (plus the #2 fallback dirs)
+  // get a turn. `null` means nothing usable was found; the caller says so
+  // instead of letting spawn fail with a bare ENOENT.
+  async cliproxyLoginBinary() {
+    if (path.isAbsolute(this.cliproxyPath)) return this.cliproxyPath;
+    const serving = await this.servingProxyExecutable();
+    if (serving) return serving;
+    try { return await this.toolExecutablePath(this.cliproxyPath); }
+    catch { return null; }
+  }
+
+  // The executable mapped into the process listening on the proxy's
+  // loopback port, per decision 0010: identity is the kernel's program-text
+  // entry (never argv[0]), the process must belong to this user, and the
+  // file must be a regular executable whose name is `cliproxyapi`. Anything
+  // short of all four is not the proxy, and the probe answers `null`.
+  async servingProxyExecutable() {
+    const lsof = this.lsofPath === undefined
+      ? (this.platform === 'darwin' ? '/usr/sbin/lsof' : null)
+      : this.lsofPath;
+    const uid = this.processUid();
+    if (!lsof || uid == null) return null;
+    let url;
+    try { url = new URL(this.cliproxyBaseUrl); } catch { return null; }
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)) return null;
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+    const run = async (args) => {
+      const result = await this.exec(lsof, args, { timeout: 10_000, maxBuffer: 65_536 });
+      return String(result?.stdout ?? result ?? '');
+    };
+    let pids;
+    try {
+      pids = (await run(['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-a', '-u', String(uid), '-t']))
+        .split(/\s+/).filter((pid) => /^\d+$/.test(pid));
+    } catch {
+      return null; // lsof exits non-zero when nothing listens
+    }
+    for (const pid of pids) {
+      let executable;
+      try {
+        executable = (await run(['-p', pid, '-a', '-d', 'txt', '-Fn']))
+          .split('\n').find((line) => line.startsWith('n'))?.slice(1);
+      } catch {
+        continue; // exited between the two calls
+      }
+      if (!executable || !path.isAbsolute(executable)) continue;
+      if (path.basename(executable).toLowerCase() !== 'cliproxyapi') continue;
+      try {
+        const stat = await fs.promises.stat(executable);
+        if (!stat.isFile()) continue;
+        await fs.promises.access(executable, fs.constants.X_OK);
+      } catch {
+        continue;
+      }
+      return executable;
+    }
+    return null;
   }
 
   // Issue #522 — per-profile client-key helper wiring (design §2.5).

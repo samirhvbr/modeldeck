@@ -14,7 +14,9 @@ homes tracked.
 The ruling, as shipped:
 
 - The `extraClaudeScanRoots` setting lists additional Claude homes, each
-  attributed to an existing profile label ({ path, profileSlug }); on Tim's
+  attributed to a profile label ({ path, profileSlug }). The label is free
+  text — pointing it at a managed profile is the operator's contract, not
+  daemon-enforced (profiles can be created after the setting). On Tim's
   machine `~/.claude-insight-agents` maps to `lend-management`.
 - Extra roots are strictly read-only toward the scanned directory: ingest
   opens read streams only, never writes, never repins, never touches the
