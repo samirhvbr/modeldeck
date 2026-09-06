@@ -322,7 +322,7 @@ export const CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT = "A Claude credential exists i
 // this; the review-hardening pass replaced the time window with the
 // serve-time baseline below because unrelated config writes refresh the
 // file's mtime constantly.)
-export const CLAUDE_STRAY_LOGIN_VERIFY_HINT = "A sign-in completed into the default Claude config (~/.claude.json) instead of this account's profile — the terminal that ran it wasn't pinned. Run the sign-in command ModelDeck provides (it pins the profile itself), then verify.";
+export const CLAUDE_STRAY_LOGIN_VERIFY_HINT = "That sign-in went to a different Claude profile, not this one. Use the sign-in button on this card (not a plain terminal), then verify.";
 
 // Issue #89: refresh failures whose message carries this phrase mean the
 // stored credentials are unusable (missing or expired) — the account needs a
@@ -335,6 +335,14 @@ export const CLAUDE_STRAY_LOGIN_VERIFY_HINT = "A sign-in completed into the defa
 // message carrying this exact suffix, so authState flips to signin-required
 // with signinReason "missing" — the amber "Sign in needed" + one-click
 // path (#114/#118), never the calm #149 idle notice.
+// Issue #636: the shell env writer exports ModelDeck's proxy client key
+// into every fresh terminal of a proxy-routed profile (#277). A login run
+// with that key in scope shows "API Usage Billing" and takes the
+// paste-the-code path instead of the plain browser handoff. Both the
+// session launcher and the login command drop OUR key first; a key the
+// user set for their own tooling (no marker) is left alone.
+export const CLAUDE_MANAGED_KEY_UNSET_FRAGMENT = 'if [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY; fi';
+
 export const SIGN_IN_REQUIRED_ERROR_PATTERN = /sign in explicitly before refreshing/i;
 
 // Issue #149: the Claude probe emits two DISTINCT failures that both end in
@@ -3248,7 +3256,7 @@ export class ModelDeckService {
           command: claudeExecutable,
           args: ['/login'],
           env: { CLAUDE_CONFIG_DIR: profileRef, CLAUDE_SECURESTORAGE_CONFIG_DIR: profileRef },
-          preview: `CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(claudeExecutable)} /login`,
+          preview: `${CLAUDE_MANAGED_KEY_UNSET_FRAGMENT}; CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(claudeExecutable)} /login`,
         };
       }
       return {
@@ -3262,7 +3270,7 @@ export class ModelDeckService {
         // the login session cannot pair one profile's storage with another's
         // credential scope.
         env: { CLAUDE_CONFIG_DIR: profileRef, CLAUDE_SECURESTORAGE_CONFIG_DIR: profileRef },
-        preview: `CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(claudeExecutable)} auth login`,
+        preview: `${CLAUDE_MANAGED_KEY_UNSET_FRAGMENT}; CLAUDE_CONFIG_DIR=${shellQuote(profileRef)} CLAUDE_SECURESTORAGE_CONFIG_DIR=${shellQuote(profileRef)} ${shellQuote(claudeExecutable)} auth login`,
       };
     }
     const profileRef = managedCodexProfile(account.profileRef, this.codexProfilesDir);
@@ -6521,7 +6529,7 @@ export class ModelDeckService {
       const previewService = clientKeyServiceForRecord(this.claudeClientKeyRecord(account));
       const preview = cliproxyRouted
         ? `cd ${shellQuote(cwd)} && ${claudeProxyPointerShellSnippet(previewService)}; ${pins} ${invocation}`
-        : `cd ${shellQuote(cwd)} && if [ "\${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY; fi; ${pins} ${invocation}`;
+        : `cd ${shellQuote(cwd)} && ${CLAUDE_MANAGED_KEY_UNSET_FRAGMENT}; ${pins} ${invocation}`;
       return {
         provider,
         account,

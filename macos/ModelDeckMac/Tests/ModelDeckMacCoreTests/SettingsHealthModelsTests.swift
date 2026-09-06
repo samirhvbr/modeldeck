@@ -702,6 +702,40 @@ struct AutoVerifyTests {
         #expect(signedIn == 1)
     }
 
+    @Test func signedOutReadWithADiagnosisLandsOnTheCardWhilePollingContinues() async {
+        // Issue #636 tripwire: the daemon's verify hint (stray login, default
+        // Keychain slot) must reach the card without a Verify click.
+        let backend = StubSignInBackend()
+        let hint = "That sign-in went to a different Claude profile, not this one."
+        backend.verifyResult = AccountVerification(
+            account: DeckAccount(id: "acct-1", provider: "claude", label: "Deck One"),
+            authenticated: false,
+            verifyHint: hint
+        )
+        let sleeper = StubSleeper()
+        let model = makeModel(backend, sleeper: sleeper)
+        var signedIn = 0
+        model.onSignedIn = { signedIn += 1 }
+
+        await model.beginSignIn(account: account)
+        await settle { sleeper.pendingSleeps == 1 }
+        sleeper.tick()
+        await settle { model.error(for: "acct-1") != nil }
+
+        #expect(model.error(for: "acct-1") == hint)
+        if case .awaitingSignIn? = model.phase(for: "acct-1") {} else {
+            Issue.record("expected to stay on awaitingSignIn")
+        }
+        #expect(signedIn == 0)
+
+        // A corrective login finishes; the next beat still completes the flow.
+        await settle { sleeper.pendingSleeps == 1 }
+        backend.verifyResult = nil
+        sleeper.tick()
+        await settle { signedIn == 1 }
+        #expect(model.error(for: "acct-1") == nil)
+    }
+
     @Test func transportErrorsStaySilent() async {
         let backend = StubSignInBackend()
         backend.verifyError = DaemonClientError.daemonError(message: "mutation token or origin rejected", status: 403)

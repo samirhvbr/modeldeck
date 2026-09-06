@@ -197,6 +197,16 @@ public final class AccountSignInModel: ObservableObject {
     /// and cannot be spammed over by the poller.
     private func autoVerifyOnce(account: DeckAccount) async -> Bool {
         guard let verification = try? await reauth.verifyAccount(accountID: account.id) else { return false }
+        // Issue #636: a signed-out read that carries the daemon's diagnosis
+        // (the login landed in another profile, or in the default Keychain
+        // slot) is not "still mid-login" — it is the answer to why the card
+        // stays flagged, and nobody presses Verify after the browser said
+        // success. Surface it on the card; polling continues so a corrective
+        // login still clears the flow on its own.
+        if !verification.authenticated, let hint = verification.verifyHint {
+            if case .awaitingSignIn = phases[account.id] { errors[account.id] = hint }
+            return false
+        }
         guard verification.authenticated, verification.identityMismatch == nil else { return false }
         // Cancel or a manual Verify may have taken over while the daemon
         // read — the late success belongs to that path's outcome, not this

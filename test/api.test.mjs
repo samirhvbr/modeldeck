@@ -8,6 +8,7 @@ import { Readable } from 'node:stream';
 import { Store } from '../src/db.mjs';
 import {
   CLAUDE_DEFAULT_KEYCHAIN_VERIFY_HINT,
+  CLAUDE_MANAGED_KEY_UNSET_FRAGMENT,
   ModelDeckService,
 } from '../src/service.mjs';
 import { createApp } from '../src/server.mjs';
@@ -1732,7 +1733,7 @@ test('historical-boundary CLI: activation-driven login spec and identity-mismatc
   const realProfile = fs.realpathSync(seeded.profileRef);
   assert.equal(
     result.body.command,
-    `CLAUDE_CONFIG_DIR='${realProfile}' CLAUDE_SECURESTORAGE_CONFIG_DIR='${realProfile}' '${canonicalClaudePath}' /login`,
+    `${CLAUDE_MANAGED_KEY_UNSET_FRAGMENT}; CLAUDE_CONFIG_DIR='${realProfile}' CLAUDE_SECURESTORAGE_CONFIG_DIR='${realProfile}' '${canonicalClaudePath}' /login`,
   );
   assert.ok(!result.body.command.includes('logout'));
 

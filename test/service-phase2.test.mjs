@@ -845,7 +845,7 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
       assert.equal(spec.command, fs.realpathSync(canonicalPath));
       assert.equal(calls.find((call) => call.args[0] === '--version').binary, spec.command);
       assert.ok(spec.preview.endsWith(`'${spec.command}' /login`));
-      assert.match(spec.preview, /^CLAUDE_CONFIG_DIR=/);
+      assert.match(spec.preview, /; CLAUDE_CONFIG_DIR=/);
       assert.equal(spec.flow, 'activation');
     } finally { data.close(); }
   });
@@ -872,6 +872,26 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
     } finally { data.close(); }
   });
 
+  await t.test('both login previews drop the managed proxy key before the pins (#636 tripwire)', async () => {
+    // A login run with ModelDeck's proxy client key in scope shows
+    // "API Usage Billing" and takes the paste-the-code path. The preview
+    // must unset OUR key (marker-guarded) ahead of the profile pins.
+    const unset = 'if [ "${MODELDECK_MANAGED_ANTHROPIC_API_KEY:-}" = "1" ]; then unset ANTHROPIC_API_KEY MODELDECK_MANAGED_ANTHROPIC_API_KEY; fi; CLAUDE_CONFIG_DIR=';
+    for (const version of ['2.1.215', '2.1.216']) {
+      const data = fixture({
+        claudePath: '/fixture/bin/claude',
+        realpath: async (value) => value,
+        exec: async (_binary, args) => ({ stdout: args[0] === '--version' ? `Claude Code ${version}` : '' }),
+      });
+      try {
+        const account = data.store.saveAccount({ provider: 'claude', label: 'Work', profileRef: data.firstHome });
+        const spec = await data.service.loginSpec(account.id);
+        assert.ok(spec.preview.startsWith(unset), `${version}: ${spec.preview}`);
+        assert.doesNotMatch(spec.preview, /logout/);
+      } finally { data.close(); }
+    }
+  });
+
   await t.test('2.1.216 and later drive sign-in through activation with the env pair pinned (#596 tripwire)', async () => {
     for (const version of ['2.1.216', '2.2.0', '3.0.1']) {
       const claudeExecutable = '/fixture/bin/claude';
@@ -894,7 +914,8 @@ test('Claude login specs are version-aware (issue #99)', async (t) => {
         // the invoking shell's environment again.
         const real = fs.realpathSync(data.firstHome);
         assert.deepEqual(spec.env, { CLAUDE_CONFIG_DIR: real, CLAUDE_SECURESTORAGE_CONFIG_DIR: real });
-        assert.match(spec.preview, /^CLAUDE_CONFIG_DIR='[^']+' CLAUDE_SECURESTORAGE_CONFIG_DIR='[^']+' /);
+        // #636: the managed-key unset now leads; the pins must still precede the executable.
+        assert.match(spec.preview, /; CLAUDE_CONFIG_DIR='[^']+' CLAUDE_SECURESTORAGE_CONFIG_DIR='[^']+' /);
         assert.match(spec.preview, /\/login$/);
         assert.doesNotMatch(spec.preview, /logout/);
       } finally { data.close(); }
