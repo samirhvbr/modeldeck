@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "_comment_profile": "OPUS-ONLY PROFILE, the fleet default. The 1M window is explicit via the [1m] suffix on `model`. Do NOT add CLAUDE_CODE_DISABLE_1M_CONTEXT here: that is the flag that drops the window back to 200K. The highest effortLevel a settings FILE accepts is 'xhigh' — writing 'max' here silently does nothing; use /effort max for a single session.",
+  "model": "opus[1m]",
+  "effortLevel": "high",
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "opus",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5"
+  },
+  "permissions": {
+    "_comment": "Project permissions for ModelDeck (samirhvbr fork). The allow-list starts at reading, writing and git — NOTHING for your stack is granted yet. GRANTING A NEW PERMISSION IS THE OWNER'S ACT: it gets written into this file together with its reason and how to revert it, never applied silently. THE DENY-LIST ALWAYS BEATS THE ALLOW-LIST. ADR-019 GRANT (05/09/2026): the four read-only `gh` entries — `repo view`, `pr list`, `issue list`, `api repos/` — exist because the guest clause requires reading an upstream's language before we write into it, and a rule that prompts on every check is a rule that gets skipped. They read; they change nothing. To revert, delete those four lines: the clause then still applies, it just asks each time. `gh repo edit` and `gh repo delete` stay in `ask` and the deny-list still wins.",
+    "defaultMode": "plan",
+    "allow": [
+      "Read",
+      "Edit",
+      "Write",
+      "Bash(git pull:*)",
+      "Bash(git fetch:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(gh repo view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh issue list:*)",
+      "Bash(gh api repos/:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.key)",
+      "Read(./**/*.p8)",
+      "Read(./**/*.p12)",
+      "Read(./**/*.pfx)",
+      "Bash(rm -rf:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push * --force*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean -fd:*)",
+      "Bash(curl * | sh:*)",
+      "Bash(curl * | bash:*)",
+      "Bash(wget * | sh:*)",
+      "Bash(wget * | bash:*)"
+    ],
+    "ask": [
+      "Bash(sudo:*)",
+      "Bash(gh repo edit:*)",
+      "Bash(gh repo delete:*)"
+    ]
+  }
+}
