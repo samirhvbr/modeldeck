@@ -3,7 +3,7 @@
 > **Status:** `ACTIVE`
 
 `.claude/` in this repository follows the standard of the samirhvbr/Blue3 fleet:
-a **model profile** plus a **permission posture**, both versioned.
+a **permission posture**, versioned — and **no model choice at all**, on purpose.
 
 Conduct rules for the agent are in [CLAUDE.md](../CLAUDE.md).
 
@@ -11,8 +11,21 @@ Conduct rules for the agent are in [CLAUDE.md](../CLAUDE.md).
 
 | File | Role |
 |------|------|
-| `settings.json` | The **active** profile, versioned. |
+| `settings.json` | The repository's settings, versioned — permission posture and effort level. It chooses no model; see below. |
 | `settings.local.json` | Machine-local override, **gitignored** — it may hold paths and tokens that belong to one machine. Never commit it. |
+
+## The repository does not choose the model
+
+**The model is the user's choice, made with `/model`, per session.** A subagent
+inherits the session's model. Nothing in this repository steers it: `settings.json`
+carries no `model`, no `fallbackModel` and no `availableModels`, and its `env`
+carries no `ANTHROPIC_MODEL`, no `ANTHROPIC_DEFAULT_*_MODEL` and no
+`CLAUDE_CODE_SUBAGENT_MODEL`. There are no stand-by profile files to copy over
+`settings.json` to change the model — `/model` does that.
+
+Why: every pin of that kind outlived the model it named, and a repository pin
+cannot outrank the organization's managed settings anyway (repodocs ADR-027,
+24/09/2026).
 
 ## The deny-list beats the allow-list — always
 
