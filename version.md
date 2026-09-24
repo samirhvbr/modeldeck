@@ -1,6 +1,6 @@
 # Version — samirhvbr fork of ModelDeck
 
-**Current version:** `0.1.0`
+**Current version:** `0.1.1`
 **Upstream:** `1.1.9` — timharris707/modeldeck @ `cc537d4` (`main`, 1 commit past `v1.1.9`)
 
 The **first semver in this file is ours**, and that is not cosmetic: the hooks,
